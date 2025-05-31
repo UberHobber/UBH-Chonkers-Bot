@@ -37,4 +37,4 @@ Steps to Operate
     - Edit the DB_Settings.json file as needed and place it in your secrets folder.
     - Edit the Youtube User ID to the desired value. (MAKE SURE YOU'VE REMOVED THE PREFIXES, SEE NOTES)
     - If you want to download a custom list of video/chat data, use the CUSTOM_PLAYLIST value.
-5. Start this script. It *should* work fine? If not, have fun debugging.
+5. Run Main.py. It *should* work fine? If not, have fun debugging.
