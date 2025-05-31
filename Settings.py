@@ -12,7 +12,7 @@ print("Specify directory where Secrets and/or Cookies are...")
 SECRETS_DIRECTORY = filedialog.askdirectory(title="Specify directory where Secrets and/or Cookies are")
 print(f"Secrets Directory: {SECRETS_DIRECTORY}")
 
-if not DATA_DIRECTORY or SECRETS_DIRECTORY:
+if DATA_DIRECTORY == None or SECRETS_DIRECTORY == None:
     sys.exit()
 
 # Settings for the Oauth 2.0 Configuration used by the YT_API Class.
