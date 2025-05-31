@@ -1,0 +1,30 @@
+CREATE TABLE public.user_ids (
+	id text NOT NULL,
+	CONSTRAINT user_ids_PK PRIMARY KEY (id)
+);
+
+CREATE TABLE public.videos (
+	id text NOT NULL,
+	title text NULL,
+	videoid text NULL,
+	publishedat text NULL,
+	processed bool DEFAULT false NULL,
+	CONSTRAINT videos_PK PRIMARY KEY (id)
+);
+CREATE UNIQUE INDEX videos_videoid_INDEX ON public.videos USING btree (videoid);
+
+CREATE TABLE public.messages (
+	message_id text NOT NULL,
+	message text NULL,
+	"timestamp" int8 NULL,
+	time_in_seconds float4 NULL,
+	"type" text NULL,
+	video_id text NULL,
+	user_id text NULL,
+	user_name text NULL,
+	user_member_status int8 NULL,
+	CONSTRAINT messages_PK PRIMARY KEY (message_id),
+	CONSTRAINT messages_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+	CONSTRAINT messages_video_id_fkey FOREIGN KEY (video_id) REFERENCES public.videos(videoid)
+);
+CREATE INDEX messages_video_id ON public.messages USING btree (video_id);
