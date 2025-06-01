@@ -109,7 +109,7 @@ class MessageClass(NamespaceBaseClass):
             if "badges" in dir(self.data.author):
                 self.member_months = self._Membership_Level(self.data.author.badges[0].title)
             else:
-                self.member_months = None
+                self.member_months = -1
             
             self.entry = {
                 "message_id":self.id,
