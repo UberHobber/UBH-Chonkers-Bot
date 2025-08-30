@@ -16,12 +16,12 @@ About This Tool
 NOTE: THIS WILL NOT DOWNLOAD THE VIDEOS THEMSELVES! Use something like YT-DLP for that.
 
 This tool is designed to download the following from every publically available YT video on a channel:
-    1. Video Metadata (Upload Date, Unique ID, Title, etc.)
-    2. Video Thumbnail (Best quality it's able to find)
-    3. Every Chat, Superchat, Member's Message, and Super Sticker sent in:
-        - Livestream VODs (If they haven't been edited and the chat thrown out as concequence)
-        - Video Premieres
-        - Pre/Post-chat if the stream is currently live, waiting to start, or has just finished
+1. Video Metadata (Upload Date, Unique ID, Title, etc.)
+2. Video Thumbnail (Best quality it's able to find)
+3. Every Chat, Superchat, Member's Message, and Super Sticker sent in:
+    - Livestream VODs (If they haven't been edited and the chat thrown out as concequence)
+    - Video Premieres
+    - Pre/Post-chat if the stream is currently live, waiting to start, or has just finished
 
 You can set a flag to download member's only video data as well into a separate database. (SEE SETTINGS)
 
