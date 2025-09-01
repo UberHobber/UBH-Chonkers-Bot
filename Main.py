@@ -230,8 +230,8 @@ Existing:       {all_chat_stats.existing_messages}
 
 ---USER STATISTICS---
 
-To Process:     {all_chat_stats.new_user_ids + all_chat_stats.exist_user_ids}
+Unique Users:   {all_chat_stats.new_user_ids + len(all_chat_stats.exist_user_ids)}
 New:            {all_chat_stats.new_user_ids}
-Existing:       {all_chat_stats.exist_user_ids}
+Existing:       {len(all_chat_stats.exist_user_ids)}
 Invalid:        {all_chat_stats.invalid_users}
 """)

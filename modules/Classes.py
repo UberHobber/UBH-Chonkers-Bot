@@ -39,7 +39,7 @@ class ChatStats:
         self.new_messages:int = 0
         self.existing_messages:int = 0
         self.new_user_ids:int = 0
-        self.exist_user_ids:int = 0
+        self.exist_user_ids = set()
         self.invalid_users:int = 0
     
     def append_all(self,all_chat_stats:'ChatStats'):
@@ -48,7 +48,7 @@ class ChatStats:
         all_chat_stats.new_messages += self.new_messages
         all_chat_stats.existing_messages += self.existing_messages
         all_chat_stats.new_user_ids += self.new_user_ids
-        all_chat_stats.exist_user_ids += self.exist_user_ids
+        all_chat_stats.exist_user_ids = all_chat_stats.exist_user_ids.union(self.exist_user_ids)
 
 class VideoClass:
     """
@@ -75,7 +75,7 @@ class VideoClass:
                 # Date video was released / VOD was generated
                 self._publish_date:str|None = self._snippet.get("publishedAt")
                 if self._publish_date is not None:
-                    self.publish_date = datetime.strptime(self._publish_date,"%Y-%m-%dT%H:%M:%SZ")
+                    self.publish_date = _get_date_time(self._publish_date)
                 else:
                     self.publish_date = None
 
@@ -94,11 +94,11 @@ class VideoClass:
 
                 if self._liveStreamingDetails is not None:
                     self._scheduled_start = self._liveStreamingDetails.get("scheduledStartTime")
-                    self.scheduled_start = datetime.strptime(self._scheduled_start,"%Y-%m-%dT%H:%M:%SZ") if self._scheduled_start is not None else None
+                    self.scheduled_start = _get_date_time(self._scheduled_start) if self._scheduled_start is not None else None
                     self._actual_start = self._liveStreamingDetails.get("actualStartTime")
-                    self.actual_start = datetime.strptime(self._actual_start,"%Y-%m-%dT%H:%M:%SZ") if self._actual_start is not None else None
+                    self.actual_start = _get_date_time(self._actual_start) if self._actual_start is not None else None
                     self._actual_end = self._liveStreamingDetails.get("actualEndTime")
-                    self.actual_end = datetime.strptime(self._actual_end,"%Y-%m-%dT%H:%M:%SZ") if self._actual_end is not None else None
+                    self.actual_end = _get_date_time(self._actual_end) if self._actual_end is not None else None
                 else:
                     self.scheduled_start = None
                     self.actual_start = None
@@ -202,7 +202,7 @@ class MessageClass:
     def __init__(self,message:dict[str,Any],video:VideoClass):
         try:
             self.id = message.get("message_id") # Back-end ID for message
-            self.message = message.get("message") # Message contents
+            self.message:str|None = message.get("message") # Message contents
             self._time_absolute = message.get("timestamp")
             if self._time_absolute is not None:
                 self.time_absolute = self._time_absolute/1000000 # Exact time the message was sent (Timestamp is in microseconds so need to convert it)
@@ -335,7 +335,8 @@ class UserClass:
             if self._snippet is not None:
                 self.name = self._snippet.get("title") # Most current username
                 self.custom_url = self._snippet.get("customUrl") # Custom URL if one was set
-                self.created = self._snippet.get("publishedAt") # Date channel was created
+                self._created = self._snippet.get("publishedAt") # Date channel was created
+                self.created = _get_date_time(self._created) if self._created is not None else None
                 self.region = self._snippet.get("country")
 
                 # JSON file will only contain an object for a profile picture if one exists. This will get the best quality one it can find.
@@ -514,10 +515,6 @@ class YT_API:
         :rtype: List of Strings
         """
         
-        ###########################
-        ### GET BULK VIDEO DATA ###
-        ###########################
-        
         with LOG.TQDM_Logging():
             with tqdm(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
 
@@ -560,7 +557,7 @@ class YT_API:
         
         return ids
 
-    def Get_Messages(self,video:VideoClass):
+    def Get_Messages(self,video:VideoClass,skip_download=False):
         """
         Retrieves all chat messages from a given video, saves them to JSON files, and enters them into the database.
         
@@ -606,46 +603,113 @@ class YT_API:
         
         v = video
 
-        # Timeout will prevent sitting endlessly on a waiting room or livestream
-        if CFG.TIMEOUT == True:
-            chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'],inactivity_timeout=5)
+        #-----------------------#
+        #-- GET ALL CHAT DATA --#
+        #-----------------------#
+
+        if skip_download == True:
+            message_path = f'{CFG.DATA_PATH}/{v.id}_Messages.json'
+            if os.path.isfile(message_path):
+                with open(message_path,'r') as file:
+                    messages_on_file = json.load(file) #type: list[dict]
         else:
-            chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
+            # Timeout will prevent sitting endlessly on a waiting room or livestream
+            if CFG.TIMEOUT == True:
+                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'],inactivity_timeout=5)
+            else:
+                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
 
         message_list = []
         chat_stats = ChatStats()
 
-        if chat is None:
+        chat_list = chat if skip_download == False else messages_on_file
+
+        if chat_list is None:
             return chat_stats
 
         def Update_Postfix_Messages():
-            return f"New Messages: {chat_stats.new_messages} | Existing Messages: {chat_stats.existing_messages} | New Users: {chat_stats.new_user_ids} | Existing Users: {chat_stats.exist_user_ids}"
+            return f"New Messages: {chat_stats.new_messages} | Existing Messages: {chat_stats.existing_messages} | New Users: {chat_stats.new_user_ids} | Existing Users: {len(chat_stats.exist_user_ids)}"
 
         with LOG.TQDM_Logging():
             with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} || {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=1, leave=False) as messbar:
                 try:
+                    unique_user_ids = set()
                     # Process all chats collected by Chat_Downloader
-                    for message in chat:
+                    for message in chat_list:
                         chat_stats.total_messages += 1
                         try:
                             msg = MessageClass(message,v)
+
+                            #----------------------#
+                            #-- USER ID DATABASE --#
+                            #----------------------#
 
                             # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
                             if len(DB.GetEntries(self.db.cursor,"user_ids",filter={"id":msg.usr_id})) == 0:
                                 DB.InsertEntries(self.db.cursor,"user_ids",[{"id":msg.usr_id}])
                                 self.db.database.commit()
                                 chat_stats.new_user_ids += 1
+                                unique_user_ids.add(msg.usr_id)
                             else:
-                                chat_stats.exist_user_ids += 1
+                                unique_user_ids.add(msg.usr_id)
+                                chat_stats.exist_user_ids.add(msg.usr_id)
+
+                            #--------------------#
+                            #-- EMOTE DATABASE --#
+                            #--------------------#
 
                             # Add Unique Emotes if they don't already exist in DB
                             if len(msg.e_emote_entries) > 0:
                                 DB.InsertEntries(self.db.cursor,"emotes",msg.e_emote_entries,"id")
 
+                            #----------------------#
+                            #-- MESSAGE DATABASE --#
+                            #----------------------#
+
                             # Add message to DB if it doesn't already exist
                             if len(DB.GetEntries(self.db.cursor,"messages",filter={"message_id":msg.id})) == 0:
                                 DB.InsertEntries(self.db.cursor,"messages",[msg.entry])
                                 self.db.database.commit()
+
+                                #-----------------------#
+                                #-- NICKNAME DATABASE --#
+                                #-----------------------#
+
+                                # Get all the nicknames to search for
+                                nickname_entries = DB.GetEntries(self.db.cursor,"nicknames","nickname")
+                                nicknames:list[str] = []
+                                for nick_entry in nickname_entries:
+                                    for key in nick_entry.keys():
+                                        nicknames.append(key)
+                                sorted_nicknames = sorted(nicknames, key=len, reverse=True)
+
+                                entries = []
+                                used_positions = set()
+
+                                #-------------------------------#
+                                #-- NICKNAME MATCHES DATABASE --#
+                                #-------------------------------#
+
+                                # Only look for nicknames if there are any to look for in the database
+                                if len(sorted_nicknames) > 0:
+                                    for nick in sorted_nicknames:
+                                        search_pattern = r'\b' + re.escape(nick) + r'\b'
+                                        if msg.message is not None:
+                                            for match in re.finditer(pattern=search_pattern, string=msg.message, flags=re.IGNORECASE):
+                                                start, end = match.span()
+                                                if not any(pos in used_positions for pos in range(start, end)):
+                                                    entry = {
+                                                        "message_id":msg.id,
+                                                        "matched_nickname":nick,
+                                                        "index_start":start,
+                                                        "index_end":end
+                                                    }
+                                                    used_positions.update(range(start, end))
+                                                    entries.append(entry)
+                                    
+                                    DB.InsertEntries(self.db.cursor,"nickname_matches",entries,"message_id,index_start,index_end")
+                                    self.db.database.commit()
+
                                 chat_stats.new_messages += 1
                                 messbar.set_postfix_str(Update_Postfix_Messages())
                                 messbar.update(1)
@@ -677,6 +741,10 @@ class YT_API:
         :rtype: Integer
         """
         invalid:int = 0
+
+        #-------------------#
+        #-- GET USER DATA --#
+        #-------------------#
 
         request = self.api.channels().list(part="id,snippet,statistics,status,brandingSettings",id=users)
         response = request.execute()
@@ -790,9 +858,9 @@ class YT_API:
                     else:
                         os.rename(temp_pfp,pfp_path)
 
-                #-------------------------#
-                #-- DATABASE OPERATIONS --#
-                #-------------------------#
+                #------------------------------#
+                #-- USER DATABASE OPERATIONS --#
+                #------------------------------#
 
                 # Update the unprocessed User_ID with additional information
                 for column, value in u.entry.items():
@@ -816,3 +884,21 @@ class YT_API:
                 invalid += 1
         
         return invalid
+
+
+def _get_date_time(timestamp:str):
+    """Some timestamp strings in the API include fractions of a second."""
+    pattern = r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?Z?$'
+    match = re.match(pattern, timestamp)
+    if not match:
+        raise ValueError(f"Invalid datetime format: {timestamp}")
+    
+    base = match.group(1)
+    microseconds = match.group(2)
+
+    if microseconds:
+        microseconds = microseconds.ljust(6, '0')[:6]
+        formatted_string = f"{base}.{microseconds}"
+    else:
+        formatted_string = f"{base}.000000"
+    return datetime.strptime(formatted_string, "%Y-%m-%dT%H:%M:%S.%f")
