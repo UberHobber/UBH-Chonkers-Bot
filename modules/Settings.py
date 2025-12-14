@@ -14,33 +14,34 @@ from tkinter import filedialog,messagebox
 MEMBER_DIRECTORY = {
     "Calli":{
         "user_id":"L_qhgtOy0dy1Agp8vkySQg",
-        "database":"YTDB_Calli",
+        "db_suffix":"calli",
         "database_members":"YTDB_Calli_Members",
     },
     "Kiara":{
         "user_id":"Hsx4Hqa-1ORjQTh9TYDhww",
-        "database":"YTDB_Kiara",
+        "db_suffix":"kiara",
         "database_members":"YTDB_Kiara_Members",
     },
     "Ina":{
         "user_id":"MwGHR0BTZuLsmjY_NT5Pwg",
-        "database":"YTDB_Ina",
+        "db_suffix":"ina",
         "database_members":"YTDB_Ina_Members",
     },
     "Gura":{
         "user_id":"oSrY_IQQVpmIRZ9Xf-y93g",
-        "database":"YTDB_Gura",
+        "db_suffix":"gura",
         "database_members":"YTDB_Gura_Members",
     },
     "Ame":{
         "user_id":"yl1z3jo3XHR1riLFKG5UAg",
-        "database":"YTDB_Ame",
+        "db_suffix":"ame",
         "database_members":"YTDB_Ame_Members",
     },
 }
 
 # Pick the member entry you'd like here
 MEMBER_SELECTOR = MEMBER_DIRECTORY["Kiara"]
+MEMBER_SUFFIX = MEMBER_SELECTOR["db_suffix"]
 
 # Database Configuration settngs
 DB_VERBOSE = False
@@ -86,7 +87,8 @@ COOKIES = None if MEMBERS == False else f"{SECRETS_DIRECTORY}/cookies.txt"
 DATA_FOLDER_NAME = "Data_Public" if MEMBERS == False else "Data_Members"
 
 # The main data path used elsewhere in code
-DATA_PATH = f"{DATA_DIRECTORY}/{DATA_FOLDER_NAME}"
+DATA_PATH = f"{DATA_DIRECTORY}/{DATA_FOLDER_NAME}_{MEMBER_SUFFIX}"
+USER_PATH = f"{DATA_DIRECTORY}/Data_Users"
 
 # Edit the template provided and stuff it in your secrets folder
 with open(f"{SECRETS_DIRECTORY}/DB_Settings.json",'r') as file:
@@ -97,7 +99,16 @@ DB_USR = db_settings["DB_USR"]
 DB_PASS = db_settings["DB_PASS"]
 DB_HOST = db_settings["DB_HOST"]
 DB_PORT = db_settings["DB_PORT"]
-DB_NAME = MEMBER_SELECTOR["database"] if MEMBERS == False else MEMBER_SELECTOR["database_members"]
+DB_NAME = "YTDB_Public" if MEMBERS == False else MEMBER_SELECTOR["database_members"]
+
+DB_TABLES = {
+    "emotes":f"emotes_{MEMBER_SUFFIX}",
+    "messages":f"messages_{MEMBER_SUFFIX}",
+    "nickname_matches":f"nickname_matches_{MEMBER_SUFFIX}",
+    "nicknames":f"nicknames_{MEMBER_SUFFIX}",
+    "videos":f"videos_{MEMBER_SUFFIX}",
+    "user_ids":"user_ids"
+}
 
 # Auto-filled out data for Youtube data
 YT_USER_ID = MEMBER_SELECTOR["user_id"] # UserID of the selected member

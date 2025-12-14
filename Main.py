@@ -94,8 +94,8 @@ with LOG.TQDM_Logging():
             #--------------------------------#
 
             # Don't do any processing if the current video_id has already been processed
-            complete_video = DB.GetEntries(db.cursor,"videos","title,processed",{"id":video_id,"processed":True})
-            video_exists = True if len(DB.GetEntries(db.cursor,"videos","title",{"id":video_id})) > 0 else False
+            complete_video = DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"title,processed",{"id":video_id,"processed":True})
+            video_exists = True if len(DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"title",{"id":video_id})) > 0 else False
             if len(complete_video) > 0:
                 vid_stats.skipped_videos += 1
                 vidbar.set_postfix_str(Update_Postfix_Videos())
@@ -136,11 +136,11 @@ with LOG.TQDM_Logging():
 
             # Will update the video in database if something changed in the returned JSON data
             if video_exists == False:
-                DB.InsertEntries(db.cursor,"videos",[vid.entry])
+                DB.InsertEntries(cursor=db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
                 db.database.commit()
             elif vid.status == "Update":
                 for column, value in vid.entry.items():
-                    DB.UpdateEntry(db.cursor,"videos",column,value,"id",vid.id)
+                    DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],column,value,"id",vid.id)
                     db.database.commit()
 
             #-----------------------------#
@@ -152,7 +152,7 @@ with LOG.TQDM_Logging():
                 message_stats = yt.Get_Messages(vid)
                 message_stats.append_all(all_chat_stats) # Update the global stats for chats and users
                 if vid.livestream == False:
-                    DB.UpdateEntry(db.cursor,"videos","processed",True,"id",vid.id)
+                    DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
                     db.database.commit()
                 vid_stats.success_videos += 1
                 if vid.livestream == True:
@@ -160,7 +160,7 @@ with LOG.TQDM_Logging():
             # Regular videos (or streams that have been edited) have no chat
             except chat_downloader.errors.NoChatReplay as e:
                 if vid.livestream == False:
-                    DB.UpdateEntry(db.cursor,"videos","processed",True,"id",vid.id)
+                    DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
                     db.database.commit()
                 vid_stats.no_chat_videos += 1
                 LOG.logger.warning(f"No Chat Replay available.")
@@ -190,7 +190,7 @@ def Batch_Users(users):
 
 LOG.logger.info("Obtaining all unprocessed users from database...")
 # Get fresh users from the DB
-unique_users = DB.GetEntries(db.cursor,"user_ids","id",{"processed":False})
+unique_users = DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id",{"processed":False})
 LOG.logger.info(f"Total of {len(unique_users)} unique user(s) aquired.")
 
 # List of IDs

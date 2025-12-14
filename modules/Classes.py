@@ -645,8 +645,8 @@ class YT_API:
                             #----------------------#
 
                             # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
-                            if len(DB.GetEntries(self.db.cursor,"user_ids",filter={"id":msg.usr_id})) == 0:
-                                DB.InsertEntries(self.db.cursor,"user_ids",[{"id":msg.usr_id}])
+                            if len(DB.GetEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],filter={"id":msg.usr_id})) == 0:
+                                DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
                                 self.db.database.commit()
                                 chat_stats.new_user_ids += 1
                                 unique_user_ids.add(msg.usr_id)
@@ -660,15 +660,15 @@ class YT_API:
 
                             # Add Unique Emotes if they don't already exist in DB
                             if len(msg.e_emote_entries) > 0:
-                                DB.InsertEntries(self.db.cursor,"emotes",msg.e_emote_entries,"id")
+                                DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,"id")
 
                             #----------------------#
                             #-- MESSAGE DATABASE --#
                             #----------------------#
 
                             # Add message to DB if it doesn't already exist
-                            if len(DB.GetEntries(self.db.cursor,"messages",filter={"message_id":msg.id})) == 0:
-                                DB.InsertEntries(self.db.cursor,"messages",[msg.entry])
+                            if len(DB.GetEntries(self.db.cursor,CFG.DB_TABLES["messages"],filter={"message_id":msg.id})) == 0:
+                                DB.InsertEntries(cursor=self.db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
                                 self.db.database.commit()
 
                                 #-----------------------#
@@ -676,7 +676,7 @@ class YT_API:
                                 #-----------------------#
 
                                 # Get all the nicknames to search for
-                                nickname_entries = DB.GetEntries(self.db.cursor,"nicknames","nickname")
+                                nickname_entries = DB.GetEntries(self.db.cursor,CFG.DB_TABLES["nicknames"],"nickname")
                                 nicknames:list[str] = []
                                 for nick_entry in nickname_entries:
                                     for key in nick_entry.keys():
@@ -707,7 +707,7 @@ class YT_API:
                                                     used_positions.update(range(start, end))
                                                     entries.append(entry)
                                     
-                                    DB.InsertEntries(self.db.cursor,"nickname_matches",entries,"message_id,index_start,index_end")
+                                    DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
                                     self.db.database.commit()
 
                                 chat_stats.new_messages += 1
@@ -766,7 +766,7 @@ class YT_API:
                 #-- WRITE USER DATA TO DISK --#
                 #-----------------------------#
 
-                temp_path = f"{CFG.DATA_PATH}/users/{u.id}_TEMP.json"
+                temp_path = f"{CFG.USER_PATH}/{u.id}_TEMP.json"
 
                 # Write user data to file
                 with open(temp_path,'w') as file:
@@ -777,7 +777,7 @@ class YT_API:
                     new_hash = xxhash.xxh128_hexdigest(image.read())
 
                 data_hashes = set()
-                user_path = f"{CFG.DATA_PATH}/users/{u.id}.json"
+                user_path = f"{CFG.USER_PATH}/{u.id}.json"
 
                 # Check if user data already exists
                 if os.path.isfile(user_path):
@@ -786,7 +786,7 @@ class YT_API:
                         data_hashes.add(xxhash.xxh128_hexdigest(data.read()))
                     # Create a new filename
                     number = 1
-                    new_path = f"{CFG.DATA_PATH}/users/{u.id}_{number}.json"
+                    new_path = f"{CFG.USER_PATH}/{u.id}_{number}.json"
 
                     # Increment until no overlapping name
                     while os.path.isfile(new_path):
@@ -795,7 +795,7 @@ class YT_API:
                             data_hashes.add(xxhash.xxh128_hexdigest(image.read()))
 
                         number += 1
-                        new_path = f"{CFG.DATA_PATH}/users/{u.id}_{number}.json"
+                        new_path = f"{CFG.USER_PATH}/{u.id}_{number}.json"
                     # Delete it if it already matches another one
                     if new_hash in data_hashes:
                         os.remove(temp_path)
@@ -810,7 +810,7 @@ class YT_API:
                 #------------------------------#
 
                 if u.pfp is not None:
-                    temp_pfp = f"{CFG.DATA_PATH}/users/{u.id}_pfp_TEMP.jpg"
+                    temp_pfp = f"{CFG.USER_PATH}/{u.id}_pfp_TEMP.jpg"
 
                     # Download a fresh pfp
                     with open(temp_pfp,'wb') as handle:
@@ -827,7 +827,7 @@ class YT_API:
 
                     # Check for previously downloaded profile picture
                     pfp_hashes = set()
-                    pfp_path = f"{CFG.DATA_PATH}/users/{u.id}_pfp.jpg"
+                    pfp_path = f"{CFG.USER_PATH}/{u.id}_pfp.jpg"
 
                     # Check if a profile picture already exists
                     if os.path.isfile(pfp_path):
@@ -838,7 +838,7 @@ class YT_API:
 
                         # Create a new filename
                         number = 1
-                        new_path = f"{CFG.DATA_PATH}/users/{u.id}_pfp_{number}.jpg"
+                        new_path = f"{CFG.USER_PATH}/{u.id}_pfp_{number}.jpg"
 
                         # Increment until no overlapping name
                         while os.path.isfile(new_path):
@@ -847,7 +847,7 @@ class YT_API:
                                 pfp_hashes.add(xxhash.xxh128_hexdigest(image.read()))
 
                             number += 1
-                            new_path = f"{CFG.DATA_PATH}/users/{u.id}_pfp_{number}.jpg"
+                            new_path = f"{CFG.USER_PATH}/{u.id}_pfp_{number}.jpg"
 
                         # Delete it if it already matches another one
                         if new_hash in pfp_hashes:
@@ -864,10 +864,10 @@ class YT_API:
 
                 # Update the unprocessed User_ID with additional information
                 for column, value in u.entry.items():
-                    DB.UpdateEntry(self.db.cursor,"user_ids",column,value,"id",u.id)
+                    DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],column,value,"id",u.id)
                     self.db.database.commit()
 
-                DB.UpdateEntry(self.db.cursor,"user_ids","processed",True,"id",u.id)
+                DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",u.id)
                 self.db.database.commit()
 
                 valid_ids.add(u.id)
@@ -878,8 +878,8 @@ class YT_API:
 
         for user in all_users:
             if user not in valid_ids:
-                DB.UpdateEntry(self.db.cursor,"user_ids","exists",False,"id",user)
-                DB.UpdateEntry(self.db.cursor,"user_ids","processed",True,"id",user)
+                DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"exists",False,"id",user)
+                DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",user)
                 self.db.database.commit()
                 invalid += 1
         
