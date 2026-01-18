@@ -17,6 +17,11 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
+# S3 API
+import boto3
+from types_boto3_s3.client import S3Client
+from botocore.exceptions import ClientError
+
 # Other Project Files
 import modules.logconfig as LOG
 import modules.Settings as CFG
@@ -41,7 +46,7 @@ class ChatStats:
         self.new_user_ids:int = 0
         self.exist_user_ids = set()
         self.invalid_users:int = 0
-    
+
     def append_all(self,all_chat_stats:'ChatStats'):
         """Updates the total stats with additional numbers"""
         all_chat_stats.total_messages += self.total_messages
@@ -50,9 +55,121 @@ class ChatStats:
         all_chat_stats.new_user_ids += self.new_user_ids
         all_chat_stats.exist_user_ids = all_chat_stats.exist_user_ids.union(self.exist_user_ids)
 
+class H3Client():
+    def __init__(self) -> None:
+        self.client:S3Client = boto3.client(
+        's3',
+        endpoint_url=CFG.ENDPOINT_URL,
+        aws_access_key_id=CFG.ENDPOINT_ID,
+        aws_secret_access_key=CFG.ENDPOINT_KEY,
+        region_name=CFG.ENDPOINT_REGION
+    )
+    def get_all_buckets(self):
+        response = self.client.list_buckets()
+        buckets = response.get('Buckets')
+        bucket_list:list[str] = []
+        for bucket in buckets:
+            bucket_name = bucket.get("Name")
+            if bucket_name:
+                bucket_list.append(bucket_name)
+        return bucket_list
+
+class H3Bucket:
+    def __init__(self,client:S3Client,bucket_name:str,local_dir:str) -> None:
+        self.name = bucket_name
+        self.client = client
+        self.local_root = local_dir
+        try:
+            self.client.head_bucket(Bucket=self.name)
+        except ClientError as e:
+            error_code = e.response['Error']['Code'] #type:ignore
+            if error_code == '404':
+                LOG.logger.error(f"Bucket {self.name} does not exist!")
+            if error_code == '403':
+                LOG.logger.error(f"No permission to access bucket {self.name}!")
+            else:
+                LOG.logger.error(f"Error accessing bucket {self.name}:\n{e}")
+        except Exception as e:
+            LOG.logger.error(f"Error accessing bucket {self.name}:\n{e}")
+
+    def get_object_count(self):
+        paginator = self.client.get_paginator('list_objects_v2')
+        count_iterator = paginator.paginate(Bucket=self.name).search('KeyCount')
+        total_keys = sum(count for count in count_iterator)
+        return total_keys
+
+    def iterate_all_objects(self,filter:str|None=None):
+        paginator = self.client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=self.name,Prefix=filter) if filter else paginator.paginate(Bucket=self.name)
+        for page in pages:
+            page_packet = []
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    page_packet.append({'Key': obj['Key']}) #type:ignore
+            yield page_packet
+
+    def delete_objects(self,filter:str|None=None):
+        deleted_count:int = 0
+        try:
+            for obj_packet in self.iterate_all_objects(filter):
+                response = self.client.delete_objects(
+                    Bucket=self.name,
+                    Delete={"Objects":obj_packet}
+                )
+                deleted = len(response.get('Deleted', []))
+                deleted_count += deleted
+                if 'Errors' in response:
+                    for error in response['Errors']:
+                        LOG.logger.warning(f"Error deleting {error['Key']}: {error['Message']}") #type:ignore
+                LOG.logger.info(f"Deleted {deleted} object(s)")
+            return deleted_count
+        except ClientError as e:
+            LOG.logger.error(f"Error deleting object(s): {e}")
+            return -1
+
+    def check_object_exists(self,object_name:str):
+        try:
+            self.client.head_object(Bucket=self.name,Key=object_name)
+            return True # File DOES Exist
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404': #type:ignore
+                return False # File does NOT exist
+            else:
+                LOG.logger.error(f"Error checking object {object_name}: {e}")
+                return e
+
+    def upload_object(self,path:str,object_name:str):
+        try:
+            object_status = self.check_object_exists(object_name)
+            if isinstance(object_status,ClientError):
+                raise object_status
+            if object_status is True:
+                self.client.upload_file(path,self.name,object_name)
+                return True # File Overwritten
+            else:
+                self.client.upload_file(path,self.name,object_name)
+                return False # File Uploaded
+        except ClientError as e:
+            LOG.logger.error(f"Client Error while uploading {object_name}: {e}")
+            return e # Error Uploading
+
+    def download_object(self,object_name:str,file_path:str):
+        try:
+            object_status = self.check_object_exists(object_name)
+            if isinstance(object_status,ClientError):
+                raise object_status
+            elif object_status is False:
+                return False # No file to download
+            else:
+                self.client.download_file(self.name,object_name,file_path)
+                return True # File downloaded
+        except ClientError as e:
+            LOG.logger.error(f"Client Error while downloading {object_name}: {e}")
+            return e # Error Uploading
+
 class VideoClass:
     """
-    A Class that will nab all the data currently implemented into the database structure. 
+    A Class that will nab all the data currently implemented into the database structure.
     Creates a useful self.entry variable for piping into the database method(s) as needed.
 
     :param video: The JSON file (preferably loaded from json.load), ideally provided from the Get_All_Videos method in the YT_API class
@@ -66,10 +183,9 @@ class VideoClass:
         try:
 
             self.id:str|None = video.get("id") # Back-end ID for video
-            self.file = f"{CFG.DATA_PATH}/{self.id}.json" # Filename for JSON dump
             self._snippet:dict[str,Any]|None = video.get("snippet")
             self._liveStreamingDetails:dict[str,Any]|None = video.get("liveStreamingDetails")
-            
+
             if self._snippet is not None:
 
                 # Date video was released / VOD was generated
@@ -124,6 +240,7 @@ class VideoClass:
 
                     self.thumbnail:str|None = self._thumbnail.get("url") if self._thumbnail is not None else None
 
+
             self.entry:dict[str,Any] = {
                 "id":self.id,
                 "title":self.title,
@@ -137,12 +254,12 @@ class VideoClass:
         except Exception as e:
             LOG.logger.error(f"Video file {self.id} not initialized:\n{e}")
             raise e
-    
-    def Get_Thumbnail(self):
-        """Will download the video thumbnail. Checks if there's an updated one and renames the old one and downloads a new one."""
-        if self.thumbnail is not None:
-            temp_thumb = f"{CFG.DATA_PATH}/{self.id}_Thumbnail_TEMP.jpg"
 
+    def Get_Thumbnail(self,bucket:H3Bucket):
+        """Will download the video thumbnail. Checks if there's an updated one and renames the old one and downloads a new one."""
+
+        if self.thumbnail is not None and self.id is not None:
+            temp_thumb = f"{bucket.local_root}/{CFG.THUMBNAIL_TAG}/{self.id}_TEMP.jpg"
             # Download a fresh thumbnail
             with open(temp_thumb,'wb') as handle:
                 img_response = requests.get(self.thumbnail,stream=True)
@@ -152,46 +269,12 @@ class VideoClass:
                     if not block:
                         break
                     handle.write(block)
-            # Hash the fresh thumbnail
-            with open(temp_thumb,"rb") as image:
-                new_hash = xxhash.xxh128_hexdigest(image.read())
 
-            # Check for previously downloaded thumbnails
-            thumbnail_hashes = set()
-            thumb_path = f"{CFG.DATA_PATH}/{self.id}_Thumbnail.jpg"
-
-            # Check if a thumbnail already exists
-            if os.path.isfile(thumb_path):
-
-                # Hash the file and store it for cross referencing
-                with open(thumb_path,"rb") as image:
-                    thumbnail_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                # Create a new filename
-                number = 1
-                new_path = f"{CFG.DATA_PATH}/{self.id}_Thumbnail_{number}.jpg"
-
-                # Increment until no overlapping name
-                while os.path.isfile(new_path):
-                    # Hash the file and store it for cross referencing
-                    with open(new_path,"rb") as image:
-                        thumbnail_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                    number += 1
-                    new_path = f"{CFG.DATA_PATH}/{self.id}_Thumbnail_{number}.jpg"
-
-                # Delete it if it already matches another one
-                if new_hash in thumbnail_hashes:
-                    os.remove(temp_thumb)
-                else:
-                    os.rename(thumb_path,new_path)
-                    os.rename(temp_thumb,thumb_path)
-            else:
-                os.rename(temp_thumb,thumb_path)
+            _check_and_upload_file(bucket,temp_thumb,self.id,"jpg",CFG.THUMBNAIL_TAG)
 
 class MessageClass:
     """
-    A Class that will nab all the data currently implemented into the database structure. 
+    A Class that will nab all the data currently implemented into the database structure.
     Creates a useful self.entry variable for piping into the database method(s) as needed.
 
     :param message: The JSON file (preferably loaded from json.load), ideally provided from the get_chat method from the ChatDownloader tool developed by xenova
@@ -322,7 +405,7 @@ class MessageClass:
 
 class UserClass:
     """
-    A Class that will nab all the data currently implemented into the database structure. 
+    A Class that will nab all the data currently implemented into the database structure.
     Creates a useful self.entry variable for piping into the database method(s) as needed.
 
     :param user: The JSON file (preferably loaded from json.load), containing the API response from a channel request from Youtube
@@ -379,28 +462,28 @@ class UserClass:
 
 class YT_API:
     """
-    Creates a usable API endpoint for making calls. Was initially going to handle ALL calls using your own provided credentials, 
+    Creates a usable API endpoint for making calls. Was initially going to handle ALL calls using your own provided credentials,
     but xenova's ChatDownloader tool worked so well I pivoted to utilizing that for getting chat messages.
 
     :param database: Initialized Database Object the methods can use to make queries on.
     :type database: Database Object
     """
     def __init__(self,database:DB.PostgresClass):
-        
+
         def get_authenticated_service():
             """
             Authenticates credientials onto the Youtube API.
-            
+
             :return: Youtube API object for making calls with.
             :rtype: API Object
             """
             credentials:Any | google.auth.external_account_authorized_user.Credentials | google.oauth2.credentials.Credentials = None
-            
+
             # Check if we have saved credentials
             if os.path.exists(CFG.TOKEN_PICKLE_FILE):
                 with open(CFG.TOKEN_PICKLE_FILE, 'rb') as token:
                     credentials = pickle.load(token)
-            
+
             # If credentials don't exist or are invalid, run the flow
             if not credentials or not credentials.valid:
                 if credentials and credentials.expired and credentials.refresh_token:
@@ -412,13 +495,13 @@ class YT_API:
                 else:
                     flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
                     credentials = flow.run_local_server(port=0)
-                
+
                 # Save credentials for future use
                 with open(CFG.TOKEN_PICKLE_FILE, 'wb') as token:
                     pickle.dump(credentials, token)
-            
+
             api_resource = build('youtube', 'v3', credentials=credentials)
-            
+
             return api_resource
 
         self.api = get_authenticated_service()
@@ -439,8 +522,8 @@ class YT_API:
 
         LOG.logger.info(f"{video_count} video(s) found!")
         return video_count
-    
-    def Get_Video_Info(self,id:str):
+
+    def Get_Video_Info(self,id:str,bucket:H3Bucket):
         request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=id)
 
         response = request.execute()
@@ -454,58 +537,21 @@ class YT_API:
             del video["kind"]
             del video["etag"]
 
-            temp_path = f"{CFG.DATA_PATH}/{id}_TEMP.json"
+            temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{id}_TEMP.json"
 
             # Write Video data to file
             with open(temp_path,'w') as file:
                 file.write(json.dumps(video,indent=4))
 
-            # Hash the video data
-            with open(temp_path,"rb") as image:
-                new_hash = xxhash.xxh128_hexdigest(image.read())
+            video_detail_status = _check_and_upload_file(bucket,temp_path,id,"json",CFG.DETAIL_TAG)
 
-            data_hashes = set()
-            filepath = f"{CFG.DATA_PATH}/{id}.json"
-
-            # Check if video data already exists
-            if os.path.isfile(filepath):
-
-                # Hash the file and store it for cross referencing
-                with open(filepath,"rb") as data:
-                    data_hashes.add(xxhash.xxh128_hexdigest(data.read()))
-
-                # Create a new filename
-                number = 1
-                new_path = f"{CFG.DATA_PATH}/{id}_{number}.json"
-
-                # Increment until no overlapping name
-                while os.path.isfile(new_path):
-                    # Hash the file and store it for cross referencing
-                    with open(new_path,"rb") as image:
-                        data_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                    number += 1
-                    new_path = f"{CFG.DATA_PATH}/{id}_{number}.json"
-
-                # Delete it if it already matches another one
-                if new_hash in data_hashes:
-                    os.remove(temp_path)
-                    status = "Existing"
-                else:
-                    os.rename(filepath,new_path)
-                    os.rename(temp_path,filepath)
-                    status = "Update"
-            else:
-                os.rename(temp_path,filepath)
-                status = "New"
-
-            vid_obj = VideoClass(video,status)
+            vid_obj = VideoClass(video,video_detail_status)
 
             return vid_obj
         else:
             return None
 
-    def Get_All_Videos(self):
+    def Get_All_Videos(self,bucket:H3Bucket):
         """
         Retrieves all YT videos from a playlist, and returns a list of video_ids
 
@@ -514,18 +560,13 @@ class YT_API:
         :return: video_ids of all videos from the playlist
         :rtype: List of Strings
         """
-        
         with LOG.TQDM_Logging():
             with tqdm(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
 
                 request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
-
                 response = request.execute()
-
                 next_page = response["nextPageToken"]
-
                 video_list:list[dict[str,Any]] = response["items"]
-
                 dl_vidbar.update(len(video_list))
 
                 while True:
@@ -534,33 +575,33 @@ class YT_API:
                     else:
                         next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50,pageToken=next_page)
                         next_response = next_request.execute()
-
                         try:
                             next_page = next_response["nextPageToken"]
                         except:
                             next_page = None
-
                         response_items:list[dict] = next_response["items"]
-
                         dl_vidbar.update(len(response_items))
-
                         video_list:list[dict[str,Any]] = video_list + response_items
 
-        with open(f"{CFG.DATA_PATH}/__Video_Playlist.json",'w') as file:
+        playlist_name = "Video_Playlist" if CFG.GET_MEMBERS_ONLY is False else f"Video_Playlist{CFG.MEMBERS_ONLY_FLAG}"
+        playlist_path = f"{CFG.LOCAL_DATA_PATH}/{playlist_name}_TEMP.json"
+        with open(playlist_path,'w') as file:
             file.write(json.dumps(video_list,indent=4))
+
+        _check_and_upload_file(bucket,playlist_path,playlist_name,"json")
 
         ids:list[str] = []
 
         for video in video_list:
             vid_id:str = video["contentDetails"]["videoId"]
             ids.append(vid_id)
-        
+
         return ids
 
-    def Get_Messages(self,video:VideoClass,skip_download=False):
+    def Get_Messages(self,video:VideoClass,bucket:H3Bucket,skip_download=False):
         """
         Retrieves all chat messages from a given video, saves them to JSON files, and enters them into the database.
-        
+
         Writes a JSON formatted file for each video. File is named "[YT URL]_Messages.json"
 
         :param video: The video that is used to get the chats from
@@ -568,58 +609,69 @@ class YT_API:
         :return: Stats about the messages that were parsed, and the users who sent them
         :rtype: ChatStats object
         """
-
-        def _WriteFile():
+        def _WriteFile(object_name:str,object_path:str,existing_messages:list[dict[str,Any]],collected_messages:list[dict[str,Any]]):
             """
             Writes the downloaded chat data to a file with the name of the video ID.
             If the file already exists, load up all existsing chat meessages and
             add any new ones to the file.
             """
-            
-            message_path = f'{CFG.DATA_PATH}/{v.id}_Messages.json'
 
-            if os.path.isfile(message_path):
-                e_ids = set()
-                
-                with open(message_path,'r') as file:
-                    all_messages = json.load(file) #type: list[dict]
-                
-                for ex_message in all_messages:
+            e_ids = set()
+            messages_to_save:list[dict[str,Any]] = []
+
+            if existing_messages:
+                for ex_message in existing_messages:
                     em_id = ex_message["message_id"]
                     e_ids.add(em_id)
+                    messages_to_save.append(ex_message)
 
-                for n_message in message_list:
-                    nm_id = n_message["message_id"]
-                    if nm_id in e_ids:
-                        continue
-                    else:
-                        all_messages.append(n_message)
+            for message in collected_messages:
+                nm_id = message["message_id"]
+                if nm_id in e_ids:
+                    continue
+                else:
+                    messages_to_save.append(message)
 
-                with open(message_path,'w') as file:
-                    file.write(json.dumps(all_messages,indent=4))
-            else:
-                with open(message_path,'w') as file:
-                    file.write(json.dumps(message_list,indent=4))
-        
+            with open(object_path,"w") as file:
+                file.write(json.dumps(messages_to_save,indent=4))
+
+            upload_status = bucket.upload_object(object_path,object_name)
+            if isinstance(upload_status,ClientError):
+                raise upload_status
+
         v = video
+
+        message_object = f"{CFG.MESSAGES_TAG}/{v.id}.json"
+        existing_messages_local = f'{bucket.local_root}/{message_object}'
+        messages_exist = bucket.check_object_exists(message_object)
+        if isinstance(messages_exist,ClientError):
+            raise messages_exist
+        elif messages_exist is True:
+            downloaded_object = bucket.download_object(message_object,existing_messages_local)
+            if isinstance(downloaded_object,ClientError):
+                raise downloaded_object
+            elif os.path.isfile(existing_messages_local):
+                with open(existing_messages_local,'r') as file:
+                    messages_on_file:list[dict[str,Any]] = json.load(file) #type: list[dict]
+            else:
+                messages_on_file = []
+        else:
+            messages_on_file = []
 
         #-----------------------#
         #-- GET ALL CHAT DATA --#
         #-----------------------#
 
         if skip_download == True:
-            message_path = f'{CFG.DATA_PATH}/{v.id}_Messages.json'
-            if os.path.isfile(message_path):
-                with open(message_path,'r') as file:
-                    messages_on_file = json.load(file) #type: list[dict]
+            pass
         else:
             # Timeout will prevent sitting endlessly on a waiting room or livestream
             if CFG.TIMEOUT == True:
-                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'],inactivity_timeout=5)
+                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'],inactivity_timeout=20)
             else:
                 chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
 
-        message_list = []
+        message_list:list[dict[str,Any]] = []
         chat_stats = ChatStats()
 
         chat_list = chat if skip_download == False else messages_on_file
@@ -706,7 +758,7 @@ class YT_API:
                                                     }
                                                     used_positions.update(range(start, end))
                                                     entries.append(entry)
-                                    
+
                                     DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
                                     self.db.database.commit()
 
@@ -722,17 +774,18 @@ class YT_API:
                         except Exception as e:
                             messbar.update(1)
                             raise e
+
                 except Exception as r:
-                    _WriteFile() # If it crashes, at least we get some of the messages to file so we can debug.
+                    _WriteFile(message_object,existing_messages_local,messages_on_file,message_list) # If it crashes, at least we get some of the messages to file so we can debug.
                     raise r
 
-                _WriteFile()
+                _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
 
         return chat_stats
 
-    def Get_User_Batch(self,users:list[str]):
+    def Get_User_Batch(self,users:list[str],bucket:H3Bucket):
         """Gets data about all users in the list of users. Will keep track of invalid users.
-        
+
         NOTE: the Youtube API call will only return 50 at most, break lists up into chunks of 50.
 
         :param users: List of 50 or less users
@@ -756,124 +809,59 @@ class YT_API:
 
         try:
             for user in user_list:
-                
+
                 del user["kind"]
                 del user["etag"]
 
                 u = UserClass(user)
 
-                #-----------------------------#
-                #-- WRITE USER DATA TO DISK --#
-                #-----------------------------#
+                if u.id is not None:
+                    #-----------------------------#
+                    #-- WRITE USER DATA TO DISK --#
+                    #-----------------------------#
 
-                temp_path = f"{CFG.USER_PATH}/{u.id}_TEMP.json"
+                    temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{u.id}_TEMP.json"
 
-                # Write user data to file
-                with open(temp_path,'w') as file:
-                    file.write(json.dumps(user,indent=4))
+                    # Write user data to file
+                    with open(temp_path,'w') as file:
+                        file.write(json.dumps(user,indent=4))
 
-                # Hash the user data
-                with open(temp_path,"rb") as image:
-                    new_hash = xxhash.xxh128_hexdigest(image.read())
+                    user_detail_status = _check_and_upload_file(bucket,temp_path,u.id,"json",CFG.DETAIL_TAG)
 
-                data_hashes = set()
-                user_path = f"{CFG.USER_PATH}/{u.id}.json"
+                    #------------------------------#
+                    #-- PROFILE PICTURE DOWNLOAD --#
+                    #------------------------------#
 
-                # Check if user data already exists
-                if os.path.isfile(user_path):
-                    # Hash the file and store it for cross referencing
-                    with open(user_path,"rb") as data:
-                        data_hashes.add(xxhash.xxh128_hexdigest(data.read()))
-                    # Create a new filename
-                    number = 1
-                    new_path = f"{CFG.USER_PATH}/{u.id}_{number}.json"
+                    if u.pfp is not None:
+                        temp_pfp = f"{bucket.local_root}/{CFG.PFP_TAG}/{u.id}_TEMP.jpg"
+                        # Download a fresh thumbnail
+                        with open(temp_pfp,'wb') as handle:
+                            img_response = requests.get(u.pfp,stream=True)
+                            if not img_response.ok:
+                                LOG.logger.info(img_response)
+                            for block in img_response.iter_content(1024):
+                                if not block:
+                                    break
+                                handle.write(block)
 
-                    # Increment until no overlapping name
-                    while os.path.isfile(new_path):
-                        # Hash the file and store it for cross referencing
-                        with open(new_path,"rb") as image:
-                            data_hashes.add(xxhash.xxh128_hexdigest(image.read()))
+                        _check_and_upload_file(bucket,temp_pfp,u.id,"jpg",CFG.PFP_TAG)
 
-                        number += 1
-                        new_path = f"{CFG.USER_PATH}/{u.id}_{number}.json"
-                    # Delete it if it already matches another one
-                    if new_hash in data_hashes:
-                        os.remove(temp_path)
-                    else:
-                        os.rename(user_path,new_path)
-                        os.rename(temp_path,user_path)
-                else:
-                    os.rename(temp_path,user_path)
+                    #------------------------------#
+                    #-- USER DATABASE OPERATIONS --#
+                    #------------------------------#
 
-                #------------------------------#
-                #-- PROFILE PICTURE DOWNLOAD --#
-                #------------------------------#
+                    # Update the unprocessed User_ID with additional information
+                    for column, value in u.entry.items():
+                        DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],column,value,"id",u.id)
+                        self.db.database.commit()
 
-                if u.pfp is not None:
-                    temp_pfp = f"{CFG.USER_PATH}/{u.id}_pfp_TEMP.jpg"
-
-                    # Download a fresh pfp
-                    with open(temp_pfp,'wb') as handle:
-                        img_response = requests.get(u.pfp,stream=True)
-                        if not img_response.ok:
-                            LOG.logger.info(img_response)
-                        for block in img_response.iter_content(1024):
-                            if not block:
-                                break
-                            handle.write(block)
-                    # Hash the fresh profile picture
-                    with open(temp_pfp,"rb") as image:
-                        new_hash = xxhash.xxh128_hexdigest(image.read())
-
-                    # Check for previously downloaded profile picture
-                    pfp_hashes = set()
-                    pfp_path = f"{CFG.USER_PATH}/{u.id}_pfp.jpg"
-
-                    # Check if a profile picture already exists
-                    if os.path.isfile(pfp_path):
-
-                        # Hash the file and store it for cross referencing
-                        with open(pfp_path,"rb") as image:
-                            pfp_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                        # Create a new filename
-                        number = 1
-                        new_path = f"{CFG.USER_PATH}/{u.id}_pfp_{number}.jpg"
-
-                        # Increment until no overlapping name
-                        while os.path.isfile(new_path):
-                            # Hash the file and store it for cross referencing
-                            with open(new_path,"rb") as image:
-                                pfp_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                            number += 1
-                            new_path = f"{CFG.USER_PATH}/{u.id}_pfp_{number}.jpg"
-
-                        # Delete it if it already matches another one
-                        if new_hash in pfp_hashes:
-                            os.remove(temp_pfp)
-                        else:
-                            os.rename(pfp_path,new_path)
-                            os.rename(temp_pfp,pfp_path)
-                    else:
-                        os.rename(temp_pfp,pfp_path)
-
-                #------------------------------#
-                #-- USER DATABASE OPERATIONS --#
-                #------------------------------#
-
-                # Update the unprocessed User_ID with additional information
-                for column, value in u.entry.items():
-                    DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],column,value,"id",u.id)
+                    DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",u.id)
                     self.db.database.commit()
 
-                DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",u.id)
-                self.db.database.commit()
-
-                valid_ids.add(u.id)
+                    valid_ids.add(u.id)
         except:
             invalid += 1
-        
+
         all_users = users
 
         for user in all_users:
@@ -882,9 +870,12 @@ class YT_API:
                 DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",user)
                 self.db.database.commit()
                 invalid += 1
-        
+
         return invalid
 
+########################
+### HELPER FUNCTIONS ###
+########################
 
 def _get_date_time(timestamp:str):
     """Some timestamp strings in the API include fractions of a second."""
@@ -892,7 +883,7 @@ def _get_date_time(timestamp:str):
     match = re.match(pattern, timestamp)
     if not match:
         raise ValueError(f"Invalid datetime format: {timestamp}")
-    
+
     base = match.group(1)
     microseconds = match.group(2)
 
@@ -902,3 +893,120 @@ def _get_date_time(timestamp:str):
     else:
         formatted_string = f"{base}.000000"
     return datetime.strptime(formatted_string, "%Y-%m-%dT%H:%M:%S.%f")
+
+def _check_and_upload_file(bucket:H3Bucket,temp_path:str,file_name:str,file_extension:str,file_tag:str|None=None):
+
+    def _build_paths(basepath:str|None=None,counter:str|int|None=None):
+        if counter:
+            full_name = f"{file_name}_{counter}.{file_extension}"
+        else:
+            full_name = f"{file_name}.{file_extension}"
+
+        if file_tag:
+            key_name = f"{file_tag}/{full_name}"
+        else:
+            key_name = f"{full_name}"
+
+        if basepath:
+            local_path = f"{basepath}/{key_name}"
+        else:
+            local_path = f"{key_name}"
+        return key_name,local_path
+
+    # Hash the fresh file
+    with open(temp_path,"rb") as image:
+        new_hash = xxhash.xxh128_hexdigest(image.read())
+
+    #------------------------------#
+    #-- CHECK FOR EXISTING FILES --#
+    #------------------------------#
+
+    hash_set:set[str] = set()
+    file_list:list[str] = []
+    file_key,file_path = _build_paths(bucket.local_root)
+
+    try:
+        # See if file already exists
+        object_exists = bucket.check_object_exists(file_key)
+        if isinstance(object_exists,ClientError):
+            raise object_exists
+
+            #-----------------------------------------------#
+            #-- UPLOAD NEWEST FILE: WHEN FILE DON'T EXIST --#
+            #-----------------------------------------------#
+
+        elif object_exists is False:
+            os.rename(temp_path,file_path)
+            file_list.append(file_path)
+            file_uploaded = bucket.upload_object(file_path,file_key)
+            if isinstance(file_uploaded,ClientError):
+                raise file_uploaded
+            status = "New"
+
+            #----------------------------#
+            #-- GET ALL EXISTING FILES --#
+            #----------------------------#
+
+        else:
+            # Attempt to download existing file
+            file_downloaded = bucket.download_object(file_key,file_path)
+            if isinstance(file_downloaded,ClientError):
+                raise file_downloaded
+            # Hash the file and store it for cross referencing
+            with open(file_path,"rb") as image:
+                hash_set.add(xxhash.xxh128_hexdigest(image.read()))
+            # Add path to list for deletion later
+            file_list.append(file_path)
+
+            counter = 1
+            next_name,next_path = _build_paths(bucket.local_root,counter)
+
+            # Loop and download files until the next_path doesn't exist
+            next_file_exists = bucket.check_object_exists(next_path)
+            if isinstance(next_file_exists,ClientError):
+                raise next_file_exists
+            while next_file_exists is True:
+                file_downloaded = bucket.download_object(next_name,next_path)
+                if isinstance(file_downloaded,ClientError):
+                    raise file_downloaded
+                # Hash the file and store it for cross referencing
+                with open(next_path,"rb") as image:
+                    hash_set.add(xxhash.xxh128_hexdigest(image.read()))
+                # Add path to list for deletion later
+                file_list.append(next_path)
+
+                counter += 1
+                next_name,next_path = _build_paths(bucket.local_root,counter)
+                next_file_exists = bucket.check_object_exists(next_path)
+                if isinstance(next_file_exists,ClientError):
+                    raise next_file_exists
+
+            #-------------------------------------------------#
+            #-- UPLOAD NEWEST FILE: WHEN FILE ALREADY EXIST --#
+            #-------------------------------------------------#
+
+            # If the new file doesn't match any existing ones:
+            # Rename the last exiting file, upload it, replace it with the new one
+            if new_hash not in hash_set:
+                os.rename(file_path,next_path)
+                file_list.append(next_path)
+                file_uploaded = bucket.upload_object(next_path,next_name)
+                if isinstance(file_uploaded,ClientError):
+                    raise file_uploaded
+                os.rename(temp_path,file_path)
+                file_uploaded = bucket.upload_object(file_path,file_key)
+                if isinstance(file_uploaded,ClientError):
+                    raise file_uploaded
+                status = "Update"
+            else:
+                status = "Existing"
+
+            # Cleanup local files
+            if len(file_list) > 0:
+                for file in file_list:
+                    if os.path.isfile(file):
+                        os.remove(file)
+    except ClientError as e:
+        LOG.logger.error(f"Error processing file for {file_name}:\n{e}")
+        status = "ERROR"
+    return status

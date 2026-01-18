@@ -1,5 +1,5 @@
 # Native Stuff
-import json
+import json,os
 from sys import exit
 from tkinter import filedialog,messagebox
 
@@ -7,41 +7,12 @@ from tkinter import filedialog,messagebox
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-# YT INFORMATION
-# Given just the UserID, all other IDs can be generated for the upload playlists and channel ID.
-# If you only have the ChannelID, remove the "UC" at the start and put it into the UserID field.
-# NOTE: Custom handles DO NOT work, you need the ID number with all the random characters.
-MEMBER_DIRECTORY = {
-    "Calli":{
-        "user_id":"L_qhgtOy0dy1Agp8vkySQg",
-        "db_suffix":"calli",
-        "database_members":"YTDB_Calli_Members",
-    },
-    "Kiara":{
-        "user_id":"Hsx4Hqa-1ORjQTh9TYDhww",
-        "db_suffix":"kiara",
-        "database_members":"YTDB_Kiara_Members",
-    },
-    "Ina":{
-        "user_id":"MwGHR0BTZuLsmjY_NT5Pwg",
-        "db_suffix":"ina",
-        "database_members":"YTDB_Ina_Members",
-    },
-    "Gura":{
-        "user_id":"oSrY_IQQVpmIRZ9Xf-y93g",
-        "db_suffix":"gura",
-        "database_members":"YTDB_Gura_Members",
-    },
-    "Ame":{
-        "user_id":"yl1z3jo3XHR1riLFKG5UAg",
-        "db_suffix":"ame",
-        "database_members":"YTDB_Ame_Members",
-    },
-}
+CHANNEL_SELECTION = "Calli"
 
-# Pick the member entry you'd like here
-MEMBER_SELECTOR = MEMBER_DIRECTORY["Kiara"]
-MEMBER_SUFFIX = MEMBER_SELECTOR["db_suffix"]
+# Do not prompt for directories or options, just run the file.
+QUICK_SETTINGS = True
+QUICK_SETTINGS_DATA = "D:/CodingProjects/_Datafiles"
+QUICK_SETTINGS_SECRET = "D:/CodingProjects/_NoShare"
 
 # Database Configuration settngs
 DB_VERBOSE = False
@@ -52,16 +23,30 @@ LOG_VERBOSE = False # Any debug messages will appear
 LOG_NAME = "LOG" # Log file prefix
 CONTINUOUS_LOG = True # Create one continuous log file and not separate ones per-run
 
+# File Object Prefixes
+MEMBERS_ONLY_FLAG = "_members"
+DETAIL_TAG = "details"
+THUMBNAIL_TAG= "thumbnails"
+MESSAGES_TAG = "messages"
+PFP_TAG = "pfp"
+
 #####################################
 ### OTHER SETTINGS (DO NOT TOUCH) ###
 #####################################
 
 # Will ask if a log file will be created at all
-LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?") # Create a log file (In script location)
+if QUICK_SETTINGS is True:
+    LOG = False
+else:
+    LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?") # Create a log file (In script location)
 
 # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
-DATA_DIRECTORY = filedialog.askdirectory(title="Specify directory for data to be downloaded to")
-SECRETS_DIRECTORY = filedialog.askdirectory(title="Specify directory where Secrets and/or Cookies are")
+if QUICK_SETTINGS is True:
+    DATA_DIRECTORY = QUICK_SETTINGS_DATA
+    SECRETS_DIRECTORY = QUICK_SETTINGS_SECRET
+else:
+    DATA_DIRECTORY = filedialog.askdirectory(title="Specify directory for data to be downloaded to")
+    SECRETS_DIRECTORY = filedialog.askdirectory(title="Specify directory where Secrets and/or Cookies are")
 
 # Will exit if either folder dialog boxes were closed
 if DATA_DIRECTORY == "" or SECRETS_DIRECTORY == "":
@@ -71,24 +56,54 @@ if DATA_DIRECTORY == "" or SECRETS_DIRECTORY == "":
 CLIENT_SECRETS_FILE = f'{SECRETS_DIRECTORY}/client_secret.json'  # Download this from Google Cloud Console
 TOKEN_PICKLE_FILE = f'{SECRETS_DIRECTORY}/token.pickle'# Will be created on first launch
 
+with open(f"{SECRETS_DIRECTORY}/Settings.json",'r') as file:
+    gen_settings = json.load(file)
+
+# YT INFORMATION
+# Given just the UserID, all other IDs can be generated for the upload playlists and channel ID.
+# If you only have the ChannelID, remove the "UC" at the start and put it into the UserID field.
+# NOTE: Custom handles DO NOT work, you need the ID number with all the random characters.
+CHANNEL_DIRECTORY = gen_settings["channel_directory"]
+
+# Pick the member entry you'd like here
+CHANNEL_SELECTOR = CHANNEL_DIRECTORY[CHANNEL_SELECTION]
+CHANNEL_SUFFIX = CHANNEL_SELECTOR["db_suffix"]
+USER_DATA_NAME = gen_settings["user_data_name"]
+
 # Set this if you want to write to a member's only database.
-MEMBERS = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
+if QUICK_SETTINGS is True:
+    GET_MEMBERS_ONLY = True
+else:
+    GET_MEMBERS_ONLY = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
 
 # The chat scraper can timeout if there is a livestream going and no new messages arrive.
 # Good for if there's a livestream (either live or waiting), but getting all other videos are desired.
-TIMEOUT = messagebox.askyesno("Chat-Timeout","Do you want the chat scraper to timeout?\n(Pick no if you want it to keep watching a livestream.)")
+if QUICK_SETTINGS is True:
+    TIMEOUT = True
+else:
+    TIMEOUT = messagebox.askyesno("Chat-Timeout","Do you want the chat scraper to timeout?\n(Pick no if you want it to keep watching a livestream.)")
 
 # Needed to access chat messages from member's only videos. Use browser addins to generate, make sure name matches.
 # NOTE: Once you've exported the cookies, CLOSE that browser (or user agent) and do not open/use until this program finishes.
 # Keeping the browser open tends to make the YT cookies reset and break the access to member's only videos.
-COOKIES = None if MEMBERS == False else f"{SECRETS_DIRECTORY}/cookies.txt"
+COOKIES = None if GET_MEMBERS_ONLY is False else f"{SECRETS_DIRECTORY}/cookies.txt"
 
 # These folders will be automatically created if they don't exist. It's where the JSON files and thumbnails will be saved to.
-DATA_FOLDER_NAME = "Data_Public" if MEMBERS == False else "Data_Members"
 
 # The main data path used elsewhere in code
-DATA_PATH = f"{DATA_DIRECTORY}/{DATA_FOLDER_NAME}_{MEMBER_SUFFIX}"
-USER_PATH = f"{DATA_DIRECTORY}/Data_Users"
+LOCAL_DATA_PATH = f"{DATA_DIRECTORY}/{CHANNEL_SUFFIX}"
+LOCAL_USER_PATH = f"{DATA_DIRECTORY}/{USER_DATA_NAME}"
+
+DETAIL_TAG = f"{DETAIL_TAG}" if GET_MEMBERS_ONLY is False else f"{DETAIL_TAG}{MEMBERS_ONLY_FLAG}"
+THUMBNAIL_TAG= f"{THUMBNAIL_TAG}" if GET_MEMBERS_ONLY is False else f"{THUMBNAIL_TAG}{MEMBERS_ONLY_FLAG}"
+
+DATA_PATHS = [
+    f"{LOCAL_DATA_PATH}/{DETAIL_TAG}",
+    f"{LOCAL_DATA_PATH}/{THUMBNAIL_TAG}",
+    f"{LOCAL_DATA_PATH}/{MESSAGES_TAG}",
+    f"{LOCAL_USER_PATH}/{DETAIL_TAG}",
+    f"{LOCAL_USER_PATH}/{PFP_TAG}"
+]
 
 # Edit the template provided and stuff it in your secrets folder
 with open(f"{SECRETS_DIRECTORY}/DB_Settings.json",'r') as file:
@@ -99,22 +114,47 @@ DB_USR = db_settings["DB_USR"]
 DB_PASS = db_settings["DB_PASS"]
 DB_HOST = db_settings["DB_HOST"]
 DB_PORT = db_settings["DB_PORT"]
-DB_NAME = "YTDB_Public" if MEMBERS == False else MEMBER_SELECTOR["database_members"]
+DB_NAME = db_settings["db_name"]
 
-DB_TABLES = {
-    "emotes":f"emotes_{MEMBER_SUFFIX}",
-    "messages":f"messages_{MEMBER_SUFFIX}",
-    "nickname_matches":f"nickname_matches_{MEMBER_SUFFIX}",
-    "nicknames":f"nicknames_{MEMBER_SUFFIX}",
-    "videos":f"videos_{MEMBER_SUFFIX}",
-    "user_ids":"user_ids"
-}
+if GET_MEMBERS_ONLY is False:
+    DB_TABLES = {
+        "emotes":f"emotes_{CHANNEL_SUFFIX}",
+        "messages":f"messages_{CHANNEL_SUFFIX}",
+        "nickname_matches":f"nickname_matches_{CHANNEL_SUFFIX}",
+        "nicknames":f"nicknames_{CHANNEL_SUFFIX}",
+        "videos":f"videos_{CHANNEL_SUFFIX}",
+        "user_ids":"user_ids"
+    }
+else:
+    DB_TABLES = {
+        "emotes":f"emotes_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+        "messages":f"messages_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+        "nickname_matches":f"nickname_matches_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+        "nicknames":f"nicknames_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+        "videos":f"videos_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+        "user_ids":"user_ids"
+    }
 
 # Auto-filled out data for Youtube data
-YT_USER_ID = MEMBER_SELECTOR["user_id"] # UserID of the selected member
+YT_USER_ID = CHANNEL_SELECTOR["user_id"] # UserID of the selected member
 YT_CHANNEL_ID = "UC" + YT_USER_ID
 UPLOAD_PLAYLIST = "UU" + YT_USER_ID # Hidden playlist containing ALL publically accessible Youtube Videos, Livestream VODs, and Shorts.
 MEMBERS_ONLY_PLAYLIST = "UUMO" + YT_USER_ID # Hiiden playlist containing ALL non-privated member's only Youtube Videos, Livestream VODs, and Shorts.
 
 # Leave this be, edit CUSTOM PLAYLIST and MEMBERS values above instead.
-PLAYLIST = UPLOAD_PLAYLIST if MEMBERS == False else MEMBERS_ONLY_PLAYLIST
+PLAYLIST = UPLOAD_PLAYLIST if GET_MEMBERS_ONLY is False else MEMBERS_ONLY_PLAYLIST
+
+if os.path.exists(f"{SECRETS_DIRECTORY}/S3_Settings.json"):
+    # Edit the template provided and stuff it in your secrets folder
+    with open(f"{SECRETS_DIRECTORY}/S3_Settings.json",'r') as file:
+        s3_settings = json.load(file)
+
+    # Auto-filled out data from the settings file and other settings
+    ENDPOINT_URL = s3_settings["endpoint_url"]
+    ENDPOINT_ID = s3_settings["aws_access_key_id"]
+    ENDPOINT_KEY = s3_settings["aws_secret_access_key"]
+    ENDPOINT_REGION = s3_settings["region_name"]
+
+    S3_ENABLED = True
+else:
+    S3_ENABLED = False

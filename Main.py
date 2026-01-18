@@ -1,5 +1,5 @@
 # Native Stuff
-import os,sys
+import os,sys,shutil
 
 sys.path.append(os.getcwd())
 
@@ -57,13 +57,17 @@ https://github.com/xenova/chat-downloader
 """
 
 # Create the data paths if they don't exist
-if os.path.isdir(CFG.DATA_PATH):
-    pass
-else:
-    os.mkdir(CFG.DATA_PATH)
+for d_path in CFG.DATA_PATHS:
+    if os.path.isdir(d_path):
+        pass
+    else:
+        os.makedirs(d_path)
 
 # Initialize database connection and setup the API calls
 db = DB.PostgresClass()
+s3 = C.H3Client()
+channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,CFG.LOCAL_DATA_PATH)
+user_bucket = C.H3Bucket(s3.client,CFG.USER_DATA_NAME,CFG.LOCAL_USER_PATH)
 yt = C.YT_API(db)
 
 #################################
@@ -75,7 +79,7 @@ vid_stats = C.VideoStats()
 all_chat_stats = C.ChatStats()
 
 LOG.logger.info("\nObtaining all videos from Youtube API...")
-video_ids = yt.Get_All_Videos()
+video_ids = yt.Get_All_Videos(channel_bucket)
 LOG.logger.info(f"Total of {len(video_ids)} video(s) aquired.")
 
 LOG.logger.info("Processing videos for details, thumbnail, and chat messages...")
@@ -108,7 +112,7 @@ with LOG.TQDM_Logging():
 
             # Get video data from API, check if it's been updated, and return the data as a class
             try:
-                vid = yt.Get_Video_Info(video_id)
+                vid = yt.Get_Video_Info(video_id,channel_bucket)
             except Exception as u:
                 vid_stats.error_videos += 1
                 LOG.logger.error(f"Unknown error parsing video: {u}")
@@ -128,7 +132,7 @@ with LOG.TQDM_Logging():
             #-------------------------#
 
             # Currently has no relation to the database, just saving it to file
-            vid.Get_Thumbnail()
+            vid.Get_Thumbnail(channel_bucket)
 
             #---------------------------------------#
             #-- INSERT/UPDATE VIDEO INTO DATABASE --#
@@ -138,7 +142,7 @@ with LOG.TQDM_Logging():
             if video_exists == False:
                 DB.InsertEntries(cursor=db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
                 db.database.commit()
-            elif vid.status == "Update":
+            else:
                 for column, value in vid.entry.items():
                     DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],column,value,"id",vid.id)
                     db.database.commit()
@@ -149,7 +153,7 @@ with LOG.TQDM_Logging():
 
             # Get the YTC messages from the video and put them into the database
             try:
-                message_stats = yt.Get_Messages(vid)
+                message_stats = yt.Get_Messages(vid,channel_bucket)
                 message_stats.append_all(all_chat_stats) # Update the global stats for chats and users
                 if vid.livestream == False:
                     DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
@@ -205,11 +209,16 @@ if len(user_list) > 0:
     with LOG.TQDM_Logging():
         with tqdm(Batch_Users(user_list),desc='Users Processed',total=len(user_list),bar_format='{desc}: {n_fmt}/{total_fmt} || {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
             for users in userbar:
-                all_chat_stats.invalid_users += yt.Get_User_Batch(users)
+                all_chat_stats.invalid_users += yt.Get_User_Batch(users,user_bucket)
                 userbar.set_postfix_str(Update_Postfix_Users())
                 userbar.update(len(users))
 
 LOG.logger.info("User processing complete.\n")
+
+LOG.logger.info("Cleaning up local folders")
+shutil.rmtree(channel_bucket.local_root)
+shutil.rmtree(user_bucket.local_root)
+LOG.logger.info("Local folders deleted")
 
 LOG.logger.info(f"""
 ---VIDEO STATISTICS---

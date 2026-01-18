@@ -1,0 +1,11 @@
+{
+    "data_folder":"path/to/data",
+    "secret_folder":"path/to/noshare",
+    "user_data_name":"users",
+    "channel_directory":{
+        "Channel":{
+            "user_id":"channel_id",
+            "db_suffix":"database_identifier"
+        }
+    }
+}

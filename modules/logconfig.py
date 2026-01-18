@@ -40,7 +40,7 @@ class ConsoleFormatter(logging.Formatter):
         log_fmt = self.FORMATS.get(record.levelno)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
-    
+
 class LogFormatter(logging.Formatter):
     '''Formats the log file outputs based on what type of log object they are'''
     crit_fmt = 'CRTICAL: %(message)s'
@@ -92,7 +92,7 @@ logger.setLevel(logging.DEBUG)
 
 def TimeCurrent():
     """Get the current time at moment of function call
-    
+
     :return: Hours:Minutes:Seconds
     :rtype: String
     """
@@ -100,7 +100,7 @@ def TimeCurrent():
 
 def TimeDurration():
     """Gets the start time of the program and calculates how long it's been at moment of function call.
-    
+
     :return: Time elapsed since start of program, in seconds.
     :rtype: String"""
     time_current = time.time()
@@ -111,7 +111,7 @@ def TimeDurration():
 
 def FullTimestamp():
     """Formatted combination of both Current Time and Time Elapsed.
-    
+
     :return: {Hours:Minutes:Seconds}, {Seconds} elapsed
     :rtype: String"""
     return f'{TimeCurrent()}, {TimeDurration()} elapsed'
@@ -160,9 +160,9 @@ def TQDM_Logging():
     tqdm_handler.setLevel(logging.INFO) if CFG.LOG_VERBOSE == False else tqdm_handler.setLevel(logging.DEBUG)
     if stream_handlers:
         tqdm_handler.setFormatter(stream_handlers[0].formatter)
-    
+
     logger.addHandler(tqdm_handler)
-    
+
     try:
         yield logger
     finally:

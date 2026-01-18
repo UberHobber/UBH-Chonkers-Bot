@@ -40,7 +40,7 @@ class PostgresClass:
 def InsertEntries(cursor:psycopg2.extensions.cursor,table:str,data_list:list[dict[str,Any]],conflict:str|None=None) -> None:
     """
     Inserts a given list of dictionaries into a target table.
-    
+
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
     :param table: Target table
@@ -62,7 +62,7 @@ def InsertEntries(cursor:psycopg2.extensions.cursor,table:str,data_list:list[dic
             else:
                 query: str = f'INSERT INTO {table} ({columns}) VALUES ({placeholders})'
 
-            
+
 
             if CFG.DB_VERBOSE == True:
                 LOG.logger.info(query)
@@ -76,7 +76,7 @@ def InsertEntries(cursor:psycopg2.extensions.cursor,table:str,data_list:list[dic
 def UpdateEntry(cursor:psycopg2.extensions.cursor,table:str,data_column:str,data_value:Any,filter_column:str,filter_value:Any):
     """
     Updates an entry with a new value for a single column.
-    
+
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
     :param table: Target table
@@ -142,7 +142,7 @@ def DeleteEntries(cursor:psycopg2.extensions.cursor,table:str,filter:dict[str,An
 def GetEntries(cursor:psycopg2.extensions.cursor,table:str,columns:str='*',filter:dict[str,Any]|None=None) -> list[dict[str, Any]]:
     """
     Retrieves entries from a given table. Can specify columns and various filters.
-    
+
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
     :param table: Table name
@@ -157,7 +157,7 @@ def GetEntries(cursor:psycopg2.extensions.cursor,table:str,columns:str='*',filte
     base_query: str = f'SELECT {columns} FROM {table}'
 
     if filter != None:
-        
+
         column_list:str = " AND ".join([f'{col} = %s' for col in filter.keys()])
 
         values = list(filter.values())
