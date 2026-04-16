@@ -7,7 +7,7 @@ from tkinter import filedialog,messagebox
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-CHANNEL_SELECTION = "Calli"
+CHANNEL_SELECTION = "Kiara"
 
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
@@ -72,7 +72,7 @@ USER_DATA_NAME = gen_settings["user_data_name"]
 
 # Set this if you want to write to a member's only database.
 if QUICK_SETTINGS is True:
-    GET_MEMBERS_ONLY = True
+    GET_MEMBERS_ONLY = False
 else:
     GET_MEMBERS_ONLY = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
 
