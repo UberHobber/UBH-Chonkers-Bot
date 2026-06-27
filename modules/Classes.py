@@ -19,6 +19,7 @@ from googleapiclient.discovery import build
 
 # S3 API
 import boto3
+from botocore.config import Config as BotocoreConfig
 from types_boto3_s3.client import S3Client
 from botocore.exceptions import ClientError
 
@@ -62,7 +63,8 @@ class H3Client():
         endpoint_url=CFG.ENDPOINT_URL,
         aws_access_key_id=CFG.ENDPOINT_ID,
         aws_secret_access_key=CFG.ENDPOINT_KEY,
-        region_name=CFG.ENDPOINT_REGION
+        region_name=CFG.ENDPOINT_REGION,
+        config=BotocoreConfig(max_pool_connections=max(25, CFG.WORKER_COUNT * 15))
     )
     def get_all_buckets(self):
         response = self.client.list_buckets()
@@ -706,106 +708,110 @@ class YT_API:
         def Update_Postfix_Messages():
             return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {chat_stats.new_user_ids:,} | Existing Users: {len(chat_stats.exist_user_ids):,}"
 
-        with LOG.TQDM_Logging():
-            with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
-                try:
-                    unique_user_ids = set()
-                    uncommitted = 0
-                    # Process all chats collected by Chat_Downloader
-                    for message in chat_list:
-                        chat_stats.total_messages += 1
-                        try:
-                            msg = MessageClass(message,v)
+        with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
+            try:
+                unique_user_ids = set()
+                uncommitted = 0
+                # Process all chats collected by Chat_Downloader
+                for message in chat_list:
+                    chat_stats.total_messages += 1
+                    try:
+                        msg = MessageClass(message,v)
 
-                            #----------------------#
-                            #-- USER ID DATABASE --#
-                            #----------------------#
+                        #----------------------#
+                        #-- USER ID DATABASE --#
+                        #----------------------#
 
-                            # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
-                            # Lock covers the check+insert+set-update atomically to prevent duplicate inserts across threads
-                            with _lock:
-                                _is_new_user = msg.usr_id not in known_user_ids
-                                if _is_new_user:
-                                    DB.InsertEntries(_db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
-                                    known_user_ids.add(msg.usr_id)
+                        # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
+                        # Lock covers check+insert+commit atomically. The commit MUST happen inside the lock so the
+                        # user row is visible to all connections before any thread inserts a message referencing it.
+                        # Without the commit here, a concurrent thread can see the user in known_user_ids (set already
+                        # updated) but fail the FK check because the insert hasn't been flushed to the DB yet.
+                        with _lock:
+                            _is_new_user = msg.usr_id not in known_user_ids
                             if _is_new_user:
-                                chat_stats.new_user_ids += 1
-                                unique_user_ids.add(msg.usr_id)
-                            else:
-                                unique_user_ids.add(msg.usr_id)
-                                chat_stats.exist_user_ids.add(msg.usr_id)
-
-                            #--------------------#
-                            #-- EMOTE DATABASE --#
-                            #--------------------#
-
-                            # Add Unique Emotes if they don't already exist in DB
-                            if len(msg.e_emote_entries) > 0:
-                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,"id")
-
-                            #----------------------#
-                            #-- MESSAGE DATABASE --#
-                            #----------------------#
-
-                            # Add message to DB if it doesn't already exist
-                            if msg.id not in known_message_ids:
-                                DB.InsertEntries(cursor=_db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
-                                known_message_ids.add(msg.id)
-
-                                entries = []
-                                used_positions = set()
-
-                                #-------------------------------#
-                                #-- NICKNAME MATCHES DATABASE --#
-                                #-------------------------------#
-
-                                # Only look for nicknames if there are any to look for in the database
-                                if len(sorted_nicknames) > 0:
-                                    for nick in sorted_nicknames:
-                                        search_pattern = r'\b' + re.escape(nick) + r'\b'
-                                        if msg.message is not None:
-                                            for match in re.finditer(pattern=search_pattern, string=msg.message, flags=re.IGNORECASE):
-                                                start, end = match.span()
-                                                if not any(pos in used_positions for pos in range(start, end)):
-                                                    entry = {
-                                                        "message_id":msg.id,
-                                                        "matched_nickname":nick,
-                                                        "index_start":start,
-                                                        "index_end":end
-                                                    }
-                                                    used_positions.update(range(start, end))
-                                                    entries.append(entry)
-
-                                    DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
-
-                                chat_stats.new_messages += 1
-                                messbar.set_postfix_str(Update_Postfix_Messages())
-                                messbar.update(1)
-                            else:
-                                chat_stats.existing_messages += 1
-                                messbar.set_postfix_str(Update_Postfix_Messages())
-                                messbar.update(1)
-
-                            message_list.append(message)
-
-                            uncommitted += 1
-                            if uncommitted >= 500:
-                                _db.database.commit()
+                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
+                                _db.database.commit()  # flush immediately — FK must be satisfied for all connections
                                 uncommitted = 0
+                                known_user_ids.add(msg.usr_id)
+                        if _is_new_user:
+                            chat_stats.new_user_ids += 1
+                            unique_user_ids.add(msg.usr_id)
+                        else:
+                            unique_user_ids.add(msg.usr_id)
+                            chat_stats.exist_user_ids.add(msg.usr_id)
 
-                        except Exception as e:
+                        #--------------------#
+                        #-- EMOTE DATABASE --#
+                        #--------------------#
+
+                        # Add Unique Emotes if they don't already exist in DB
+                        if len(msg.e_emote_entries) > 0:
+                            DB.InsertEntries(_db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,"id")
+
+                        #----------------------#
+                        #-- MESSAGE DATABASE --#
+                        #----------------------#
+
+                        # Add message to DB if it doesn't already exist
+                        if msg.id not in known_message_ids:
+                            DB.InsertEntries(cursor=_db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
+                            known_message_ids.add(msg.id)
+
+                            entries = []
+                            used_positions = set()
+
+                            #-------------------------------#
+                            #-- NICKNAME MATCHES DATABASE --#
+                            #-------------------------------#
+
+                            # Only look for nicknames if there are any to look for in the database
+                            if len(sorted_nicknames) > 0:
+                                for nick in sorted_nicknames:
+                                    search_pattern = r'\b' + re.escape(nick) + r'\b'
+                                    if msg.message is not None:
+                                        for match in re.finditer(pattern=search_pattern, string=msg.message, flags=re.IGNORECASE):
+                                            start, end = match.span()
+                                            if not any(pos in used_positions for pos in range(start, end)):
+                                                entry = {
+                                                    "message_id":msg.id,
+                                                    "matched_nickname":nick,
+                                                    "index_start":start,
+                                                    "index_end":end
+                                                }
+                                                used_positions.update(range(start, end))
+                                                entries.append(entry)
+
+                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
+
+                            chat_stats.new_messages += 1
+                            messbar.set_postfix_str(Update_Postfix_Messages())
                             messbar.update(1)
-                            raise e
+                        else:
+                            chat_stats.existing_messages += 1
+                            messbar.set_postfix_str(Update_Postfix_Messages())
+                            messbar.update(1)
 
-                except Exception as r:
-                    if uncommitted > 0:
-                        _db.database.commit()
-                    _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
-                    raise r
+                        message_list.append(message)
 
+                        uncommitted += 1
+                        if uncommitted >= 500:
+                            _db.database.commit()
+                            uncommitted = 0
+
+                    except Exception as e:
+                        messbar.update(1)
+                        raise e
+
+            except Exception as r:
                 if uncommitted > 0:
                     _db.database.commit()
                 _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
+                raise r
+
+            if uncommitted > 0:
+                _db.database.commit()
+            _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
 
         return chat_stats
 
