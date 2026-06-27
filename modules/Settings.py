@@ -10,9 +10,13 @@ from tkinter import filedialog,messagebox
 CHANNEL_SELECTION = "Bae"
 USE_COOKIES = False
 
-# Seconds to wait between processing each video. Prevents hitting YouTube too fast
-# when many consecutive videos have no chat replay. 0 to disable.
+# Seconds to wait between starting each chat download. The rate limiter enforces this
+# gap even across concurrent workers so YouTube isn't hit simultaneously. 0 to disable.
 REQUEST_DELAY = 1.0
+
+# Number of videos to process in parallel. 2 is the safe default — going above 3
+# risks hitting YouTube's rate limits and getting temporarily blocked.
+WORKER_COUNT = 2
 
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True

@@ -106,6 +106,29 @@ def UpdateEntry(cursor:psycopg2.extensions.cursor,table:str,data_column:str,data
         LOG.logger.error(f'Query: {query} ({type(query)})\nValues: {values} ({type(values)})\n')
         raise e
 
+def UpdateEntries(cursor:psycopg2.extensions.cursor,table:str,data_dict:dict[str,Any],filter_column:str,filter_value:Any):
+    """
+    Updates multiple columns in a single query.
+
+    :param cursor: Database cursor object to execute commands.
+    :param table: Target table
+    :param data_dict: Dict of {column: value} pairs to update
+    :param filter_column: Column to filter on
+    :param filter_value: Value of column to filter by
+    """
+    try:
+        LOG.logger.debug(f'Updating {len(data_dict)} column(s) in table {table} in database.')
+        set_clause = ", ".join([f"{col} = %s" for col in data_dict.keys()])
+        values = list(data_dict.values()) + [filter_value]
+        query: str = f'UPDATE {table} SET {set_clause} WHERE {filter_column} = %s'
+        if CFG.DB_VERBOSE == True:
+            LOG.logger.info(query)
+            LOG.logger.info(values)
+        cursor.execute(query,values)
+    except Exception as e:
+        LOG.logger.error(f'Query: {query}\nValues: {values} ({type(values)})\n')
+        raise e
+
 def DeleteEntries(cursor:psycopg2.extensions.cursor,table:str,filter:dict[str,Any]|None=None) -> None:
     """
     Deletes an entry in the target table matching a given filter. Deletes ALL entries if no filter given.

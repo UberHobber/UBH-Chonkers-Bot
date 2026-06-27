@@ -1,5 +1,5 @@
 # Native Stuff
-import os,json,pickle,requests,re,xxhash
+import os,json,pickle,requests,re,xxhash,threading
 from typing import Any
 from datetime import datetime
 
@@ -598,7 +598,25 @@ class YT_API:
 
         return ids
 
-    def Get_Messages(self,video:VideoClass,bucket:H3Bucket,skip_download=False):
+    def Get_Videos_Info_Batch(self,ids:list[str],bucket:H3Bucket) -> dict[str,'VideoClass']:
+        """Fetches info for up to 50 video IDs in a single API call instead of one call per video."""
+        result:dict[str,VideoClass] = {}
+        if not ids:
+            return result
+        request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=",".join(ids))
+        response = request.execute()
+        for video in response.get("items",[]):
+            vid_id = video["id"]
+            del video["kind"]
+            del video["etag"]
+            temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{vid_id}_TEMP.json"
+            with open(temp_path,'w') as file:
+                file.write(json.dumps(video,indent=4))
+            video_detail_status = _check_and_upload_file(bucket,temp_path,vid_id,"json",CFG.DETAIL_TAG)
+            result[vid_id] = VideoClass(video,video_detail_status)
+        return result
+
+    def Get_Messages(self,video:VideoClass,bucket:H3Bucket,known_user_ids:set,sorted_nicknames:list[str],db=None,user_id_lock=None,bar_position:int=1,skip_download=False):
         """
         Retrieves all chat messages from a given video, saves them to JSON files, and enters them into the database.
 
@@ -640,6 +658,8 @@ class YT_API:
                 raise upload_status
 
         v = video
+        _db = db if db is not None else self.db
+        _lock = user_id_lock if user_id_lock is not None else threading.Lock()
 
         message_object = f"{CFG.MESSAGES_TAG}/{v.id}.json"
         existing_messages_local = f'{bucket.local_root}/{message_object}'
@@ -657,6 +677,10 @@ class YT_API:
                 messages_on_file = []
         else:
             messages_on_file = []
+
+        # Pre-load existing message IDs for this video to avoid per-message DB lookups
+        existing_msg_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["messages"],"message_id",{"video_id":v.id})
+        known_message_ids:set = set(row["message_id"] for row in existing_msg_rows)
 
         #-----------------------#
         #-- GET ALL CHAT DATA --#
@@ -683,9 +707,10 @@ class YT_API:
             return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {chat_stats.new_user_ids:,} | Existing Users: {len(chat_stats.exist_user_ids):,}"
 
         with LOG.TQDM_Logging():
-            with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=1, leave=False) as messbar:
+            with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
                 try:
                     unique_user_ids = set()
+                    uncommitted = 0
                     # Process all chats collected by Chat_Downloader
                     for message in chat_list:
                         chat_stats.total_messages += 1
@@ -697,9 +722,13 @@ class YT_API:
                             #----------------------#
 
                             # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
-                            if len(DB.GetEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],filter={"id":msg.usr_id})) == 0:
-                                DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
-                                self.db.database.commit()
+                            # Lock covers the check+insert+set-update atomically to prevent duplicate inserts across threads
+                            with _lock:
+                                _is_new_user = msg.usr_id not in known_user_ids
+                                if _is_new_user:
+                                    DB.InsertEntries(_db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
+                                    known_user_ids.add(msg.usr_id)
+                            if _is_new_user:
                                 chat_stats.new_user_ids += 1
                                 unique_user_ids.add(msg.usr_id)
                             else:
@@ -712,28 +741,16 @@ class YT_API:
 
                             # Add Unique Emotes if they don't already exist in DB
                             if len(msg.e_emote_entries) > 0:
-                                DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,"id")
+                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,"id")
 
                             #----------------------#
                             #-- MESSAGE DATABASE --#
                             #----------------------#
 
                             # Add message to DB if it doesn't already exist
-                            if len(DB.GetEntries(self.db.cursor,CFG.DB_TABLES["messages"],filter={"message_id":msg.id})) == 0:
-                                DB.InsertEntries(cursor=self.db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
-                                self.db.database.commit()
-
-                                #-----------------------#
-                                #-- NICKNAME DATABASE --#
-                                #-----------------------#
-
-                                # Get all the nicknames to search for
-                                nickname_entries = DB.GetEntries(self.db.cursor,CFG.DB_TABLES["nicknames"],"nickname")
-                                nicknames:list[str] = []
-                                for nick_entry in nickname_entries:
-                                    for key in nick_entry.keys():
-                                        nicknames.append(key)
-                                sorted_nicknames = sorted(nicknames, key=len, reverse=True)
+                            if msg.id not in known_message_ids:
+                                DB.InsertEntries(cursor=_db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
+                                known_message_ids.add(msg.id)
 
                                 entries = []
                                 used_positions = set()
@@ -759,8 +776,7 @@ class YT_API:
                                                     used_positions.update(range(start, end))
                                                     entries.append(entry)
 
-                                    DB.InsertEntries(self.db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
-                                    self.db.database.commit()
+                                    DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
 
                                 chat_stats.new_messages += 1
                                 messbar.set_postfix_str(Update_Postfix_Messages())
@@ -771,14 +787,24 @@ class YT_API:
                                 messbar.update(1)
 
                             message_list.append(message)
+
+                            uncommitted += 1
+                            if uncommitted >= 500:
+                                _db.database.commit()
+                                uncommitted = 0
+
                         except Exception as e:
                             messbar.update(1)
                             raise e
 
                 except Exception as r:
-                    _WriteFile(message_object,existing_messages_local,messages_on_file,message_list) # If it crashes, at least we get some of the messages to file so we can debug.
+                    if uncommitted > 0:
+                        _db.database.commit()
+                    _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
                     raise r
 
+                if uncommitted > 0:
+                    _db.database.commit()
                 _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
 
         return chat_stats
@@ -850,12 +876,8 @@ class YT_API:
                     #-- USER DATABASE OPERATIONS --#
                     #------------------------------#
 
-                    # Update the unprocessed User_ID with additional information
-                    for column, value in u.entry.items():
-                        DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],column,value,"id",u.id)
-                        self.db.database.commit()
-
-                    DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",u.id)
+                    # Update the unprocessed User_ID with additional information (single query)
+                    DB.UpdateEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],{**u.entry,"processed":True},"id",u.id)
                     self.db.database.commit()
 
                     valid_ids.add(u.id)

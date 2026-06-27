@@ -1,5 +1,6 @@
 # Native Stuff
-import os,sys,shutil,time
+import os,sys,shutil,time,threading
+from concurrent.futures import ThreadPoolExecutor,as_completed
 
 sys.path.append(os.getcwd())
 
@@ -82,106 +83,177 @@ LOG.logger.info("\nObtaining all videos from Youtube API...")
 video_ids = yt.Get_All_Videos(channel_bucket)
 LOG.logger.info(f"Total of {len(video_ids):,} video(s) aquired.")
 
-LOG.logger.info("Processing videos for details, thumbnail, and chat messages...")
+LOG.logger.info("Pre-loading database state...")
+all_video_records = DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"id,processed")
+video_db_status = {r["id"]: r["processed"] for r in all_video_records}
+LOG.logger.info(f"  {len(video_db_status):,} video record(s) loaded from database.")
+
+known_user_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id"))
+LOG.logger.info(f"  {len(known_user_ids):,} known user ID(s) loaded.")
+
+nickname_entries = DB.GetEntries(db.cursor,CFG.DB_TABLES["nicknames"],"nickname")
+sorted_nicknames:list[str] = sorted([e["nickname"] for e in nickname_entries], key=len, reverse=True)
+LOG.logger.info(f"  {len(sorted_nicknames):,} nickname(s) loaded.")
+
+unprocessed_ids = [vid_id for vid_id in video_ids if video_db_status.get(vid_id) is not True]
+LOG.logger.info(f"  {len(unprocessed_ids):,} unprocessed video(s) to fetch.")
+
+LOG.logger.info("Fetching video details in batches of 50...")
+video_info_cache:dict = {}
+with LOG.TQDM_Logging():
+    with tqdm(desc='Video Info Fetched',total=len(unprocessed_ids),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=0,leave=False) as fetchbar:
+        for i in range(0,len(unprocessed_ids),50):
+            batch = unprocessed_ids[i:i+50]
+            try:
+                batch_result = yt.Get_Videos_Info_Batch(batch,channel_bucket)
+                video_info_cache.update(batch_result)
+            except Exception as e:
+                LOG.logger.error(f"Batch fetch failed for {len(batch)} video(s), falling back to individual fetch: {e}")
+                for vid_id in batch:
+                    try:
+                        vid = yt.Get_Video_Info(vid_id,channel_bucket)
+                        if vid:
+                            video_info_cache[vid_id] = vid
+                    except Exception as e2:
+                        LOG.logger.error(f"Individual fetch failed for {vid_id}: {e2}")
+            fetchbar.update(len(batch))
+LOG.logger.info(f"{len(video_info_cache):,} video(s) ready for processing.")
+
+##################################
+### THREAD POOL INFRASTRUCTURE ###
+##################################
+
+tqdm.set_lock(threading.RLock())  # make tqdm bar updates thread-safe
+
+_thread_local = threading.local()
+user_id_lock = threading.Lock()
+_available_positions = list(range(1, CFG.WORKER_COUNT + 1))  # one bar slot per worker
+_position_lock = threading.Lock()
+
+def get_thread_db():
+    """Returns a per-thread DB connection. Assigns a stable tqdm bar position on first call."""
+    if not hasattr(_thread_local,'db'):
+        with _position_lock:
+            _thread_local.bar_position = _available_positions.pop(0)
+        _thread_local.db = DB.PostgresClass()
+    return _thread_local.db
+
+class _RateLimiter:
+    """Enforces a minimum gap between chat-download starts across all worker threads."""
+    def __init__(self,delay:float):
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._delay = delay
+    def wait(self):
+        if self._delay <= 0:
+            return
+        with self._lock:
+            elapsed = time.monotonic() - self._last
+            if elapsed < self._delay:
+                time.sleep(self._delay - elapsed)
+            self._last = time.monotonic()
+
+rate_limiter = _RateLimiter(CFG.REQUEST_DELAY)
+
+def process_video(video_id:str):
+    """
+    Processes a single video: thumbnail, DB insert/update, chat messages.
+    Designed to run in a worker thread — uses its own DB connection via get_thread_db().
+    Returns (local_vid_stats, local_chat_stats) so the main thread can aggregate them.
+    """
+    thread_db = get_thread_db()
+    vid = video_info_cache[video_id]
+    video_exists = video_id in video_db_status
+    local_vid_stats = C.VideoStats()
+    local_chat_stats = C.ChatStats()
+
+    #-------------------------#
+    #-- GET VIDEO THUMBNAIL --#
+    #-------------------------#
+
+    vid.Get_Thumbnail(channel_bucket)
+
+    #---------------------------------------#
+    #-- INSERT/UPDATE VIDEO INTO DATABASE --#
+    #---------------------------------------#
+
+    if not video_exists:
+        DB.InsertEntries(cursor=thread_db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
+    else:
+        update_data = {k: v for k, v in vid.entry.items() if k != "id"}
+        DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],update_data,"id",vid.id)
+    thread_db.database.commit()
+
+    #-----------------------------#
+    #-- GET VIDEO CHAT MESSAGES --#
+    #-----------------------------#
+
+    rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
+
+    try:
+        message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
+        message_stats.append_all(local_chat_stats)
+        if vid.livestream == False:
+            DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+            thread_db.database.commit()
+        local_vid_stats.success_videos = 1
+        if vid.livestream == True:
+            local_vid_stats.still_live = 1
+    except chat_downloader.errors.NoChatReplay:
+        if vid.livestream == False:
+            DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+            thread_db.database.commit()
+        local_vid_stats.no_chat_videos = 1
+        LOG.logger.warning(f"{video_id}: No Chat Replay available.")
+    except chat_downloader.errors.VideoUnplayable:
+        local_vid_stats.unavailable_videos = 1
+        LOG.logger.warning(f"{video_id}: Video inaccessible, skipping.")
+    except Exception as u:
+        local_vid_stats.error_videos = 1
+        LOG.logger.error(f"{video_id}: Unknown error: {u}")
+
+    return local_vid_stats,local_chat_stats
+
+#################################
+### VIDEO AND CHAT PROCESSING ###
+#################################
+
+LOG.logger.info(f"Processing videos with {CFG.WORKER_COUNT} worker(s)...")
 with LOG.TQDM_Logging():
     with tqdm(desc='Videos Processed',total=len(video_ids),bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix="",position=0,leave=False) as vidbar:
-        # Get all videos in the hidden playlist then use generator to pass each id to loop
-        for video_id in video_ids:
 
-            def Update_Postfix_Videos():
-                return f"Current Video: {video_id} | Sucessful: {vid_stats.success_videos:,} | Skipped: {vid_stats.skipped_videos:,} | No Chat: {vid_stats.no_chat_videos:,} | Unavailable: {vid_stats.unavailable_videos:,} | Errors: {vid_stats.error_videos:,}"
+        def Update_Postfix_Videos():
+            return f"Successful: {vid_stats.success_videos:,} | Skipped: {vid_stats.skipped_videos:,} | No Chat: {vid_stats.no_chat_videos:,} | Unavailable: {vid_stats.unavailable_videos:,} | Errors: {vid_stats.error_videos:,}"
 
-            vidbar.set_postfix_str(Update_Postfix_Videos())
+        with ThreadPoolExecutor(max_workers=CFG.WORKER_COUNT) as executor:
+            futures:dict = {}
 
-            #--------------------------------#
-            #-- LOOK FOR VIDEO IN DATABASE --#
-            #--------------------------------#
-
-            # Don't do any processing if the current video_id has already been processed
-            complete_video = DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"title,processed",{"id":video_id,"processed":True})
-            video_exists = True if len(DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"title",{"id":video_id})) > 0 else False
-            if len(complete_video) > 0:
-                vid_stats.skipped_videos += 1
-                vidbar.set_postfix_str(Update_Postfix_Videos())
-                vidbar.update(1)
-                continue
-
-            #-----------------------------#
-            #-- GET DETAILED VIDEO INFO --#
-            #-----------------------------#
-
-            # Get video data from API, check if it's been updated, and return the data as a class
-            try:
-                vid = yt.Get_Video_Info(video_id,channel_bucket)
-            except Exception as u:
-                vid_stats.error_videos += 1
-                LOG.logger.error(f"Unknown error parsing video: {u}")
-                vidbar.set_postfix_str(Update_Postfix_Videos())
-                vidbar.update(1)
-                continue
-
-            # Make sure the video still exists before trying to process it.
-            if vid is None:
-                vid_stats.skipped_videos += 1
-                vidbar.set_postfix_str(Update_Postfix_Videos())
-                vidbar.update(1)
-                continue
-
-            #-------------------------#
-            #-- GET VIDEO THUMBNAIL --#
-            #-------------------------#
-
-            # Currently has no relation to the database, just saving it to file
-            vid.Get_Thumbnail(channel_bucket)
-
-            #---------------------------------------#
-            #-- INSERT/UPDATE VIDEO INTO DATABASE --#
-            #---------------------------------------#
-
-            # Will update the video in database if something changed in the returned JSON data
-            if video_exists == False:
-                DB.InsertEntries(cursor=db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
-                db.database.commit()
-            else:
-                for column, value in vid.entry.items():
-                    DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],column,value,"id",vid.id)
-                    db.database.commit()
-
-            #-----------------------------#
-            #-- GET VIDEO CHAT MESSAGES --#
-            #-----------------------------#
-
-            # Get the YTC messages from the video and put them into the database
-            try:
-                message_stats = yt.Get_Messages(vid,channel_bucket)
-                message_stats.append_all(all_chat_stats) # Update the global stats for chats and users
-                if vid.livestream == False:
-                    DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
-                    db.database.commit()
-                vid_stats.success_videos += 1
-                if vid.livestream == True:
-                    vid_stats.still_live += 1
-            # Regular videos (or streams that have been edited) have no chat
-            except chat_downloader.errors.NoChatReplay as e:
-                if vid.livestream == False:
-                    DB.UpdateEntry(db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
-                    db.database.commit()
-                vid_stats.no_chat_videos += 1
-                LOG.logger.warning(f"No Chat Replay available.")
-            # Catch when a video goes private or is members-only
-            except chat_downloader.errors.VideoUnplayable as f:
-                vid_stats.unavailable_videos += 1
-                LOG.logger.warning(f"Video inaccessible, skipping.")
-            # Catch any unknown errors
-            except Exception as u:
-                vid_stats.error_videos += 1
-                LOG.logger.error(f"Unknown error parsing video: {u}")
-
-            if CFG.REQUEST_DELAY > 0:
-                time.sleep(CFG.REQUEST_DELAY)
+            # Pre-skip already-processed or unavailable videos without entering the pool
+            for video_id in video_ids:
+                if video_db_status.get(video_id) is True or video_info_cache.get(video_id) is None:
+                    vid_stats.skipped_videos += 1
+                    vidbar.update(1)
+                else:
+                    futures[executor.submit(process_video,video_id)] = video_id
 
             vidbar.set_postfix_str(Update_Postfix_Videos())
-            vidbar.update(1)
+
+            # Collect results as each worker finishes
+            for future in as_completed(futures):
+                video_id = futures[future]
+                try:
+                    local_vid_stats,local_chat_stats = future.result()
+                    vid_stats.success_videos += local_vid_stats.success_videos
+                    vid_stats.no_chat_videos += local_vid_stats.no_chat_videos
+                    vid_stats.unavailable_videos += local_vid_stats.unavailable_videos
+                    vid_stats.error_videos += local_vid_stats.error_videos
+                    vid_stats.still_live += local_vid_stats.still_live
+                    local_chat_stats.append_all(all_chat_stats)
+                except Exception as e:
+                    vid_stats.error_videos += 1
+                    LOG.logger.error(f"Uncaught error for video {video_id}: {e}")
+                vidbar.set_postfix_str(Update_Postfix_Videos())
+                vidbar.update(1)
 
 LOG.logger.info("Video and chat processing complete.\n")
 
