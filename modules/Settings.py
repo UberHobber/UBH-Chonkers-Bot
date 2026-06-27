@@ -18,6 +18,11 @@ REQUEST_DELAY = 1.0
 # risks hitting YouTube's rate limits and getting temporarily blocked.
 WORKER_COUNT = 2
 
+# Number of users to process in parallel WITHIN each batch of 50. This only parallelizes
+# file I/O (PFP downloads, S3 uploads) — the YouTube API call stays one-per-batch and
+# sequential, so raising this value does NOT increase API call rate.
+USER_WORKER_COUNT = 10
+
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
 QUICK_SETTINGS_DATA = "D:/CodingProjects/_Datafiles"

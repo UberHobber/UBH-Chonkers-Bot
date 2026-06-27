@@ -282,8 +282,8 @@ if len(user_list) > 0:
         return f"Skipped: {all_chat_stats.invalid_users:,}"
 
     with LOG.TQDM_Logging():
-        with tqdm(Batch_Users(user_list),desc='Users Processed',total=len(user_list),bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
-            for users in userbar:
+        with tqdm(total=len(user_list),desc='Users Processed',bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
+            for users in Batch_Users(user_list):
                 all_chat_stats.invalid_users += yt.Get_User_Batch(users,user_bucket)
                 userbar.set_postfix_str(Update_Postfix_Users())
                 userbar.update(len(users))

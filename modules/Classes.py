@@ -1,5 +1,6 @@
 # Native Stuff
 import os,json,pickle,requests,re,xxhash,threading,queue
+from concurrent.futures import ThreadPoolExecutor,as_completed
 from typing import Any
 from datetime import datetime
 
@@ -567,7 +568,7 @@ class YT_API:
 
                 request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
                 response = request.execute()
-                next_page = response["nextPageToken"]
+                next_page = response.get("nextPageToken")
                 video_list:list[dict[str,Any]] = response["items"]
                 dl_vidbar.update(len(video_list))
 
@@ -577,10 +578,7 @@ class YT_API:
                     else:
                         next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50,pageToken=next_page)
                         next_response = next_request.execute()
-                        try:
-                            next_page = next_response["nextPageToken"]
-                        except:
-                            next_page = None
+                        next_page = next_response.get("nextPageToken")
                         response_items:list[dict] = next_response["items"]
                         dl_vidbar.update(len(response_items))
                         video_list:list[dict[str,Any]] = video_list + response_items
@@ -854,73 +852,84 @@ class YT_API:
         #-- GET USER DATA --#
         #-------------------#
 
+        # One API call per batch of 50 — rate unchanged vs. the original sequential loop.
         request = self.api.channels().list(part="id,snippet,statistics,status,brandingSettings",id=users)
         response = request.execute()
-        if "items" in response:
-            user_list = response["items"]
-        else:
-            user_list = []
-        valid_ids = set()
+        user_list:list[dict] = response.get("items",[])
 
-        try:
-            for user in user_list:
+        # IDs returned by the API (present but perhaps file-processing failed)
+        # vs. IDs the API didn't return at all (banned / deleted accounts).
+        api_returned_ids:set = {u.get("id") for u in user_list if u.get("id")}
+        valid_ids:set = set()  # successfully processed
 
-                del user["kind"]
-                del user["etag"]
+        def _process_user_files(user:dict) -> 'UserClass|None':
+            """Handles all file I/O for one user: JSON write, S3 upload, PFP download + upload.
+            Returns the UserClass on success, None if the user has no id."""
+            del user["kind"]
+            del user["etag"]
+            u = UserClass(user)
+            if u.id is None:
+                return None
 
-                u = UserClass(user)
+            #-----------------------------#
+            #-- WRITE USER DATA TO DISK --#
+            #-----------------------------#
 
-                if u.id is not None:
-                    #-----------------------------#
-                    #-- WRITE USER DATA TO DISK --#
-                    #-----------------------------#
+            temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{u.id}_TEMP.json"
+            with open(temp_path,'w') as file:
+                file.write(json.dumps(user,indent=4))
+            _check_and_upload_file(bucket,temp_path,u.id,"json",CFG.DETAIL_TAG)
 
-                    temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{u.id}_TEMP.json"
+            #------------------------------#
+            #-- PROFILE PICTURE DOWNLOAD --#
+            #------------------------------#
 
-                    # Write user data to file
-                    with open(temp_path,'w') as file:
-                        file.write(json.dumps(user,indent=4))
+            if u.pfp is not None:
+                temp_pfp = f"{bucket.local_root}/{CFG.PFP_TAG}/{u.id}_TEMP.jpg"
+                with open(temp_pfp,'wb') as handle:
+                    img_response = requests.get(u.pfp,stream=True)
+                    if not img_response.ok:
+                        LOG.logger.warning(f"PFP download failed for {u.id}: HTTP {img_response.status_code}")
+                    for block in img_response.iter_content(1024):
+                        if not block:
+                            break
+                        handle.write(block)
+                _check_and_upload_file(bucket,temp_pfp,u.id,"jpg",CFG.PFP_TAG)
 
-                    user_detail_status = _check_and_upload_file(bucket,temp_path,u.id,"json",CFG.DETAIL_TAG)
+            return u
 
-                    #------------------------------#
-                    #-- PROFILE PICTURE DOWNLOAD --#
-                    #------------------------------#
+        # Parallelize per-user file I/O within the batch (PFP downloads + S3 uploads).
+        # The API call above is already complete — no extra API concurrency is added.
+        completed_users:list = []
+        with ThreadPoolExecutor(max_workers=CFG.USER_WORKER_COUNT) as pool:
+            futures = {pool.submit(_process_user_files,user): user.get("id") for user in user_list}
+            for future in as_completed(futures):
+                uid = futures[future]
+                try:
+                    u = future.result()
+                    if u is not None:
+                        completed_users.append(u)
+                        valid_ids.add(u.id)
+                except Exception as e:
+                    LOG.logger.error(f"Error processing user {uid}: {e}")
+                    invalid += 1
 
-                    if u.pfp is not None:
-                        temp_pfp = f"{bucket.local_root}/{CFG.PFP_TAG}/{u.id}_TEMP.jpg"
-                        # Download a fresh thumbnail
-                        with open(temp_pfp,'wb') as handle:
-                            img_response = requests.get(u.pfp,stream=True)
-                            if not img_response.ok:
-                                LOG.logger.info(img_response)
-                            for block in img_response.iter_content(1024):
-                                if not block:
-                                    break
-                                handle.write(block)
+        #------------------------------#
+        #-- USER DATABASE OPERATIONS --#
+        #------------------------------#
 
-                        _check_and_upload_file(bucket,temp_pfp,u.id,"jpg",CFG.PFP_TAG)
+        # Write all successful users, then all invalid users, with a single commit per batch.
+        for u in completed_users:
+            DB.UpdateEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],{**u.entry,"processed":True},"id",u.id)
 
-                    #------------------------------#
-                    #-- USER DATABASE OPERATIONS --#
-                    #------------------------------#
-
-                    # Update the unprocessed User_ID with additional information (single query)
-                    DB.UpdateEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],{**u.entry,"processed":True},"id",u.id)
-                    self.db.database.commit()
-
-                    valid_ids.add(u.id)
-        except:
-            invalid += 1
-
-        all_users = users
-
-        for user in all_users:
-            if user not in valid_ids:
+        for user in users:
+            if user not in api_returned_ids:
+                # Not in the API response at all — banned or deleted account.
                 DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"exists",False,"id",user)
                 DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",user)
-                self.db.database.commit()
                 invalid += 1
+
+        self.db.database.commit()
 
         return invalid
 
