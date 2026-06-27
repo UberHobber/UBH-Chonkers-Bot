@@ -680,10 +680,10 @@ class YT_API:
             return chat_stats
 
         def Update_Postfix_Messages():
-            return f"New Messages: {chat_stats.new_messages} | Existing Messages: {chat_stats.existing_messages} | New Users: {chat_stats.new_user_ids} | Existing Users: {len(chat_stats.exist_user_ids)}"
+            return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {chat_stats.new_user_ids:,} | Existing Users: {len(chat_stats.exist_user_ids):,}"
 
         with LOG.TQDM_Logging():
-            with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} || {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=1, leave=False) as messbar:
+            with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=1, leave=False) as messbar:
                 try:
                     unique_user_ids = set()
                     # Process all chats collected by Chat_Downloader

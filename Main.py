@@ -1,5 +1,5 @@
 # Native Stuff
-import os,sys,shutil
+import os,sys,shutil,time
 
 sys.path.append(os.getcwd())
 
@@ -80,16 +80,16 @@ all_chat_stats = C.ChatStats()
 
 LOG.logger.info("\nObtaining all videos from Youtube API...")
 video_ids = yt.Get_All_Videos(channel_bucket)
-LOG.logger.info(f"Total of {len(video_ids)} video(s) aquired.")
+LOG.logger.info(f"Total of {len(video_ids):,} video(s) aquired.")
 
 LOG.logger.info("Processing videos for details, thumbnail, and chat messages...")
 with LOG.TQDM_Logging():
-    with tqdm(desc='Videos Processed',total=len(video_ids),bar_format='{desc}: {n_fmt}/{total_fmt} || {postfix}',ncols=80,postfix="",position=0,leave=False) as vidbar:
+    with tqdm(desc='Videos Processed',total=len(video_ids),bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix="",position=0,leave=False) as vidbar:
         # Get all videos in the hidden playlist then use generator to pass each id to loop
         for video_id in video_ids:
 
             def Update_Postfix_Videos():
-                return f"Current Video: {video_id} | Sucessful: {vid_stats.success_videos} | Skipped: {vid_stats.skipped_videos} | No Chat: {vid_stats.no_chat_videos} | Unavailable: {vid_stats.unavailable_videos} | Errors: {vid_stats.error_videos}"
+                return f"Current Video: {video_id} | Sucessful: {vid_stats.success_videos:,} | Skipped: {vid_stats.skipped_videos:,} | No Chat: {vid_stats.no_chat_videos:,} | Unavailable: {vid_stats.unavailable_videos:,} | Errors: {vid_stats.error_videos:,}"
 
             vidbar.set_postfix_str(Update_Postfix_Videos())
 
@@ -177,6 +177,9 @@ with LOG.TQDM_Logging():
                 vid_stats.error_videos += 1
                 LOG.logger.error(f"Unknown error parsing video: {u}")
 
+            if CFG.REQUEST_DELAY > 0:
+                time.sleep(CFG.REQUEST_DELAY)
+
             vidbar.set_postfix_str(Update_Postfix_Videos())
             vidbar.update(1)
 
@@ -195,7 +198,7 @@ def Batch_Users(users):
 LOG.logger.info("Obtaining all unprocessed users from database...")
 # Get fresh users from the DB
 unique_users = DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id",{"processed":False})
-LOG.logger.info(f"Total of {len(unique_users)} unique user(s) aquired.")
+LOG.logger.info(f"Total of {len(unique_users):,} unique user(s) aquired.")
 
 # List of IDs
 user_list = [str(v) for d in unique_users for v in d.values()]
@@ -204,10 +207,10 @@ if len(user_list) > 0:
 
 
     def Update_Postfix_Users():
-        return f"Skipped: {all_chat_stats.invalid_users}"
+        return f"Skipped: {all_chat_stats.invalid_users:,}"
 
     with LOG.TQDM_Logging():
-        with tqdm(Batch_Users(user_list),desc='Users Processed',total=len(user_list),bar_format='{desc}: {n_fmt}/{total_fmt} || {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
+        with tqdm(Batch_Users(user_list),desc='Users Processed',total=len(user_list),bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
             for users in userbar:
                 all_chat_stats.invalid_users += yt.Get_User_Batch(users,user_bucket)
                 userbar.set_postfix_str(Update_Postfix_Users())
@@ -223,24 +226,24 @@ LOG.logger.info("Local folders deleted")
 LOG.logger.info(f"""
 ---VIDEO STATISTICS---
 
-Total Videos:   {len(video_ids)}
-Existing:       {vid_stats.skipped_videos}
-New/Updated:    {vid_stats.success_videos}
-Still Live:     {vid_stats.still_live}
-No Chat:        {vid_stats.no_chat_videos}
-Unavailable:    {vid_stats.unavailable_videos}
-Errors:         {vid_stats.error_videos}
+Total Videos:   {len(video_ids):,}
+Existing:       {vid_stats.skipped_videos:,}
+New/Updated:    {vid_stats.success_videos:,}
+Still Live:     {vid_stats.still_live:,}
+No Chat:        {vid_stats.no_chat_videos:,}
+Unavailable:    {vid_stats.unavailable_videos:,}
+Errors:         {vid_stats.error_videos:,}
 
 ---CHAT STATISTICS---
 
-To Process:     {all_chat_stats.total_messages}
-New:            {all_chat_stats.new_messages}
-Existing:       {all_chat_stats.existing_messages}
+To Process:     {all_chat_stats.total_messages:,}
+New:            {all_chat_stats.new_messages:,}
+Existing:       {all_chat_stats.existing_messages:,}
 
 ---USER STATISTICS---
 
-Unique Users:   {all_chat_stats.new_user_ids + len(all_chat_stats.exist_user_ids)}
-New:            {all_chat_stats.new_user_ids}
-Existing:       {len(all_chat_stats.exist_user_ids)}
-Invalid:        {all_chat_stats.invalid_users}
+Unique Users:   {all_chat_stats.new_user_ids + len(all_chat_stats.exist_user_ids):,}
+New:            {all_chat_stats.new_user_ids:,}
+Existing:       {len(all_chat_stats.exist_user_ids):,}
+Invalid:        {all_chat_stats.invalid_users:,}
 """)

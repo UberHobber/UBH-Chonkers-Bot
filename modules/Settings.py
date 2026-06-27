@@ -7,7 +7,12 @@ from tkinter import filedialog,messagebox
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-CHANNEL_SELECTION = "Kiara"
+CHANNEL_SELECTION = "Bae"
+USE_COOKIES = False
+
+# Seconds to wait between processing each video. Prevents hitting YouTube too fast
+# when many consecutive videos have no chat replay. 0 to disable.
+REQUEST_DELAY = 1.0
 
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
@@ -86,7 +91,7 @@ else:
 # Needed to access chat messages from member's only videos. Use browser addins to generate, make sure name matches.
 # NOTE: Once you've exported the cookies, CLOSE that browser (or user agent) and do not open/use until this program finishes.
 # Keeping the browser open tends to make the YT cookies reset and break the access to member's only videos.
-COOKIES = None if GET_MEMBERS_ONLY is False else f"{SECRETS_DIRECTORY}/cookies.txt"
+COOKIES = None if GET_MEMBERS_ONLY is False and USE_COOKIES is False else f"{SECRETS_DIRECTORY}/cookies.txt"
 
 # These folders will be automatically created if they don't exist. It's where the JSON files and thumbnails will be saved to.
 
