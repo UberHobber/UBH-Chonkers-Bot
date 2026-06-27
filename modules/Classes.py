@@ -1,5 +1,5 @@
 # Native Stuff
-import os,json,pickle,requests,re,xxhash,threading
+import os,json,pickle,requests,re,xxhash,threading,queue
 from typing import Any
 from datetime import datetime
 
@@ -688,19 +688,42 @@ class YT_API:
         #-- GET ALL CHAT DATA --#
         #-----------------------#
 
-        if skip_download == True:
-            pass
-        else:
-            # Timeout will prevent sitting endlessly on a waiting room or livestream
-            if CFG.TIMEOUT == True:
-                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'],inactivity_timeout=20)
-            else:
-                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
-
         message_list:list[dict[str,Any]] = []
         chat_stats = ChatStats()
 
-        chat_list = chat if skip_download == False else messages_on_file
+        if skip_download == False:
+            # chat_downloader's built-in inactivity_timeout calls _thread.interrupt_main(),
+            # which only raises KeyboardInterrupt in the main thread. In a worker thread the
+            # timer fires but the interrupt lands in the wrong thread and the worker stays
+            # blocked on the network call forever. We implement the timeout ourselves via a
+            # queue so it works correctly from any thread.
+            _raw_chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
+            if CFG.TIMEOUT:
+                _msg_queue:queue.Queue = queue.Queue()
+                def _feed_queue():
+                    try:
+                        for _msg in _raw_chat:
+                            _msg_queue.put(_msg)
+                    except Exception as _e:
+                        _msg_queue.put(_e)
+                    _msg_queue.put(None)
+                threading.Thread(target=_feed_queue, daemon=True).start()
+                def _timed_chat_iter():
+                    while True:
+                        try:
+                            _item = _msg_queue.get(timeout=20)
+                        except queue.Empty:
+                            return
+                        if _item is None:
+                            return
+                        if isinstance(_item, Exception):
+                            raise _item
+                        yield _item
+                chat_list = _timed_chat_iter()
+            else:
+                chat_list = _raw_chat
+        else:
+            chat_list = messages_on_file
 
         if chat_list is None:
             return chat_stats
