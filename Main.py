@@ -188,8 +188,6 @@ def process_video(video_id:str):
     #-- GET VIDEO CHAT MESSAGES --#
     #-----------------------------#
 
-    rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
-
     try:
         message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
         message_stats.append_all(local_chat_stats)
@@ -205,12 +203,14 @@ def process_video(video_id:str):
             thread_db.database.commit()
         local_vid_stats.no_chat_videos = 1
         LOG.logger.warning(f"{video_id}: No Chat Replay available.")
+        rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
     except chat_downloader.errors.VideoUnplayable:
         local_vid_stats.unavailable_videos = 1
         LOG.logger.warning(f"{video_id}: Video inaccessible, skipping.")
     except Exception as u:
         local_vid_stats.error_videos = 1
         LOG.logger.error(f"{video_id}: Unknown error: {u}")
+        rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
 
     return local_vid_stats,local_chat_stats
 
@@ -314,8 +314,8 @@ Existing:       {all_chat_stats.existing_messages:,}
 
 ---USER STATISTICS---
 
-Unique Users:   {all_chat_stats.new_user_ids + len(all_chat_stats.exist_user_ids):,}
-New:            {all_chat_stats.new_user_ids:,}
-Existing:       {len(all_chat_stats.exist_user_ids):,}
+Unique Users:   {len(all_chat_stats.new_user_ids | all_chat_stats.exist_user_ids):,}
+New:            {len(all_chat_stats.new_user_ids):,}
+Existing:       {len(all_chat_stats.exist_user_ids - all_chat_stats.new_user_ids):,}
 Invalid:        {all_chat_stats.invalid_users:,}
 """)

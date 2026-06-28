@@ -7,12 +7,12 @@ from tkinter import filedialog,messagebox
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-CHANNEL_SELECTION = "Bae"
+CHANNEL_SELECTION = "Kronii"
 USE_COOKIES = False
 
 # Seconds to wait between starting each chat download. The rate limiter enforces this
 # gap even across concurrent workers so YouTube isn't hit simultaneously. 0 to disable.
-REQUEST_DELAY = 1.0
+REQUEST_DELAY = 2.0
 
 # Number of videos to process in parallel. 2 is the safe default — going above 3
 # risks hitting YouTube's rate limits and getting temporarily blocked.

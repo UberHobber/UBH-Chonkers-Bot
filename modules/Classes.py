@@ -45,8 +45,8 @@ class ChatStats:
         self.total_messages:int = 0
         self.new_messages:int = 0
         self.existing_messages:int = 0
-        self.new_user_ids:int = 0
-        self.exist_user_ids = set()
+        self.new_user_ids:set = set()
+        self.exist_user_ids:set = set()
         self.invalid_users:int = 0
 
     def append_all(self,all_chat_stats:'ChatStats'):
@@ -54,7 +54,7 @@ class ChatStats:
         all_chat_stats.total_messages += self.total_messages
         all_chat_stats.new_messages += self.new_messages
         all_chat_stats.existing_messages += self.existing_messages
-        all_chat_stats.new_user_ids += self.new_user_ids
+        all_chat_stats.new_user_ids = all_chat_stats.new_user_ids.union(self.new_user_ids)
         all_chat_stats.exist_user_ids = all_chat_stats.exist_user_ids.union(self.exist_user_ids)
 
 class H3Client():
@@ -727,7 +727,7 @@ class YT_API:
             return chat_stats
 
         def Update_Postfix_Messages():
-            return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {chat_stats.new_user_ids:,} | Existing Users: {len(chat_stats.exist_user_ids):,}"
+            return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {len(chat_stats.new_user_ids):,} | Existing Users: {len(chat_stats.exist_user_ids - chat_stats.new_user_ids):,}"
 
         with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
             try:
@@ -756,7 +756,7 @@ class YT_API:
                                 uncommitted = 0
                                 known_user_ids.add(msg.usr_id)
                         if _is_new_user:
-                            chat_stats.new_user_ids += 1
+                            chat_stats.new_user_ids.add(msg.usr_id)
                             unique_user_ids.add(msg.usr_id)
                         else:
                             unique_user_ids.add(msg.usr_id)
