@@ -188,29 +188,32 @@ def process_video(video_id:str):
     #-- GET VIDEO CHAT MESSAGES --#
     #-----------------------------#
 
-    try:
-        message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
-        message_stats.append_all(local_chat_stats)
-        if vid.livestream == False:
-            DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
-            thread_db.database.commit()
+    if CFG.SKIP_CHAT_DOWNLOAD:
         local_vid_stats.success_videos = 1
-        if vid.livestream == True:
-            local_vid_stats.still_live = 1
-    except chat_downloader.errors.NoChatReplay:
-        if vid.livestream == False:
-            DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
-            thread_db.database.commit()
-        local_vid_stats.no_chat_videos = 1
-        LOG.logger.warning(f"{video_id}: No Chat Replay available.")
-        rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
-    except chat_downloader.errors.VideoUnplayable:
-        local_vid_stats.unavailable_videos = 1
-        LOG.logger.warning(f"{video_id}: Video inaccessible, skipping.")
-    except Exception as u:
-        local_vid_stats.error_videos = 1
-        LOG.logger.error(f"{video_id}: Unknown error: {u}")
-        rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
+    else:
+        try:
+            message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
+            message_stats.append_all(local_chat_stats)
+            if vid.livestream == False:
+                DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+                thread_db.database.commit()
+            local_vid_stats.success_videos = 1
+            if vid.livestream == True:
+                local_vid_stats.still_live = 1
+        except chat_downloader.errors.NoChatReplay:
+            if vid.livestream == False:
+                DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+                thread_db.database.commit()
+            local_vid_stats.no_chat_videos = 1
+            LOG.logger.warning(f"{video_id}: No Chat Replay available.")
+            rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
+        except chat_downloader.errors.VideoUnplayable:
+            local_vid_stats.unavailable_videos = 1
+            LOG.logger.warning(f"{video_id}: Video inaccessible, skipping.")
+        except Exception as u:
+            local_vid_stats.error_videos = 1
+            LOG.logger.error(f"{video_id}: Unknown error: {u}")
+            rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
 
     return local_vid_stats,local_chat_stats
 

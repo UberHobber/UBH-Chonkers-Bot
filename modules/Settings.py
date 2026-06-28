@@ -7,7 +7,7 @@ from tkinter import filedialog,messagebox
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-CHANNEL_SELECTION = "Kronii"
+CHANNEL_SELECTION = "Nerissa"
 USE_COOKIES = False
 
 # Seconds to wait between starting each chat download. The rate limiter enforces this
@@ -89,6 +89,13 @@ if QUICK_SETTINGS is True:
     GET_MEMBERS_ONLY = False
 else:
     GET_MEMBERS_ONLY = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
+
+# Override SKIP_CHAT_DOWNLOAD via dialog when not using quick settings.
+
+if QUICK_SETTINGS is True:
+    SKIP_CHAT_DOWNLOAD = False
+else:
+    SKIP_CHAT_DOWNLOAD = messagebox.askyesno("Skip Chat Download","Skip chat download for members-only videos?\n(Metadata and thumbnails will still be processed, but videos won't be marked as done.)")
 
 # The chat scraper can timeout if there is a livestream going and no new messages arrive.
 # Good for if there's a livestream (either live or waiting), but getting all other videos are desired.
