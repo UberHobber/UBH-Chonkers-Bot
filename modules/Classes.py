@@ -1,5 +1,5 @@
 # Native Stuff
-import os,json,pickle,requests,re,xxhash,threading,queue
+import os,json,pickle,requests,re,xxhash,threading,queue,time
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from typing import Any
 from datetime import datetime
@@ -17,6 +17,7 @@ import google
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # S3 API
 import boto3
@@ -854,7 +855,17 @@ class YT_API:
 
         # One API call per batch of 50 — rate unchanged vs. the original sequential loop.
         request = self.api.channels().list(part="id,snippet,statistics,status,brandingSettings",id=users)
-        response = request.execute()
+        _RETRYABLE = {429, 500, 503}
+        for _attempt in range(5):
+            try:
+                response = request.execute()
+                break
+            except HttpError as e:
+                if e.resp.status not in _RETRYABLE or _attempt == 4:
+                    raise
+                wait = 2 ** _attempt
+                LOG.logger.warning(f"YouTube API returned {e.resp.status}, retrying in {wait}s (attempt {_attempt+1}/5)")
+                time.sleep(wait)
         user_list:list[dict] = response.get("items",[])
 
         # IDs returned by the API (present but perhaps file-processing failed)

@@ -173,6 +173,16 @@ def TQDM_Logging():
 
 StreamLog()
 
+# Route chat-downloader's logger through tqdm.write so its warnings don't
+# break TQDM progress bars by writing directly to stderr.
+_cd_logger = logging.getLogger('chat_downloader')
+_cd_tqdm_handler = TQDMHandler()
+_cd_tqdm_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+for _h in list(_cd_logger.handlers):
+    _cd_logger.removeHandler(_h)
+_cd_logger.addHandler(_cd_tqdm_handler)
+_cd_logger.propagate = False
+
 if CFG.LOG == True:
     FileLog(CFG.DEBUG_LOG_FILE,CFG.LOG_NAME)
 

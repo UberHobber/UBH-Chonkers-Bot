@@ -1,6 +1,6 @@
 # Native Stuff
 import os,sys,shutil,time,threading
-from concurrent.futures import ThreadPoolExecutor,as_completed
+from concurrent.futures import Future,ThreadPoolExecutor,as_completed
 
 sys.path.append(os.getcwd())
 
@@ -99,7 +99,7 @@ unprocessed_ids = [vid_id for vid_id in video_ids if video_db_status.get(vid_id)
 LOG.logger.info(f"  {len(unprocessed_ids):,} unprocessed video(s) to fetch.")
 
 LOG.logger.info("Fetching video details in batches of 50...")
-video_info_cache:dict = {}
+video_info_cache:dict[str,C.VideoClass] = {}
 with LOG.TQDM_Logging():
     with tqdm(desc='Video Info Fetched',total=len(unprocessed_ids),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=0,leave=False) as fetchbar:
         for i in range(0,len(unprocessed_ids),50):
@@ -155,7 +155,7 @@ class _RateLimiter:
 
 rate_limiter = _RateLimiter(CFG.REQUEST_DELAY)
 
-def process_video(video_id:str):
+def process_video(video_id:str) -> tuple[C.VideoStats, C.ChatStats]:
     """
     Processes a single video: thumbnail, DB insert/update, chat messages.
     Designed to run in a worker thread — uses its own DB connection via get_thread_db().
@@ -191,29 +191,34 @@ def process_video(video_id:str):
     if CFG.SKIP_CHAT_DOWNLOAD:
         local_vid_stats.success_videos = 1
     else:
-        try:
-            message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
-            message_stats.append_all(local_chat_stats)
-            if vid.livestream == False:
-                DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
-                thread_db.database.commit()
+        if CFG.SKIP_LIVESTREAMS and vid.livestream == True:
             local_vid_stats.success_videos = 1
-            if vid.livestream == True:
-                local_vid_stats.still_live = 1
-        except chat_downloader.errors.NoChatReplay:
-            if vid.livestream == False:
-                DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
-                thread_db.database.commit()
-            local_vid_stats.no_chat_videos = 1
-            LOG.logger.warning(f"{video_id}: No Chat Replay available.")
+            LOG.logger.info(f"{video_id}: Skipping livestream.")
             rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
-        except chat_downloader.errors.VideoUnplayable:
-            local_vid_stats.unavailable_videos = 1
-            LOG.logger.warning(f"{video_id}: Video inaccessible, skipping.")
-        except Exception as u:
-            local_vid_stats.error_videos = 1
-            LOG.logger.error(f"{video_id}: Unknown error: {u}")
-            rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
+        else:
+            try:
+                message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
+                message_stats.append_all(local_chat_stats)
+                if vid.livestream == False:
+                    DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+                    thread_db.database.commit()
+                local_vid_stats.success_videos = 1
+                if vid.livestream == True:
+                    local_vid_stats.still_live = 1
+            except chat_downloader.errors.NoChatReplay:
+                if vid.livestream == False:
+                    DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+                    thread_db.database.commit()
+                local_vid_stats.no_chat_videos = 1
+                LOG.logger.warning(f"{video_id}: No Chat Replay available.")
+                rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
+            except chat_downloader.errors.VideoUnplayable:
+                local_vid_stats.unavailable_videos = 1
+                LOG.logger.warning(f"{video_id}: Video inaccessible, skipping.")
+            except Exception as u:
+                local_vid_stats.error_videos = 1
+                LOG.logger.error(f"{video_id}: Unknown error: {u}")
+                rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
 
     return local_vid_stats,local_chat_stats
 
@@ -229,7 +234,7 @@ with LOG.TQDM_Logging():
             return f"Successful: {vid_stats.success_videos:,} | Skipped: {vid_stats.skipped_videos:,} | No Chat: {vid_stats.no_chat_videos:,} | Unavailable: {vid_stats.unavailable_videos:,} | Errors: {vid_stats.error_videos:,}"
 
         with ThreadPoolExecutor(max_workers=CFG.WORKER_COUNT) as executor:
-            futures:dict = {}
+            futures:dict[Future[tuple[C.VideoStats, C.ChatStats]], str] = {}
 
             # Pre-skip already-processed or unavailable videos without entering the pool
             for video_id in video_ids:

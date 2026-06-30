@@ -44,23 +44,38 @@ THUMBNAIL_TAG= "thumbnails"
 MESSAGES_TAG = "messages"
 PFP_TAG = "pfp"
 
+if QUICK_SETTINGS is True:
+    # Create a log file (In script location)
+    LOG = False
+    # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
+    DATA_DIRECTORY = QUICK_SETTINGS_DATA
+    SECRETS_DIRECTORY = QUICK_SETTINGS_SECRET
+    # Set this if you want to write to a member's only database.
+    GET_MEMBERS_ONLY = False
+    # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
+    SKIP_CHAT_DOWNLOAD = False
+    # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
+    TIMEOUT = True
+    # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
+    SKIP_LIVESTREAMS = True
+else:
+    # Create a log file (In script location)
+    LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?")
+    # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
+    DATA_DIRECTORY = filedialog.askdirectory(title="Specify directory for data to be downloaded to")
+    SECRETS_DIRECTORY = filedialog.askdirectory(title="Specify directory where Secrets and/or Cookies are")
+    # Set this if you want to write to a member's only database.
+    GET_MEMBERS_ONLY = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
+    # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
+    SKIP_CHAT_DOWNLOAD = messagebox.askyesno("Skip Chat Download","Process only video data and not the chat messages?\n(Useful for publicly available Members Only video info.)")
+    # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
+    TIMEOUT = messagebox.askyesno("Chat Timeout","Do you want the chat scraper to timeout?\n(Pick no if you want it to keep watching a livestream.)")
+    # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
+    SKIP_LIVESTREAMS = messagebox.askyesno("Skip Livestreams","Do you want to skip any livestreams or waiting rooms?")
+
 #####################################
 ### OTHER SETTINGS (DO NOT TOUCH) ###
 #####################################
-
-# Will ask if a log file will be created at all
-if QUICK_SETTINGS is True:
-    LOG = False
-else:
-    LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?") # Create a log file (In script location)
-
-# Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
-if QUICK_SETTINGS is True:
-    DATA_DIRECTORY = QUICK_SETTINGS_DATA
-    SECRETS_DIRECTORY = QUICK_SETTINGS_SECRET
-else:
-    DATA_DIRECTORY = filedialog.askdirectory(title="Specify directory for data to be downloaded to")
-    SECRETS_DIRECTORY = filedialog.askdirectory(title="Specify directory where Secrets and/or Cookies are")
 
 # Will exit if either folder dialog boxes were closed
 if DATA_DIRECTORY == "" or SECRETS_DIRECTORY == "":
@@ -83,26 +98,6 @@ CHANNEL_DIRECTORY = gen_settings["channel_directory"]
 CHANNEL_SELECTOR = CHANNEL_DIRECTORY[CHANNEL_SELECTION]
 CHANNEL_SUFFIX = CHANNEL_SELECTOR["db_suffix"]
 USER_DATA_NAME = gen_settings["user_data_name"]
-
-# Set this if you want to write to a member's only database.
-if QUICK_SETTINGS is True:
-    GET_MEMBERS_ONLY = False
-else:
-    GET_MEMBERS_ONLY = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
-
-# Override SKIP_CHAT_DOWNLOAD via dialog when not using quick settings.
-
-if QUICK_SETTINGS is True:
-    SKIP_CHAT_DOWNLOAD = False
-else:
-    SKIP_CHAT_DOWNLOAD = messagebox.askyesno("Skip Chat Download","Skip chat download for members-only videos?\n(Metadata and thumbnails will still be processed, but videos won't be marked as done.)")
-
-# The chat scraper can timeout if there is a livestream going and no new messages arrive.
-# Good for if there's a livestream (either live or waiting), but getting all other videos are desired.
-if QUICK_SETTINGS is True:
-    TIMEOUT = True
-else:
-    TIMEOUT = messagebox.askyesno("Chat-Timeout","Do you want the chat scraper to timeout?\n(Pick no if you want it to keep watching a livestream.)")
 
 # Needed to access chat messages from member's only videos. Use browser addins to generate, make sure name matches.
 # NOTE: Once you've exported the cookies, CLOSE that browser (or user agent) and do not open/use until this program finishes.
