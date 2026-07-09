@@ -2,12 +2,14 @@
 import json,os
 from sys import exit
 from tkinter import filedialog,messagebox
+from psycopg2.extensions import cursor
 
 ##############################
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-CHANNEL_SELECTION = "Nerissa"
+PROCESS_ALL = False
+CHANNEL_SELECTION = "HoloEN"
 USE_COOKIES = False
 
 # Seconds to wait between starting each chat download. The rate limiter enforces this
@@ -88,15 +90,6 @@ TOKEN_PICKLE_FILE = f'{SECRETS_DIRECTORY}/token.pickle'# Will be created on firs
 with open(f"{SECRETS_DIRECTORY}/Settings.json",'r') as file:
     gen_settings = json.load(file)
 
-# YT INFORMATION
-# Given just the UserID, all other IDs can be generated for the upload playlists and channel ID.
-# If you only have the ChannelID, remove the "UC" at the start and put it into the UserID field.
-# NOTE: Custom handles DO NOT work, you need the ID number with all the random characters.
-CHANNEL_DIRECTORY = gen_settings["channel_directory"]
-
-# Pick the member entry you'd like here
-CHANNEL_SELECTOR = CHANNEL_DIRECTORY[CHANNEL_SELECTION]
-CHANNEL_SUFFIX = CHANNEL_SELECTOR["db_suffix"]
 USER_DATA_NAME = gen_settings["user_data_name"]
 
 # Needed to access chat messages from member's only videos. Use browser addins to generate, make sure name matches.
@@ -105,21 +98,10 @@ USER_DATA_NAME = gen_settings["user_data_name"]
 COOKIES = None if GET_MEMBERS_ONLY is False and USE_COOKIES is False else f"{SECRETS_DIRECTORY}/cookies.txt"
 
 # These folders will be automatically created if they don't exist. It's where the JSON files and thumbnails will be saved to.
-
-# The main data path used elsewhere in code
-LOCAL_DATA_PATH = f"{DATA_DIRECTORY}/{CHANNEL_SUFFIX}"
 LOCAL_USER_PATH = f"{DATA_DIRECTORY}/{USER_DATA_NAME}"
 
 DETAIL_TAG = f"{DETAIL_TAG}" if GET_MEMBERS_ONLY is False else f"{DETAIL_TAG}{MEMBERS_ONLY_FLAG}"
 THUMBNAIL_TAG= f"{THUMBNAIL_TAG}" if GET_MEMBERS_ONLY is False else f"{THUMBNAIL_TAG}{MEMBERS_ONLY_FLAG}"
-
-DATA_PATHS = [
-    f"{LOCAL_DATA_PATH}/{DETAIL_TAG}",
-    f"{LOCAL_DATA_PATH}/{THUMBNAIL_TAG}",
-    f"{LOCAL_DATA_PATH}/{MESSAGES_TAG}",
-    f"{LOCAL_USER_PATH}/{DETAIL_TAG}",
-    f"{LOCAL_USER_PATH}/{PFP_TAG}"
-]
 
 # Edit the template provided and stuff it in your secrets folder
 with open(f"{SECRETS_DIRECTORY}/DB_Settings.json",'r') as file:
@@ -132,33 +114,79 @@ DB_HOST = db_settings["DB_HOST"]
 DB_PORT = db_settings["DB_PORT"]
 DB_NAME = db_settings["db_name"]
 
-if GET_MEMBERS_ONLY is False:
-    DB_TABLES = {
-        "emotes":f"emotes_{CHANNEL_SUFFIX}",
-        "messages":f"messages_{CHANNEL_SUFFIX}",
-        "nickname_matches":f"nickname_matches_{CHANNEL_SUFFIX}",
-        "nicknames":f"nicknames_{CHANNEL_SUFFIX}",
-        "videos":f"videos_{CHANNEL_SUFFIX}",
-        "user_ids":"user_ids"
-    }
-else:
-    DB_TABLES = {
-        "emotes":f"emotes_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
-        "messages":f"messages_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
-        "nickname_matches":f"nickname_matches_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
-        "nicknames":f"nicknames_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
-        "videos":f"videos_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
-        "user_ids":"user_ids"
-    }
+# Populated by load_channel_directory() once a DB connection exists (see Main.py).
+CHANNEL_DIRECTORY:dict[str,dict[str,str]] = {}
+CHANNELS_TO_PROCESS:list[str] = []
 
-# Auto-filled out data for Youtube data
-YT_USER_ID = CHANNEL_SELECTOR["user_id"] # UserID of the selected member
-YT_CHANNEL_ID = "UC" + YT_USER_ID
-UPLOAD_PLAYLIST = "UU" + YT_USER_ID # Hidden playlist containing ALL publically accessible Youtube Videos, Livestream VODs, and Shorts.
-MEMBERS_ONLY_PLAYLIST = "UUMO" + YT_USER_ID # Hiiden playlist containing ALL non-privated member's only Youtube Videos, Livestream VODs, and Shorts.
+def load_channel_directory(cursor:cursor) -> None:
+    """
+    Loads channel metadata from the channel_directory table (replaces the old settings.json
+    channel_directory section) and computes which channels to process this run. Call once with
+    an open DB cursor before select_channel().
+    """
+    global CHANNEL_DIRECTORY,CHANNELS_TO_PROCESS
 
-# Leave this be, edit CUSTOM PLAYLIST and MEMBERS values above instead.
-PLAYLIST = UPLOAD_PLAYLIST if GET_MEMBERS_ONLY is False else MEMBERS_ONLY_PLAYLIST
+    cursor.execute('SELECT name, user_id, db_suffix, "group" FROM channel_directory')
+    CHANNEL_DIRECTORY = {name:{"user_id":user_id,"db_suffix":db_suffix,"group":group} for name,user_id,db_suffix,group in cursor.fetchall()}
+
+    # PROCESS_ALL loops over every entry in CHANNEL_DIRECTORY instead of just CHANNEL_SELECTION.
+    CHANNELS_TO_PROCESS = list(CHANNEL_DIRECTORY.keys()) if PROCESS_ALL else [CHANNEL_SELECTION]
+
+def select_channel(channel_name:str) -> None:
+    """Recomputes all channel-specific derived settings (paths, DB tables, YT IDs) for the given channel."""
+    global CHANNEL_SELECTION,CHANNEL_SELECTOR,CHANNEL_SUFFIX,LOCAL_DATA_PATH,DATA_PATHS
+    global DB_TABLES,YT_USER_ID,YT_CHANNEL_ID,UPLOAD_PLAYLIST,MEMBERS_ONLY_PLAYLIST,PLAYLIST
+
+    CHANNEL_SELECTION = channel_name
+    CHANNEL_SELECTOR = CHANNEL_DIRECTORY[CHANNEL_SELECTION]
+    CHANNEL_SUFFIX = CHANNEL_SELECTOR["db_suffix"]
+
+    # The main data path used elsewhere in code
+    LOCAL_DATA_PATH = f"{DATA_DIRECTORY}/{CHANNEL_SUFFIX}"
+
+    DATA_PATHS = [
+        f"{LOCAL_DATA_PATH}/{DETAIL_TAG}",
+        f"{LOCAL_DATA_PATH}/{THUMBNAIL_TAG}",
+        f"{LOCAL_DATA_PATH}/{MESSAGES_TAG}",
+        f"{LOCAL_USER_PATH}/{DETAIL_TAG}",
+        f"{LOCAL_USER_PATH}/{PFP_TAG}"
+    ]
+
+    # emotes, nicknames, and nickname_matches were merged from per-channel
+    # emotes_<suffix>/nicknames_<suffix>/nickname_matches_<suffix> tables into single
+    # channel_id-keyed tables. The *_members variants were not part of that merge and
+    # still use the old per-channel naming.
+    #
+    # videos was already fully merged (earlier, separately) into one channel_id-keyed
+    # table for BOTH public and members-only videos, distinguished by its "members"
+    # column -- there's no separate videos_<suffix>_members table at all anymore.
+    if GET_MEMBERS_ONLY is False:
+        DB_TABLES = {
+            "emotes":"emotes",
+            "messages":f"messages_{CHANNEL_SUFFIX}",
+            "nickname_matches":"nickname_matches",
+            "nicknames":"nicknames",
+            "videos":"videos",
+            "user_ids":"user_ids"
+        }
+    else:
+        DB_TABLES = {
+            "emotes":f"emotes_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+            "messages":f"messages_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+            "nickname_matches":f"nickname_matches_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
+            "nicknames":"nicknames",
+            "videos":"videos",
+            "user_ids":"user_ids"
+        }
+
+    # Auto-filled out data for Youtube data
+    YT_USER_ID = CHANNEL_SELECTOR["user_id"] # UserID of the selected member
+    YT_CHANNEL_ID = "UC" + YT_USER_ID
+    UPLOAD_PLAYLIST = "UU" + YT_USER_ID # Hidden playlist containing ALL publically accessible Youtube Videos, Livestream VODs, and Shorts.
+    MEMBERS_ONLY_PLAYLIST = "UUMO" + YT_USER_ID # Hiiden playlist containing ALL non-privated member's only Youtube Videos, Livestream VODs, and Shorts.
+
+    # Leave this be, edit CUSTOM PLAYLIST and MEMBERS values above instead.
+    PLAYLIST = UPLOAD_PLAYLIST if GET_MEMBERS_ONLY is False else MEMBERS_ONLY_PLAYLIST
 
 if os.path.exists(f"{SECRETS_DIRECTORY}/S3_Settings.json"):
     # Edit the template provided and stuff it in your secrets folder

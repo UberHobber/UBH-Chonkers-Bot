@@ -3,6 +3,7 @@ from typing import Any,LiteralString
 
 # Installed Stuff
 import psycopg2
+from psycopg2 import sql
 
 # Other Project Files
 import modules.Settings as CFG
@@ -160,6 +161,98 @@ def DeleteEntries(cursor:psycopg2.extensions.cursor,table:str,filter:dict[str,An
             cursor.execute(base_query)
     except Exception as e:
         LOG.logger.error(f'Query: {query}\nValues: {values}\n')
+        raise e
+
+def CreateMessagesPartition(cursor:psycopg2.extensions.cursor,table:str,channel_id:str) -> None:
+    """
+    Creates a partition of public.messages for the given channel_id.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param table: Partition table name (e.g. "messages_<db_suffix>").
+    :type table: String
+    :param channel_id: The channel's user_id -- the partition's list value.
+    :type channel_id: String
+    """
+    query = sql.SQL('CREATE TABLE public.{partition} PARTITION OF public.messages FOR VALUES IN (%s)').format(partition=sql.Identifier(table))
+
+    if CFG.DB_VERBOSE == True:
+        LOG.logger.info(query.as_string(cursor))
+        LOG.logger.info(channel_id)
+
+    cursor.execute(query,(channel_id,))
+
+def TableExists(cursor:psycopg2.extensions.cursor,table:str) -> bool:
+    """
+    Checks whether a table exists in the public schema.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param table: Table name to check for.
+    :type table: String
+    :return: Whether the table exists.
+    :rtype: Boolean
+    """
+    cursor.execute('SELECT to_regclass(%s) IS NOT NULL',(f'public.{table}',))
+    row = cursor.fetchone()
+    return row is not None and bool(row[0])
+
+def EnsureMessagesPartition(cursor:psycopg2.extensions.cursor,table:str,channel_id:str) -> None:
+    """
+    Creates the given channel's messages partition table if it doesn't already exist.
+    Covers channels added directly to channel_directory (e.g. via manual SQL) that don't
+    yet have a matching messages_<db_suffix> partition. Caller is responsible for committing.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param table: Partition table name (e.g. "messages_<db_suffix>").
+    :type table: String
+    :param channel_id: The channel's user_id -- the partition's list value.
+    :type channel_id: String
+    """
+    if TableExists(cursor,table):
+        return
+
+    try:
+        CreateMessagesPartition(cursor,table,channel_id)
+        LOG.logger.info(f'Created missing partition table {table} for channel_id {channel_id}.')
+    except Exception as e:
+        LOG.logger.error(f'Failed to create missing partition table {table} for channel_id {channel_id}: {e}')
+        raise e
+
+def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:str,group:str) -> None:
+    """
+    Registers a new channel: adds its row to channel_directory and creates its
+    messages_<db_suffix> partition of the partitioned messages table. Caller is
+    responsible for committing (or rolling back) both statements as one transaction,
+    since the channel_directory row and its messages partition must exist together.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param name: Channel's display name, used as its key in CFG.CHANNEL_DIRECTORY.
+    :type name: String
+    :param user_id: YouTube user ID (channel_directory.user_id / channel_id used elsewhere).
+    :type user_id: String
+    :param db_suffix: Short identifier used to name the channel's messages partition table.
+    :type db_suffix: String
+    :param group: Talent group/agency the channel belongs to.
+    :type group: String
+    """
+    try:
+        insert_query = 'INSERT INTO channel_directory (name, user_id, db_suffix, "group") VALUES (%s, %s, %s, %s)'
+        insert_values = (name,user_id,db_suffix,group)
+
+        if CFG.DB_VERBOSE == True:
+            LOG.logger.info(insert_query)
+            LOG.logger.info(insert_values)
+
+        cursor.execute(insert_query,insert_values)
+
+        CreateMessagesPartition(cursor,f'messages_{db_suffix}',user_id)
+
+        LOG.logger.info(f'Added channel {name} (messages_{db_suffix}) to channel_directory.')
+    except Exception as e:
+        LOG.logger.error(f'Failed to add channel {name} (user_id={user_id}, db_suffix={db_suffix}): {e}')
         raise e
 
 def GetEntries(cursor:psycopg2.extensions.cursor,table:str,columns:str='*',filter:dict[str,Any]|None=None) -> list[dict[str, Any]]:

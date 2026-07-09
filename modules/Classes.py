@@ -88,8 +88,14 @@ class H3Bucket:
         except ClientError as e:
             error_code = e.response['Error']['Code'] #type:ignore
             if error_code == '404':
-                LOG.logger.error(f"Bucket {self.name} does not exist!")
-            if error_code == '403':
+                LOG.logger.info(f"Bucket {self.name} does not exist, creating it...")
+                try:
+                    self.client.create_bucket(Bucket=self.name)
+                    LOG.logger.info(f"Bucket {self.name} created.")
+                except ClientError as create_error:
+                    LOG.logger.error(f"Error creating bucket {self.name}:\n{create_error}")
+                    raise
+            elif error_code == '403':
                 LOG.logger.error(f"No permission to access bucket {self.name}!")
             else:
                 LOG.logger.error(f"Error accessing bucket {self.name}:\n{e}")
@@ -184,6 +190,7 @@ class VideoClass:
     """
     def __init__(self,video:dict[str,Any],status:str):
         self.status = status
+        self.members = True if CFG.GET_MEMBERS_ONLY is True else False
         try:
 
             self.id:str|None = video.get("id") # Back-end ID for video
@@ -253,7 +260,9 @@ class VideoClass:
                 "islive":self.islive,
                 "scheduled_start":self.scheduled_start,
                 "start_time":self.actual_start,
-                "end_time":self.actual_end
+                "end_time":self.actual_end,
+                "members":self.members,
+                "channel_id":CFG.YT_USER_ID
             }
         except Exception as e:
             LOG.logger.error(f"Video file {self.id} not initialized:\n{e}")
@@ -364,6 +373,8 @@ class MessageClass:
                             elif _e_img_id == "24x24":
                                 break
                     e_entry:dict = {"id":e_id,"name":e_name,"url":e_url,"custom":e_custom}
+                    if CFG.GET_MEMBERS_ONLY is False:
+                        e_entry["channel_id"] = CFG.YT_USER_ID
                     self.e_emote_entries.append(e_entry)
 
             self.entry = {
@@ -384,6 +395,8 @@ class MessageClass:
                 "symbol":self.currency_symbol,
                 "color":self.header_background_colour
             }
+            if CFG.GET_MEMBERS_ONLY is False:
+                self.entry["channel_id"] = CFG.YT_USER_ID
         except Exception as e:
             LOG.logger.error(f"Message {self.id} not initialized:\n{e}")
             raise e
@@ -568,7 +581,14 @@ class YT_API:
             with tqdm(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
 
                 request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
-                response = request.execute()
+                try:
+                    response = request.execute()
+                except HttpError as e:
+                    if e.resp.status == 404:
+                        # Channel has no Members-Only content yet, so YouTube hasn't generated this hidden playlist.
+                        LOG.logger.warning(f"Playlist {CFG.PLAYLIST} not found (404) - assuming no videos exist yet.")
+                        return []
+                    raise
                 next_page = response.get("nextPageToken")
                 video_list:list[dict[str,Any]] = response["items"]
                 dl_vidbar.update(len(video_list))
@@ -769,7 +789,8 @@ class YT_API:
 
                         # Add Unique Emotes if they don't already exist in DB
                         if len(msg.e_emote_entries) > 0:
-                            DB.InsertEntries(_db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,"id")
+                            emote_conflict = "channel_id,id" if CFG.GET_MEMBERS_ONLY is False else "id"
+                            DB.InsertEntries(_db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,emote_conflict)
 
                         #----------------------#
                         #-- MESSAGE DATABASE --#
@@ -801,10 +822,13 @@ class YT_API:
                                                     "index_start":start,
                                                     "index_end":end
                                                 }
+                                                if CFG.GET_MEMBERS_ONLY is False:
+                                                    entry["channel_id"] = CFG.YT_USER_ID
                                                 used_positions.update(range(start, end))
                                                 entries.append(entry)
 
-                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,"message_id,index_start,index_end")
+                                nickname_match_conflict = "channel_id,message_id,index_start,index_end" if CFG.GET_MEMBERS_ONLY is False else "message_id,index_start,index_end"
+                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,nickname_match_conflict)
 
                             chat_stats.new_messages += 1
                             messbar.set_postfix_str(Update_Postfix_Messages())
@@ -826,8 +850,11 @@ class YT_API:
                         raise e
 
             except Exception as r:
-                if uncommitted > 0:
-                    _db.database.commit()
+                # The failing statement aborts the whole transaction, including any earlier
+                # uncommitted inserts in this batch -- they can't be salvaged by committing,
+                # only rolled back. Must roll back (not commit) so the connection -- reused
+                # for the next video on this worker thread -- isn't left in an aborted state.
+                _db.database.rollback()
                 _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
                 raise r
 
@@ -1007,7 +1034,7 @@ def _check_and_upload_file(bucket:H3Bucket,temp_path:str,file_name:str,file_exte
             #-----------------------------------------------#
 
         elif object_exists is False:
-            os.rename(temp_path,file_path)
+            os.replace(temp_path,file_path)
             file_list.append(file_path)
             file_uploaded = bucket.upload_object(file_path,file_key)
             if isinstance(file_uploaded,ClientError):
@@ -1059,12 +1086,12 @@ def _check_and_upload_file(bucket:H3Bucket,temp_path:str,file_name:str,file_exte
             # If the new file doesn't match any existing ones:
             # Rename the last exiting file, upload it, replace it with the new one
             if new_hash not in hash_set:
-                os.rename(file_path,next_path)
+                os.replace(file_path,next_path)
                 file_list.append(next_path)
                 file_uploaded = bucket.upload_object(next_path,next_name)
                 if isinstance(file_uploaded,ClientError):
                     raise file_uploaded
-                os.rename(temp_path,file_path)
+                os.replace(temp_path,file_path)
                 file_uploaded = bucket.upload_object(file_path,file_key)
                 if isinstance(file_uploaded,ClientError):
                     raise file_uploaded
