@@ -477,6 +477,30 @@ class UserClass:
             LOG.logger.error(f"Video file {self.id} not initialized:\n{e}")
             raise e
 
+_RETRYABLE_HTTP_STATUSES = {429,500,503}
+
+def _execute_with_retry(request,max_attempts:int=5):
+    """
+    Executes a googleapiclient request, retrying with exponential backoff on transient errors
+    (429 rate limit, 500/503 backend errors) -- YouTube's API intermittently returns these under
+    normal load, not just when something's actually broken (e.g. a bare "503 The service is
+    currently unavailable" mid-pagination once killed a whole channel's run). Any other status
+    (404, 400, etc.) is raised immediately, same as calling request.execute() directly.
+
+    :param request: A googleapiclient request object (not yet executed).
+    :param max_attempts: Number of attempts before giving up and raising.
+    :type max_attempts: Integer
+    """
+    for attempt in range(max_attempts):
+        try:
+            return request.execute()
+        except HttpError as e:
+            if e.resp.status not in _RETRYABLE_HTTP_STATUSES or attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt
+            LOG.logger.warning(f"YouTube API returned {e.resp.status}, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+            time.sleep(wait)
+
 class YT_API:
     """
     Creates a usable API endpoint for making calls. Was initially going to handle ALL calls using your own provided credentials,
@@ -533,7 +557,7 @@ class YT_API:
 
         request = self.api.playlists().list(part="contentDetails",channelId=CFG.YT_CHANNEL_ID,id=CFG.PLAYLIST)
 
-        response = request.execute()
+        response = _execute_with_retry(request)
 
         video_count = response["contentDetails"]["itemCount"]
 
@@ -543,7 +567,7 @@ class YT_API:
     def Get_Video_Info(self,id:str,bucket:H3Bucket):
         request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=id)
 
-        response = request.execute()
+        response = _execute_with_retry(request)
 
         videos:list[dict] = response["items"]
 
@@ -582,7 +606,7 @@ class YT_API:
 
                 request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
                 try:
-                    response = request.execute()
+                    response = _execute_with_retry(request)
                 except HttpError as e:
                     if e.resp.status == 404:
                         # Channel has no Members-Only content yet, so YouTube hasn't generated this hidden playlist.
@@ -598,7 +622,7 @@ class YT_API:
                         break
                     else:
                         next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50,pageToken=next_page)
-                        next_response = next_request.execute()
+                        next_response = _execute_with_retry(next_request)
                         next_page = next_response.get("nextPageToken")
                         response_items:list[dict] = next_response["items"]
                         dl_vidbar.update(len(response_items))
@@ -625,7 +649,7 @@ class YT_API:
         if not ids:
             return result
         request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=",".join(ids))
-        response = request.execute()
+        response = _execute_with_retry(request)
         for video in response.get("items",[]):
             vid_id = video["id"]
             del video["kind"]
@@ -750,6 +774,29 @@ class YT_API:
         def Update_Postfix_Messages():
             return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {len(chat_stats.new_user_ids):,} | Existing Users: {len(chat_stats.exist_user_ids - chat_stats.new_user_ids):,}"
 
+        # record_message_stats() calls are buffered here instead of being executed immediately,
+        # and flushed (sorted by user_id) right before every commit -- see _flush_pending_stats().
+        pending_stats:list[tuple] = []
+
+        def _flush_pending_stats():
+            # Sorting before executing means every commit's worth of record_message_stats calls
+            # locks user_first_message/user_first_channel_message rows in the same ascending
+            # user_id order, no matter which video or worker thread is running them. Two
+            # transactions can then never hold those row locks in opposite relative order, which
+            # is what a deadlock cycle requires -- see the "deadlock detected ...
+            # user_first_message" incidents this replaced (processing messages in chronological
+            # arrival order let two videos that share chatters lock overlapping users in
+            # whatever order each happened to encounter them, which could cross).
+            #
+            # Sent as one batched call, not one call per row -- see RecordMessageStatsBatch's
+            # docstring. A worker blocked on a contended user was waiting through up to 500
+            # sequential round trips to a remote DB host before the lock-holder's batch
+            # committed (multiple seconds of real stall, observed directly); one call removes
+            # nearly all of that round-trip latency from the wait.
+            pending_stats.sort(key=lambda s: s[2])
+            DB.RecordMessageStatsBatch(_db.cursor, pending_stats)
+            pending_stats.clear()
+
         with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
             try:
                 unique_user_ids = set()
@@ -773,6 +820,12 @@ class YT_API:
                             _is_new_user = msg.usr_id not in known_user_ids
                             if _is_new_user:
                                 DB.InsertEntries(_db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
+                                # Flush first -- otherwise this commit durably records every message
+                                # inserted so far in this batch while their still-buffered
+                                # record_message_stats() calls stay unexecuted, and a crash before the
+                                # next flush would lose that message's stats contribution for good
+                                # (known_message_ids skips re-inserting it, and the stats call, on retry).
+                                _flush_pending_stats()
                                 _db.database.commit()  # flush immediately — FK must be satisfied for all connections
                                 uncommitted = 0
                                 known_user_ids.add(msg.usr_id)
@@ -800,6 +853,18 @@ class YT_API:
                         if msg.id not in known_message_ids:
                             DB.InsertEntries(cursor=_db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
                             known_message_ids.add(msg.id)
+
+                            # Keep video_message_stats and user_first_channel_message up to date incrementally
+                            # rather than recomputing them later over the whole (200M+ row) messages table.
+                            # Buffered, not called immediately -- see _flush_pending_stats().
+                            pending_stats.append((
+                                CFG.YT_USER_ID,
+                                msg.video_id,
+                                msg.usr_id,
+                                msg.entry["timestamp"],
+                                msg.entry["user_member_status"] is not None and msg.entry["user_member_status"] > -1,
+                                msg.entry["user_member_status"]
+                            ))
 
                             entries = []
                             used_positions = set()
@@ -842,6 +907,7 @@ class YT_API:
 
                         uncommitted += 1
                         if uncommitted >= 500:
+                            _flush_pending_stats()
                             _db.database.commit()
                             uncommitted = 0
 
@@ -854,11 +920,15 @@ class YT_API:
                 # uncommitted inserts in this batch -- they can't be salvaged by committing,
                 # only rolled back. Must roll back (not commit) so the connection -- reused
                 # for the next video on this worker thread -- isn't left in an aborted state.
+                # pending_stats is discarded, not flushed -- those calls were never sent to the
+                # DB, and the batch they belong to is being rolled back anyway.
+                pending_stats.clear()
                 _db.database.rollback()
                 _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
                 raise r
 
             if uncommitted > 0:
+                _flush_pending_stats()
                 _db.database.commit()
             _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
 
@@ -882,17 +952,7 @@ class YT_API:
 
         # One API call per batch of 50 — rate unchanged vs. the original sequential loop.
         request = self.api.channels().list(part="id,snippet,statistics,status,brandingSettings",id=users)
-        _RETRYABLE = {429, 500, 503}
-        for _attempt in range(5):
-            try:
-                response = request.execute()
-                break
-            except HttpError as e:
-                if e.resp.status not in _RETRYABLE or _attempt == 4:
-                    raise
-                wait = 2 ** _attempt
-                LOG.logger.warning(f"YouTube API returned {e.resp.status}, retrying in {wait}s (attempt {_attempt+1}/5)")
-                time.sleep(wait)
+        response = _execute_with_retry(request)
         user_list:list[dict] = response.get("items",[])
 
         # IDs returned by the API (present but perhaps file-processing failed)

@@ -9,7 +9,7 @@ from psycopg2.extensions import cursor
 ##############################
 
 PROCESS_ALL = False
-CHANNEL_SELECTION = "HoloEN"
+CHANNEL_SELECTION = "Kiara"
 USE_COOKIES = False
 
 # Seconds to wait between starting each chat download. The rate limiter enforces this
@@ -24,6 +24,14 @@ WORKER_COUNT = 2
 # file I/O (PFP downloads, S3 uploads) — the YouTube API call stays one-per-batch and
 # sequential, so raising this value does NOT increase API call rate.
 USER_WORKER_COUNT = 10
+
+# Hours to keep retrying a just-ended livestream after chat_downloader reports NoChatReplay
+# before giving up and marking it processed. YouTube's API flips a stream to "not live"
+# before its chat replay actually finishes generating on their end, so a NoChatReplay seen
+# too soon after the stream ended doesn't mean the replay will never exist -- it means it
+# isn't ready yet. Videos that were never a livestream aren't affected by this grace period
+# (a NoChatReplay for those is always permanent).
+CHAT_REPLAY_GRACE_HOURS = 24
 
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
@@ -57,9 +65,9 @@ if QUICK_SETTINGS is True:
     # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
     SKIP_CHAT_DOWNLOAD = False
     # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
-    TIMEOUT = True
+    TIMEOUT = False
     # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
-    SKIP_LIVESTREAMS = True
+    SKIP_LIVESTREAMS = False
 else:
     # Create a log file (In script location)
     LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?")

@@ -1,6 +1,7 @@
 # Native Stuff
 import os,sys,shutil,time,threading
 from concurrent.futures import Future,ThreadPoolExecutor,as_completed
+from datetime import datetime,timedelta,timezone
 
 sys.path.append(os.getcwd())
 
@@ -196,7 +197,7 @@ def process_channel(channel_name:str):
                 DB.InsertEntries(cursor=thread_db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
             else:
                 update_data = {k: v for k, v in vid.entry.items() if k != "id"}
-                DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],update_data,"id",vid.id)
+                DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],update_data,"id",video_id)
             thread_db.database.commit()
         except Exception:
             # Roll back so a failed insert doesn't leave this worker's connection aborted for
@@ -219,7 +220,11 @@ def process_channel(channel_name:str):
             else:
                 def _mark_processed():
                     try:
-                        DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",vid.id)
+                        DB.UpdateEntry(thread_db.cursor,CFG.DB_TABLES["videos"],"processed",True,"id",video_id)
+                        # duration (and therefore messages_per_min) is only known once the video
+                        # has actually finished, which is exactly the condition under which
+                        # _mark_processed() gets called.
+                        DB.FinalizeVideoMessageRate(thread_db.cursor,video_id)
                         thread_db.database.commit()
                     except Exception:
                         thread_db.database.rollback()
@@ -234,7 +239,13 @@ def process_channel(channel_name:str):
                     if vid.livestream == True:
                         local_vid_stats.still_live = 1
                 except chat_downloader.errors.NoChatReplay:
-                    if vid.livestream == False:
+                    # YouTube's API reports a stream as no-longer-live before its chat replay has
+                    # actually finished generating -- a NoChatReplay seen too soon after the
+                    # stream ended likely means "not ready yet", not "never will exist". Give it
+                    # a grace period before treating it as permanent (see CHAT_REPLAY_GRACE_HOURS).
+                    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                    recently_ended = vid.actual_end is not None and (now_utc - vid.actual_end) < timedelta(hours=CFG.CHAT_REPLAY_GRACE_HOURS)
+                    if vid.livestream == False and not recently_ended:
                         _mark_processed()
                     local_vid_stats.no_chat_videos = 1
                     LOG.logger.warning(f"{video_id}: No Chat Replay available.")
@@ -364,3 +375,13 @@ for channel_name in CFG.CHANNELS_TO_PROCESS:
         DB.EnsureMessagesPartition(db.cursor,CFG.DB_TABLES["messages"],CFG.YT_USER_ID)
         db.database.commit()
     process_channel(channel_name)
+
+# Recompute first_messages/first_channel_messages once per run -- see RefreshFirstMessageCounts
+# docstring for why these can't be maintained incrementally anymore.
+DB.RefreshFirstMessageCounts(db.cursor)
+db.database.commit()
+
+# Refresh message-count leaderboard ranks once per run (not per channel/video/message -- see
+# RefreshUserMessageRankings docstring for why ranks can't be maintained incrementally).
+DB.RefreshUserMessageRankings(db.cursor)
+db.database.commit()
