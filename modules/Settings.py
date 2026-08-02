@@ -8,7 +8,7 @@ from psycopg2.extensions import cursor
 ### USER EDITABLE SETTINGS ###
 ##############################
 
-PROCESS_ALL = False
+PROCESS_ALL = True
 CHANNEL_SELECTION = "Kiara"
 USE_COOKIES = False
 
@@ -65,9 +65,9 @@ if QUICK_SETTINGS is True:
     # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
     SKIP_CHAT_DOWNLOAD = False
     # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
-    TIMEOUT = False
+    TIMEOUT = True
     # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
-    SKIP_LIVESTREAMS = False
+    SKIP_LIVESTREAMS = True
 else:
     # Create a log file (In script location)
     LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?")
