@@ -60,6 +60,8 @@ https://github.com/xenova/chat-downloader
 
 # Initialize database connection and setup the API calls (shared across all channels)
 db = DB.PostgresClass()
+DB.EnsureSchema(db.cursor,CFG.GET_MEMBERS_ONLY)
+db.database.commit()
 CFG.load_channel_directory(db.cursor)
 s3 = C.H3Client()
 user_bucket = C.H3Bucket(s3.client,CFG.USER_DATA_NAME,CFG.LOCAL_USER_PATH)
@@ -101,6 +103,24 @@ class _RateLimiter:
             self._last = time.monotonic()
 
 rate_limiter = _RateLimiter(CFG.REQUEST_DELAY)
+subtitle_rate_limiter = C.AdaptiveRateLimiter(CFG.SUBTITLE_REQUEST_DELAY,CFG.SUBTITLE_REQUEST_DELAY_CEILING)
+
+class _SubtitleCircuitBreaker:
+    """Trips after N consecutive throttle-exhausted videos (within one channel's run), so a
+    blocked IP doesn't get hammered by every remaining video once yt-dlp starts failing."""
+    def __init__(self,threshold:int):
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._threshold = threshold
+    def record_throttle(self):
+        with self._lock:
+            self._consecutive += 1
+    def record_success(self):
+        with self._lock:
+            self._consecutive = 0
+    @property
+    def tripped(self) -> bool:
+        return self._consecutive >= self._threshold
 
 # Users have to be done in batches of 50 manually because the API call does not give a "next page" item like the videos....
 def Batch_Users(users):
@@ -121,6 +141,7 @@ def process_channel(channel_name:str):
             os.makedirs(d_path)
 
     channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,CFG.LOCAL_DATA_PATH)
+    subtitle_breaker = _SubtitleCircuitBreaker(CFG.SUBTITLE_CIRCUIT_BREAKER_THRESHOLD)
 
     #################################
     ### VIDEO AND CHAT PROCESSING ###
@@ -260,6 +281,30 @@ def process_channel(channel_name:str):
                     local_vid_stats.error_videos = 1
                     LOG.logger.error(f"{video_id}: Unknown error: {u}")
                     rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
+
+        #-------------------------#
+        #-- GET VIDEO SUBTITLES --#
+        #-------------------------#
+        # Independent of the chat try/except above -- a NoChatReplay or chat error shouldn't
+        # block subtitle capture and vice versa. Only attempted once the video is confirmed not
+        # currently live, same as _mark_processed() above -- auto-captions aren't finalized for
+        # an in-progress livestream.
+
+        if not CFG.SKIP_SUBTITLE_DOWNLOAD and vid.livestream != True:
+            if subtitle_breaker.tripped:
+                LOG.logger.warning(f"{video_id}: Skipping subtitles, circuit breaker tripped for this run.")
+            else:
+                try:
+                    yt.Get_Subtitles(vid,channel_bucket,db=thread_db,rate_limiter=subtitle_rate_limiter)
+                    subtitle_breaker.record_success()
+                    thread_db.database.commit()
+                except C.SubtitleThrottled:
+                    subtitle_breaker.record_throttle()
+                    thread_db.database.rollback()
+                    LOG.logger.warning(f"{video_id}: Subtitle download throttled, giving up on this video.")
+                except Exception as e:
+                    thread_db.database.rollback()
+                    LOG.logger.error(f"{video_id}: Subtitle download error: {e}")
 
         return local_vid_stats,local_chat_stats
 

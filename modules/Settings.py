@@ -16,6 +16,41 @@ USE_COOKIES = False
 # gap even across concurrent workers so YouTube isn't hit simultaneously. 0 to disable.
 REQUEST_DELAY = 2.0
 
+# Just process video/chat data and skip fetching auto-generated subtitles.
+SKIP_SUBTITLE_DOWNLOAD = False
+
+# Language codes to request auto-generated subtitles for (yt-dlp subtitleslangs).
+SUBTITLE_LANGUAGES = ["en"]
+
+# Starting point (floor) for the adaptive delay between subtitle download attempts --
+# separate budget from REQUEST_DELAY above, since yt-dlp and chat_downloader are different
+# clients hitting YouTube at different points in the pipeline. This is only a starting
+# point, not fixed: AdaptiveRateLimiter (modules/Classes.py) grows it automatically whenever
+# a throttle is observed, and slowly relaxes it back down after a long clean streak -- a
+# flat few-second gap was still drawing HTTP 429s on a large fraction of videos during a
+# real backfill run, so guessing one fixed number up front isn't reliable.
+SUBTITLE_REQUEST_DELAY = 8.0
+
+# Upper bound the adaptive delay above is allowed to grow to, no matter how much throttling
+# is observed -- a sanity cap so a very strict period slows the run down rather than
+# growing the gap indefinitely. Raised from 90s after a real backfill run showed throttling
+# still occurring even once the delay had climbed all the way to that ceiling -- anonymous
+# (no-cookies) requests appear to need more room than that to fully clear.
+SUBTITLE_REQUEST_DELAY_CEILING = 180.0
+
+# Number of attempts for a subtitle download before giving up -- only retried when the
+# failure looks like YouTube throttling (see _is_throttled in Classes.py), not for
+# videos that simply have no auto-captions.
+SUBTITLE_MAX_ATTEMPTS = 3
+
+# Base for the exponential backoff between throttled subtitle download retries
+# (wait = SUBTITLE_BACKOFF_BASE ** attempt).
+SUBTITLE_BACKOFF_BASE = 5
+
+# Consecutive throttle-exhausted videos (within one channel's run) before giving up on
+# subtitles for the rest of that run, so a blocked IP doesn't get hammered further.
+SUBTITLE_CIRCUIT_BREAKER_THRESHOLD = 3
+
 # Number of videos to process in parallel. 2 is the safe default — going above 3
 # risks hitting YouTube's rate limits and getting temporarily blocked.
 WORKER_COUNT = 2
@@ -52,6 +87,7 @@ MEMBERS_ONLY_FLAG = "_members"
 DETAIL_TAG = "details"
 THUMBNAIL_TAG= "thumbnails"
 MESSAGES_TAG = "messages"
+SUBTITLE_TAG = "subtitles"
 PFP_TAG = "pfp"
 
 if QUICK_SETTINGS is True:
@@ -156,6 +192,7 @@ def select_channel(channel_name:str) -> None:
         f"{LOCAL_DATA_PATH}/{DETAIL_TAG}",
         f"{LOCAL_DATA_PATH}/{THUMBNAIL_TAG}",
         f"{LOCAL_DATA_PATH}/{MESSAGES_TAG}",
+        f"{LOCAL_DATA_PATH}/{SUBTITLE_TAG}",
         f"{LOCAL_USER_PATH}/{DETAIL_TAG}",
         f"{LOCAL_USER_PATH}/{PFP_TAG}"
     ]
@@ -175,7 +212,9 @@ def select_channel(channel_name:str) -> None:
             "nickname_matches":"nickname_matches",
             "nicknames":"nicknames",
             "videos":"videos",
-            "user_ids":"user_ids"
+            "tags":"tags",
+            "user_ids":"user_ids",
+            "subtitles":"subtitles"
         }
     else:
         DB_TABLES = {
@@ -184,7 +223,9 @@ def select_channel(channel_name:str) -> None:
             "nickname_matches":f"nickname_matches_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}",
             "nicknames":"nicknames",
             "videos":"videos",
-            "user_ids":"user_ids"
+            "tags":"tags",
+            "user_ids":"user_ids",
+            "subtitles":f"subtitles_{CHANNEL_SUFFIX}{MEMBERS_ONLY_FLAG}"
         }
 
     # Auto-filled out data for Youtube data

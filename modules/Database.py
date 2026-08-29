@@ -1,5 +1,5 @@
 # Native Stuff
-import random,time
+import os,random,time
 from typing import Any,LiteralString
 
 # Installed Stuff
@@ -345,6 +345,67 @@ def EnsureMessagesPartition(cursor:psycopg2.extensions.cursor,table:str,channel_
     except Exception as e:
         LOG.logger.error(f'Failed to create missing partition table {table} for channel_id {channel_id}: {e}')
         raise e
+
+# sql/<name>.sql -> the table (or matview) whose presence means that file has already been
+# applied. Order matters -- see sql/README.md for the FK reasons (e.g. messages before
+# nicknames, messages_members before nicknames_members). Kept in sync by hand with
+# sql/README.md and .claude/skills/chat-database/update_schema.py's FILE_GROUPS -- these are
+# small, stable clusters that don't change often.
+_CORE_SQL_FILES = [
+    ("channel_directory","channel_directory"),
+    ("user_ids","user_ids"),
+    ("videos","videos"),
+    ("tags","tags"),
+    ("emotes","emotes"),
+    ("messages","messages"),
+    ("nicknames","nicknames"),
+    ("subtitles","subtitles"),
+    ("user_first_channel_message_stats","user_first_channel_message"),
+    ("video_message_stats","video_message_stats"),
+    ("user_global_message_rankings","user_message_rankings"),
+]
+_MEMBERS_SQL_FILES = [
+    ("emotes_members","emotes_calli_members"),
+    ("messages_members","messages_calli_members"),
+    ("nicknames_members","nickname_matches_kiara_members"),
+    ("subtitles_members","subtitles_ame_members"),
+]
+
+_SQL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"sql")
+
+def EnsureSchema(cursor:psycopg2.extensions.cursor,members_only:bool) -> None:
+    """
+    Verifies the database structure this bot needs exists, and builds whatever's missing from
+    the DDL scripts in sql/ -- lets a fresh, empty database bootstrap itself on first run
+    instead of requiring the scripts to be applied by hand first. Safe to call on every
+    startup: each file is only applied if its anchor table/matview (see _CORE_SQL_FILES/
+    _MEMBERS_SQL_FILES) doesn't already exist, so an already-provisioned database is a no-op.
+
+    The `*_members` files are only applied when members_only is True, so a public-only
+    deployment never gets members-only tables it doesn't need. Caller is responsible for
+    committing.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param members_only: Whether to also ensure the members-only tables exist (CFG.GET_MEMBERS_ONLY).
+    :type members_only: Boolean
+    """
+    files = list(_CORE_SQL_FILES)
+    if members_only:
+        files += _MEMBERS_SQL_FILES
+
+    for file_name,anchor_table in files:
+        if TableExists(cursor,anchor_table):
+            continue
+        path = os.path.join(_SQL_DIR,f"{file_name}.sql")
+        with open(path,"r",encoding="utf-8") as f:
+            ddl = f.read()
+        try:
+            cursor.execute(ddl)
+            LOG.logger.info(f'Database structure missing -- created it from sql/{file_name}.sql.')
+        except Exception as e:
+            LOG.logger.error(f'Failed to build database structure from sql/{file_name}.sql: {e}')
+            raise e
 
 def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:str,group:str) -> None:
     """

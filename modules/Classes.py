@@ -7,6 +7,17 @@ from datetime import datetime
 # Installed Stuff
 from tqdm import tqdm
 from chat_downloader import ChatDownloader
+import yt_dlp
+from yt_dlp.utils import DownloadError
+from yt_dlp.networking.impersonate import ImpersonateTarget
+
+# Resolved once and reused for every subtitle request in this process, rather than calling
+# ImpersonateTarget() fresh per attempt -- a real browser's TLS/HTTP fingerprint stays
+# constant across a session, so presenting a different one on every single request (which an
+# empty ImpersonateTarget() risks, depending on yt-dlp/curl_cffi's resolution) looks exactly
+# like automated traffic to YouTube's abuse detection, independent of how well-paced the
+# requests are.
+_SUBTITLE_IMPERSONATE_TARGET = ImpersonateTarget()
 
 # Google Stuff
 import google.auth
@@ -57,6 +68,14 @@ class ChatStats:
         all_chat_stats.existing_messages += self.existing_messages
         all_chat_stats.new_user_ids = all_chat_stats.new_user_ids.union(self.new_user_ids)
         all_chat_stats.exist_user_ids = all_chat_stats.exist_user_ids.union(self.exist_user_ids)
+
+class SubtitleStats:
+    """Statistics about subtitle downloads for a channel run."""
+    def __init__(self) -> None:
+        self.fetched:int = 0
+        self.no_captions:int = 0
+        self.throttled:int = 0
+        self.errors:int = 0
 
 class H3Client():
     def __init__(self) -> None:
@@ -207,6 +226,13 @@ class VideoClass:
                     self.publish_date = None
 
                 self.title = self._snippet.get("title") # Video Title
+
+                # Present only if YouTube's API returned it -- absent (not empty-list) means
+                # either this video genuinely has no tags, or this VideoClass was built from an
+                # older cached details JSON that predates tags being captured at all. Callers
+                # that need to tell those two cases apart (see backfill_tags.py) must check the
+                # raw snippet dict themselves; this attribute alone can't distinguish them.
+                self.tags:list[str]|None = self._snippet.get("tags")
 
                 self._liveBroadcastContent:str|None = self._snippet.get("liveBroadcastContent")
                 if self._liveBroadcastContent is not None:
@@ -500,6 +526,168 @@ def _execute_with_retry(request,max_attempts:int=5):
             wait = 2 ** attempt
             LOG.logger.warning(f"YouTube API returned {e.resp.status}, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
             time.sleep(wait)
+
+class SubtitleThrottled(Exception):
+    """Raised when yt-dlp subtitle downloads keep failing in a way that looks like YouTube
+    throttling/blocking this IP, after exhausting CFG.SUBTITLE_MAX_ATTEMPTS retries."""
+    pass
+
+_THROTTLE_SIGNATURES = ("429","too many requests","sign in to confirm you're not a bot")
+
+def _is_throttled(exc:Exception) -> bool:
+    """Best-effort classification of a yt-dlp DownloadError as YouTube throttling/bot-detection
+    rather than an unrelated failure (no captions, video unavailable, etc.) -- yt-dlp doesn't
+    expose a distinct exception type for this, so this matches on known message signatures.
+    Deliberately the full "sign in to confirm you're not a bot" phrase, not just "sign in to
+    confirm" -- that shorter form also matches yt-dlp's age-restriction error ("Sign in to
+    confirm your age"), which is a permanent, never-retryable failure for this video (see
+    _is_age_restricted), not a transient throttle worth backing off and retrying."""
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _THROTTLE_SIGNATURES)
+
+_AGE_RESTRICTED_SIGNATURES = ("confirm your age","age-restricted","age restricted")
+
+def _is_age_restricted(exc:Exception) -> bool:
+    """Detects yt-dlp's age-restriction error (no authenticated cookies available to bypass
+    it). Permanent for this video -- never worth retrying or waiting on, unlike a throttle."""
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _AGE_RESTRICTED_SIGNATURES)
+
+class _YtdlpSilentLogger:
+    """Swallows all of yt-dlp's own log output. Get_Subtitles already logs the outcomes it
+    cares about (throttled/age-restricted/no captions/etc.) through modules.logconfig, which
+    coordinates properly with an in-progress tqdm bar -- yt-dlp's own error/warning messages
+    print straight to stdout/stderr regardless of the quiet/no_warnings options (those only
+    suppress its info-level noise), colliding mid-line with the bar's carriage-return updates
+    and mangling the console. The exception raised on failure still carries the full message
+    text for _is_throttled/_is_age_restricted to classify -- only the raw printing is muted."""
+    def debug(self,msg): pass
+    def info(self,msg): pass
+    def warning(self,msg): pass
+    def error(self,msg): pass
+
+class AdaptiveRateLimiter:
+    """
+    Enforces a minimum gap between subtitle download attempts that grows automatically
+    whenever YouTube throttles a request, instead of relying on a fixed guessed delay -- a
+    flat few-second gap was still drawing HTTP 429s on a large fraction of videos during a
+    real backfill run, even with per-video retry/backoff, and most of those never recovered
+    within CFG.SUBTITLE_MAX_ATTEMPTS. Thread-safe and meant to be a single instance shared
+    across every video/worker thread for the whole run (see Main.py/backfill_subtitles.py),
+    passed into Get_Subtitles's rate_limiter parameter, so it learns whatever pace YouTube is
+    actually enforcing right now rather than guessing a constant up front.
+
+    Starts at `floor` seconds. Every reported throttle multiplies the current delay by 1.5x
+    (capped at `ceiling`). After enough consecutive clean fetches, the delay decays back down
+    slightly toward the floor, so a temporarily-strict period doesn't permanently slow down
+    the rest of a multi-hour run.
+    """
+    def __init__(self,floor:float,ceiling:float):
+        self._lock = threading.Lock()
+        self._floor = floor
+        self._ceiling = ceiling
+        self._delay = floor
+        self._last = 0.0
+        self._consecutive_clean = 0
+
+    @property
+    def current(self) -> float:
+        with self._lock:
+            return self._delay
+
+    def wait(self):
+        with self._lock:
+            delay = self._delay
+            elapsed = time.monotonic() - self._last
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+            self._last = time.monotonic()
+
+    def report_throttled(self):
+        with self._lock:
+            self._consecutive_clean = 0
+            new_delay = min(self._delay * 1.5,self._ceiling)
+            if new_delay > self._delay:
+                LOG.logger.info(f"Subtitle request delay increased to {new_delay:.1f}s after a throttle.")
+            self._delay = new_delay
+
+    def report_success(self):
+        with self._lock:
+            self._consecutive_clean += 1
+            if self._consecutive_clean >= 50 and self._delay > self._floor:
+                self._delay = max(self._delay * 0.95,self._floor)
+                self._consecutive_clean = 0
+
+_VTT_TIMESTAMP = re.compile(r'(\d{2,}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2})\.(\d{3})')
+_VTT_TAG = re.compile(r'<[^>]+>')
+
+def _vtt_timestamp_to_ms(hours:str,minutes:str,seconds:str,millis:str) -> int:
+    return ((int(hours) * 3600 + int(minutes) * 60 + int(seconds)) * 1000) + int(millis)
+
+def _parse_vtt_cues(vtt_path:str) -> list[dict[str,Any]]:
+    """
+    Parses a WebVTT file into a list of {seq, start_ms, end_ms, text} cues, in file order.
+    Skips the WEBVTT header and any NOTE/STYLE blocks -- only cue timing lines and the text
+    that follows them (until the next blank line) are collected.
+
+    YouTube's auto-generated VTT is heavily duplicated by construction, in two different ways:
+
+    1. It renders as a "rolling" 2-line caption window: each cue typically repeats most of
+       the previous cue's text plus a little new content (e.g. "[Music]" then "[Music]\ndo"
+       then "do" then "do\n[Music]" ...).
+    2. Each spoken phrase appears twice: once as a "growing" cue with inline per-word
+       karaoke-style timing tags (`<00:12:47.680><c> word</c>...`), then again immediately
+       after as a plain "settled" cue containing the exact same words with the tags stripped.
+
+    Both are collapsed here: tags are stripped from each cue's text first (so the tagged
+    "growing" and plain "settled" versions of the same phrase become identical strings), then
+    each cue is deduped against the immediately preceding one -- any line it repeats verbatim
+    from the previous cue is dropped, and a cue contributing nothing new is skipped entirely.
+    What's left is the genuinely new text at each cue's own timestamp. Repeats of the same
+    word/phrase further apart (i.e. not in adjacent cues) are left alone -- those are real
+    recurrences in the video, not parsing artifacts.
+
+    :param vtt_path: Path to a .vtt file written by yt-dlp.
+    :type vtt_path: String
+    :return: Deduped cues in file order.
+    :rtype: list[dict]
+    """
+    raw_cues:list[tuple[int,int,str]] = []
+    with open(vtt_path,'r',encoding='utf-8') as file:
+        lines = file.read().splitlines()
+
+    i = 0
+    while i < len(lines):
+        match = _VTT_TIMESTAMP.search(lines[i])
+        if match:
+            start_ms = _vtt_timestamp_to_ms(*match.groups()[0:4])
+            end_ms = _vtt_timestamp_to_ms(*match.groups()[4:8])
+            i += 1
+            text_lines:list[str] = []
+            while i < len(lines) and lines[i].strip() != "":
+                text_lines.append(lines[i])
+                i += 1
+            text = "\n".join(text_lines).strip()
+            if text:
+                raw_cues.append((start_ms,end_ms,text))
+        else:
+            i += 1
+
+    cues:list[dict[str,Any]] = []
+    prev_lines:list[str] = []
+    seq = 0
+    for start_ms,end_ms,raw_text in raw_cues:
+        text = _VTT_TAG.sub("",raw_text).strip()
+        if not text:
+            continue
+        cue_lines = text.split("\n")
+        new_lines = [line for line in cue_lines if line not in prev_lines]
+        prev_lines = cue_lines
+        if not new_lines:
+            continue
+        cues.append({"seq":seq,"start_ms":start_ms,"end_ms":end_ms,"text":" ".join(new_lines)})
+        seq += 1
+    return cues
 
 class YT_API:
     """
@@ -933,6 +1121,129 @@ class YT_API:
             _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
 
         return chat_stats
+
+    def Get_Subtitles(self,video:'VideoClass',bucket:H3Bucket,db=None,rate_limiter:'AdaptiveRateLimiter|None'=None) -> SubtitleStats:
+        """
+        Downloads YouTube's auto-generated (ASR) subtitles for a video via yt-dlp, parses them
+        into cues, uploads the parsed cue list to S3 as subtitles/{id}.json (same
+        whole-file-replace/versioning behavior as details/{id}.json via _check_and_upload_file),
+        and writes one row per cue into CFG.DB_TABLES["subtitles"].
+
+        Retries on failures that look like YouTube throttling (see _is_throttled), with
+        exponential backoff (CFG.SUBTITLE_BACKOFF_BASE ** attempt). Any other failure (no
+        captions available, video unavailable, etc.) is not retried -- it just means this
+        video/language has no subtitles to store.
+
+        :param video: The video to fetch subtitles for.
+        :type video: VideoClass
+        :param bucket: The channel's S3 bucket.
+        :type bucket: H3Bucket
+        :param db: Database connection to use for the insert. Falls back to self.db.
+        :param rate_limiter: Shared AdaptiveRateLimiter to pace requests against and report
+            throttles/successes to. If omitted, no inter-request pacing happens here -- the
+            caller is responsible for spacing calls out itself.
+        :return: Stats about what happened for this video.
+        :rtype: SubtitleStats
+        """
+        stats = SubtitleStats()
+        _db = db if db is not None else self.db
+
+        subtitle_object = f"{CFG.SUBTITLE_TAG}/{video.id}.json"
+        object_exists = bucket.check_object_exists(subtitle_object)
+        if isinstance(object_exists,ClientError):
+            raise object_exists
+        if object_exists is True:
+            return stats
+
+        url = f"https://www.youtube.com/watch?v={video.id}"
+        all_cues:list[dict[str,Any]] = []
+
+        for lang in CFG.SUBTITLE_LANGUAGES:
+            temp_dir = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}"
+            current_delay = rate_limiter.current if rate_limiter is not None else CFG.SUBTITLE_REQUEST_DELAY
+            ydl_opts:dict[str,Any] = {
+                "writeautomaticsub": True,
+                "subtitleslangs": [lang],
+                "subtitlesformat": "vtt",
+                "skip_download": True,
+                "quiet": True,
+                "no_warnings": True,
+                "noprogress": True,
+                "logger": _YtdlpSilentLogger(),
+                "outtmpl": f"{temp_dir}/%(id)s_TEMP.%(ext)s",
+                "sleep_interval_subtitles": current_delay,
+                "sleep_interval_requests": current_delay,
+                "extractor_retries": CFG.SUBTITLE_MAX_ATTEMPTS,
+                "cookiefile": CFG.COOKIES,
+                "impersonate": _SUBTITLE_IMPERSONATE_TARGET,
+            }
+
+            vtt_path = f"{temp_dir}/{video.id}_TEMP.{lang}.vtt"
+
+            for attempt in range(1,CFG.SUBTITLE_MAX_ATTEMPTS + 1):
+                if rate_limiter is not None:
+                    rate_limiter.wait()
+                try:
+                    ydl = yt_dlp.YoutubeDL(ydl_opts) #type:ignore
+                    ydl.extract_info(url,download=True)
+                    if rate_limiter is not None and attempt == 1:
+                        rate_limiter.report_success()
+                    break
+                except DownloadError as e:
+                    if _is_age_restricted(e):
+                        # Permanent for this video -- skip immediately rather than burning
+                        # through the throttle retry/backoff loop for something that will
+                        # never succeed no matter how many times it's attempted.
+                        LOG.logger.info(f"{video.id}: Age-restricted, skipping.")
+                        stats.no_captions += 1
+                        vtt_path = None
+                        break
+                    elif _is_throttled(e):
+                        if rate_limiter is not None:
+                            rate_limiter.report_throttled()
+                        if attempt == CFG.SUBTITLE_MAX_ATTEMPTS:
+                            stats.throttled += 1
+                            raise SubtitleThrottled(f"{video.id}: Subtitle download throttled after {attempt} attempt(s): {e}")
+                        wait = CFG.SUBTITLE_BACKOFF_BASE ** attempt
+                        LOG.logger.warning(f"{video.id}: Subtitle download throttled, retrying in {wait}s (attempt {attempt}/{CFG.SUBTITLE_MAX_ATTEMPTS})")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        # Not a throttle signature -- treat as "no captions available" for this
+                        # video/language rather than retrying.
+                        stats.no_captions += 1
+                        vtt_path = None
+                        break
+
+            if vtt_path is None or not os.path.isfile(vtt_path):
+                stats.no_captions += 1
+                continue
+
+            cues = _parse_vtt_cues(vtt_path)
+            os.remove(vtt_path)
+
+            for cue in cues:
+                cue["video_id"] = video.id
+                cue["language"] = lang
+                if CFG.GET_MEMBERS_ONLY is False:
+                    cue["channel_id"] = CFG.YT_USER_ID
+            all_cues.extend(cues)
+
+            DB.DeleteEntries(_db.cursor,CFG.DB_TABLES["subtitles"],{"video_id":video.id,"language":lang})
+            if cues:
+                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["subtitles"],cues)
+
+        if not all_cues:
+            return stats
+
+        temp_path = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}/{video.id}_TEMP.json"
+        with open(temp_path,'w') as file:
+            file.write(json.dumps(all_cues,indent=4))
+
+        _check_and_upload_file(bucket,temp_path,video.id,"json",CFG.SUBTITLE_TAG)
+
+        stats.fetched += 1
+        return stats
 
     def Get_User_Batch(self,users:list[str],bucket:H3Bucket):
         """Gets data about all users in the list of users. Will keep track of invalid users.
