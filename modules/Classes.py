@@ -1,6 +1,7 @@
 # Native Stuff
 import os,json,pickle,requests,re,xxhash,threading,queue,time
 from concurrent.futures import ThreadPoolExecutor,as_completed
+from contextlib import contextmanager
 from typing import Any
 from datetime import datetime
 
@@ -40,6 +41,19 @@ from botocore.exceptions import ClientError
 import modules.logconfig as LOG
 import modules.Settings as CFG
 import modules.Database as DB
+
+@contextmanager
+def Stage_Bar(desc:str,position:int):
+    """
+    Per-worker status line for a video-processing sub-step that has no natural count to track
+    (thumbnail fetch, DB writes, connecting to chat, subtitle rate-limit waits) -- these used to
+    run silently between the 'Videos Processed' and 'Messages Processed' bars, making a worker
+    look stalled. Reuses that worker's existing bar slot (`position`) with leave=False, so the
+    line is overwritten by whatever comes next and never accumulates as a completed bar once the
+    stage finishes.
+    """
+    with tqdm(desc=desc,bar_format='{desc}',ncols=80,position=position,leave=False) as bar:
+        yield bar
 
 class VideoStats:
     """Statistics about all the videos."""
@@ -532,7 +546,7 @@ class SubtitleThrottled(Exception):
     throttling/blocking this IP, after exhausting CFG.SUBTITLE_MAX_ATTEMPTS retries."""
     pass
 
-_THROTTLE_SIGNATURES = ("429","too many requests","sign in to confirm you're not a bot")
+_THROTTLE_SIGNATURES = (r"\b429\b","too many requests","sign in to confirm you're not a bot")
 
 def _is_throttled(exc:Exception) -> bool:
     """Best-effort classification of a yt-dlp DownloadError as YouTube throttling/bot-detection
@@ -541,9 +555,11 @@ def _is_throttled(exc:Exception) -> bool:
     Deliberately the full "sign in to confirm you're not a bot" phrase, not just "sign in to
     confirm" -- that shorter form also matches yt-dlp's age-restriction error ("Sign in to
     confirm your age"), which is a permanent, never-retryable failure for this video (see
-    _is_age_restricted), not a transient throttle worth backing off and retrying."""
+    _is_age_restricted), not a transient throttle worth backing off and retrying. "429" is
+    matched as a whole number (\\b429\\b), not a bare substring -- yt-dlp's error text can embed
+    unrelated numbers (URLs, itags, byte offsets) that happen to contain "429"."""
     msg = str(exc).lower()
-    return any(sig in msg for sig in _THROTTLE_SIGNATURES)
+    return any(re.search(sig,msg) if sig.startswith(r"\b") else sig in msg for sig in _THROTTLE_SIGNATURES)
 
 _AGE_RESTRICTED_SIGNATURES = ("confirm your age","age-restricted","age restricted")
 
@@ -573,7 +589,7 @@ class AdaptiveRateLimiter:
     flat few-second gap was still drawing HTTP 429s on a large fraction of videos during a
     real backfill run, even with per-video retry/backoff, and most of those never recovered
     within CFG.SUBTITLE_MAX_ATTEMPTS. Thread-safe and meant to be a single instance shared
-    across every video/worker thread for the whole run (see Main.py/backfill_subtitles.py),
+    across every video/worker thread for the whole run (see Subtitles.py),
     passed into Get_Subtitles's rate_limiter parameter, so it learns whatever pace YouTube is
     actually enforcing right now rather than guessing a constant up front.
 
@@ -617,6 +633,23 @@ class AdaptiveRateLimiter:
             if self._consecutive_clean >= 50 and self._delay > self._floor:
                 self._delay = max(self._delay * 0.95,self._floor)
                 self._consecutive_clean = 0
+
+class SubtitleCircuitBreaker:
+    """Trips after N consecutive throttle-exhausted videos (within one run), so a blocked
+    IP doesn't get hammered by every remaining video once yt-dlp starts failing."""
+    def __init__(self,threshold:int):
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._threshold = threshold
+    def record_throttle(self):
+        with self._lock:
+            self._consecutive += 1
+    def record_success(self):
+        with self._lock:
+            self._consecutive = 0
+    @property
+    def tripped(self) -> bool:
+        return self._consecutive >= self._threshold
 
 _VTT_TIMESTAMP = re.compile(r'(\d{2,}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2})\.(\d{3})')
 _VTT_TAG = re.compile(r'<[^>]+>')
@@ -894,26 +927,27 @@ class YT_API:
         _db = db if db is not None else self.db
         _lock = user_id_lock if user_id_lock is not None else threading.Lock()
 
-        message_object = f"{CFG.MESSAGES_TAG}/{v.id}.json"
-        existing_messages_local = f'{bucket.local_root}/{message_object}'
-        messages_exist = bucket.check_object_exists(message_object)
-        if isinstance(messages_exist,ClientError):
-            raise messages_exist
-        elif messages_exist is True:
-            downloaded_object = bucket.download_object(message_object,existing_messages_local)
-            if isinstance(downloaded_object,ClientError):
-                raise downloaded_object
-            elif os.path.isfile(existing_messages_local):
-                with open(existing_messages_local,'r') as file:
-                    messages_on_file:list[dict[str,Any]] = json.load(file) #type: list[dict]
+        with Stage_Bar("Checking existing messages",bar_position):
+            message_object = f"{CFG.MESSAGES_TAG}/{v.id}.json"
+            existing_messages_local = f'{bucket.local_root}/{message_object}'
+            messages_exist = bucket.check_object_exists(message_object)
+            if isinstance(messages_exist,ClientError):
+                raise messages_exist
+            elif messages_exist is True:
+                downloaded_object = bucket.download_object(message_object,existing_messages_local)
+                if isinstance(downloaded_object,ClientError):
+                    raise downloaded_object
+                elif os.path.isfile(existing_messages_local):
+                    with open(existing_messages_local,'r') as file:
+                        messages_on_file:list[dict[str,Any]] = json.load(file) #type: list[dict]
+                else:
+                    messages_on_file = []
             else:
                 messages_on_file = []
-        else:
-            messages_on_file = []
 
-        # Pre-load existing message IDs for this video to avoid per-message DB lookups
-        existing_msg_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["messages"],"message_id",{"video_id":v.id})
-        known_message_ids:set = set(row["message_id"] for row in existing_msg_rows)
+            # Pre-load existing message IDs for this video to avoid per-message DB lookups
+            existing_msg_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["messages"],"message_id",{"video_id":v.id})
+            known_message_ids:set = set(row["message_id"] for row in existing_msg_rows)
 
         #-----------------------#
         #-- GET ALL CHAT DATA --#
@@ -928,7 +962,8 @@ class YT_API:
             # timer fires but the interrupt lands in the wrong thread and the worker stays
             # blocked on the network call forever. We implement the timeout ourselves via a
             # queue so it works correctly from any thread.
-            _raw_chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
+            with Stage_Bar("Connecting to chat",bar_position):
+                _raw_chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
             if CFG.TIMEOUT:
                 _msg_queue:queue.Queue = queue.Queue()
                 def _feed_queue():
@@ -968,7 +1003,7 @@ class YT_API:
 
         def _flush_pending_stats():
             # Sorting before executing means every commit's worth of record_message_stats calls
-            # locks user_first_message/user_first_channel_message rows in the same ascending
+            # locks user_first_message/user_channel_activity rows in the same ascending
             # user_id order, no matter which video or worker thread is running them. Two
             # transactions can then never hold those row locks in opposite relative order, which
             # is what a deadlock cycle requires -- see the "deadlock detected ...
@@ -1042,7 +1077,7 @@ class YT_API:
                             DB.InsertEntries(cursor=_db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
                             known_message_ids.add(msg.id)
 
-                            # Keep video_message_stats and user_first_channel_message up to date incrementally
+                            # Keep video_message_stats and user_channel_activity up to date incrementally
                             # rather than recomputing them later over the whole (200M+ row) messages table.
                             # Buffered, not called immediately -- see _flush_pending_stats().
                             pending_stats.append((
@@ -1051,7 +1086,14 @@ class YT_API:
                                 msg.usr_id,
                                 msg.entry["timestamp"],
                                 msg.entry["user_member_status"] is not None and msg.entry["user_member_status"] > -1,
-                                msg.entry["user_member_status"]
+                                msg.entry["user_member_status"],
+                                msg.id,
+                                len(msg.e_emote_entries),
+                                msg.entry["ismoderator"],
+                                msg.entry["isverified"],
+                                msg.entry["isowner"],
+                                msg.entry["amount"],
+                                msg.entry["currency"],
                             ))
 
                             entries = []
@@ -1122,7 +1164,7 @@ class YT_API:
 
         return chat_stats
 
-    def Get_Subtitles(self,video:'VideoClass',bucket:H3Bucket,db=None,rate_limiter:'AdaptiveRateLimiter|None'=None) -> SubtitleStats:
+    def Get_Subtitles(self,video_id:str,bucket:H3Bucket,db=None,rate_limiter:'AdaptiveRateLimiter|None'=None,bar_position:int=1) -> SubtitleStats:
         """
         Downloads YouTube's auto-generated (ASR) subtitles for a video via yt-dlp, parses them
         into cues, uploads the parsed cue list to S3 as subtitles/{id}.json (same
@@ -1134,28 +1176,29 @@ class YT_API:
         captions available, video unavailable, etc.) is not retried -- it just means this
         video/language has no subtitles to store.
 
-        :param video: The video to fetch subtitles for.
-        :type video: VideoClass
+        :param video_id: ID of the video to fetch subtitles for.
         :param bucket: The channel's S3 bucket.
         :type bucket: H3Bucket
         :param db: Database connection to use for the insert. Falls back to self.db.
         :param rate_limiter: Shared AdaptiveRateLimiter to pace requests against and report
             throttles/successes to. If omitted, no inter-request pacing happens here -- the
             caller is responsible for spacing calls out itself.
+        :param bar_position: This worker's tqdm bar slot, used to show what stage (rate-limit
+            wait vs. active download) is currently blocking this thread.
         :return: Stats about what happened for this video.
         :rtype: SubtitleStats
         """
         stats = SubtitleStats()
         _db = db if db is not None else self.db
 
-        subtitle_object = f"{CFG.SUBTITLE_TAG}/{video.id}.json"
+        subtitle_object = f"{CFG.SUBTITLE_TAG}/{video_id}.json"
         object_exists = bucket.check_object_exists(subtitle_object)
         if isinstance(object_exists,ClientError):
             raise object_exists
         if object_exists is True:
             return stats
 
-        url = f"https://www.youtube.com/watch?v={video.id}"
+        url = f"https://www.youtube.com/watch?v={video_id}"
         all_cues:list[dict[str,Any]] = []
 
         for lang in CFG.SUBTITLE_LANGUAGES:
@@ -1178,42 +1221,46 @@ class YT_API:
                 "impersonate": _SUBTITLE_IMPERSONATE_TARGET,
             }
 
-            vtt_path = f"{temp_dir}/{video.id}_TEMP.{lang}.vtt"
+            vtt_path = f"{temp_dir}/{video_id}_TEMP.{lang}.vtt"
 
-            for attempt in range(1,CFG.SUBTITLE_MAX_ATTEMPTS + 1):
-                if rate_limiter is not None:
-                    rate_limiter.wait()
-                try:
-                    ydl = yt_dlp.YoutubeDL(ydl_opts) #type:ignore
-                    ydl.extract_info(url,download=True)
-                    if rate_limiter is not None and attempt == 1:
-                        rate_limiter.report_success()
-                    break
-                except DownloadError as e:
-                    if _is_age_restricted(e):
-                        # Permanent for this video -- skip immediately rather than burning
-                        # through the throttle retry/backoff loop for something that will
-                        # never succeed no matter how many times it's attempted.
-                        LOG.logger.info(f"{video.id}: Age-restricted, skipping.")
-                        stats.no_captions += 1
-                        vtt_path = None
+            with Stage_Bar(f"Subtitles ({lang}): starting",bar_position) as sub_bar:
+                for attempt in range(1,CFG.SUBTITLE_MAX_ATTEMPTS + 1):
+                    if rate_limiter is not None:
+                        sub_bar.set_description_str(f"Subtitles ({lang}): rate-limit wait (~{rate_limiter.current:.1f}s)")
+                        rate_limiter.wait()
+                    try:
+                        sub_bar.set_description_str(f"Subtitles ({lang}): downloading")
+                        ydl = yt_dlp.YoutubeDL(ydl_opts) #type:ignore
+                        ydl.extract_info(url,download=True)
+                        if rate_limiter is not None and attempt == 1:
+                            rate_limiter.report_success()
                         break
-                    elif _is_throttled(e):
-                        if rate_limiter is not None:
-                            rate_limiter.report_throttled()
-                        if attempt == CFG.SUBTITLE_MAX_ATTEMPTS:
-                            stats.throttled += 1
-                            raise SubtitleThrottled(f"{video.id}: Subtitle download throttled after {attempt} attempt(s): {e}")
-                        wait = CFG.SUBTITLE_BACKOFF_BASE ** attempt
-                        LOG.logger.warning(f"{video.id}: Subtitle download throttled, retrying in {wait}s (attempt {attempt}/{CFG.SUBTITLE_MAX_ATTEMPTS})")
-                        time.sleep(wait)
-                        continue
-                    else:
-                        # Not a throttle signature -- treat as "no captions available" for this
-                        # video/language rather than retrying.
-                        stats.no_captions += 1
-                        vtt_path = None
-                        break
+                    except DownloadError as e:
+                        if _is_age_restricted(e):
+                            # Permanent for this video -- skip immediately rather than burning
+                            # through the throttle retry/backoff loop for something that will
+                            # never succeed no matter how many times it's attempted.
+                            LOG.logger.info(f"{video_id}: Age-restricted, skipping.")
+                            stats.no_captions += 1
+                            vtt_path = None
+                            break
+                        elif _is_throttled(e):
+                            if rate_limiter is not None:
+                                rate_limiter.report_throttled()
+                            if attempt == CFG.SUBTITLE_MAX_ATTEMPTS:
+                                stats.throttled += 1
+                                raise SubtitleThrottled(f"{video_id}: Subtitle download throttled after {attempt} attempt(s): {e}")
+                            wait = CFG.SUBTITLE_BACKOFF_BASE ** attempt
+                            LOG.logger.warning(f"{video_id}: Subtitle download throttled, retrying in {wait}s (attempt {attempt}/{CFG.SUBTITLE_MAX_ATTEMPTS}): {e}")
+                            sub_bar.set_description_str(f"Subtitles ({lang}): throttled, retrying in {wait:.0f}s")
+                            time.sleep(wait)
+                            continue
+                        else:
+                            # Not a throttle signature -- treat as "no captions available" for this
+                            # video/language rather than retrying.
+                            stats.no_captions += 1
+                            vtt_path = None
+                            break
 
             if vtt_path is None or not os.path.isfile(vtt_path):
                 stats.no_captions += 1
@@ -1223,24 +1270,27 @@ class YT_API:
             os.remove(vtt_path)
 
             for cue in cues:
-                cue["video_id"] = video.id
+                cue["video_id"] = video_id
                 cue["language"] = lang
                 if CFG.GET_MEMBERS_ONLY is False:
                     cue["channel_id"] = CFG.YT_USER_ID
             all_cues.extend(cues)
 
-            DB.DeleteEntries(_db.cursor,CFG.DB_TABLES["subtitles"],{"video_id":video.id,"language":lang})
+            DB.DeleteEntries(_db.cursor,CFG.DB_TABLES["subtitles"],{"video_id":video_id,"language":lang})
             if cues:
                 DB.InsertEntries(_db.cursor,CFG.DB_TABLES["subtitles"],cues)
+                total_words = sum(len(cue["text"].split()) for cue in cues)
+                speech_duration_ms = sum(cue["end_ms"] - cue["start_ms"] for cue in cues)
+                DB.RecordSubtitleStats(_db.cursor,video_id,CFG.YT_USER_ID,lang,len(cues),total_words,speech_duration_ms)
 
         if not all_cues:
             return stats
 
-        temp_path = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}/{video.id}_TEMP.json"
+        temp_path = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}/{video_id}_TEMP.json"
         with open(temp_path,'w') as file:
             file.write(json.dumps(all_cues,indent=4))
 
-        _check_and_upload_file(bucket,temp_path,video.id,"json",CFG.SUBTITLE_TAG)
+        _check_and_upload_file(bucket,temp_path,video_id,"json",CFG.SUBTITLE_TAG)
 
         stats.fetched += 1
         return stats

@@ -131,29 +131,31 @@ def UpdateEntries(cursor:psycopg2.extensions.cursor,table:str,data_dict:dict[str
         LOG.logger.error(f'Query: {query}\nValues: {values} ({type(values)})\n')
         raise e
 
-def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[str,str,str,float,bool,int|None]]) -> None:
+def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[str,str,str,float,bool,int|None,str,int,bool,bool,bool,float|None,str|None]]) -> None:
     """
-    Incrementally updates video_message_stats and user_first_channel_message (and their
+    Incrementally updates video_message_stats and user_channel_activity (and their
     dedup/first-message helper tables) for a batch of newly-inserted chat messages, in one round
     trip. Call this right before committing -- see _flush_pending_stats() in
     modules/Classes.py Get_Messages, which buffers one (channel_id, video_id, user_id, timestamp,
-    is_member, member_status) tuple per newly-inserted message and flushes the whole buffer here.
+    is_member, member_status, message_id, emote_count, is_moderator, is_verified, is_owner,
+    amount, currency) tuple per newly-inserted message and flushes the whole buffer here.
     All of the counting logic lives server-side in public.record_message_stats_batch() /
     record_message_stats() (see sql/video_message_stats.sql and
-    sql/user_first_channel_message_stats.sql).
+    sql/user_channel_activity_stats.sql).
 
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
-    :param batch: List of (channel_id, video_id, user_id, timestamp, is_member, member_status)
+    :param batch: List of (channel_id, video_id, user_id, timestamp, is_member, member_status,
+        message_id, emote_count, is_moderator, is_verified, is_owner, amount, currency)
         tuples, one per message, SORTED BY user_id by the caller -- see below for why.
     :type batch: list[tuple]
 
     record_message_stats() never touches a video_message_stats row for any video other than its
-    own (see that function's docstring in sql/user_first_channel_message_stats.sql, and
+    own (see that function's docstring in sql/user_channel_activity_stats.sql, and
     RefreshFirstMessageCounts for where first_messages/first_channel_messages moved to), which
     closed one deadlock path. That alone wasn't enough, though: a worker's transaction spans up
     to 500 messages (one commit per batch), and each row here still takes a row lock on
-    user_first_message/user_first_channel_message for whichever user it's for, held until that
+    user_first_message/user_channel_activity for whichever user it's for, held until that
     commit. Two workers processing two different videos that share chatters could each
     accumulate locks on overlapping users across their batch and lock them in opposite order --
     see the "deadlock detected ... user_first_message" incident between two DIFFERENT users.
@@ -177,9 +179,14 @@ def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[s
     if len(batch) == 0:
         return
 
-    channel_ids,video_ids,user_ids,timestamps,is_members,member_statuses = zip(*batch)
-    query = 'SELECT record_message_stats_batch(%s,%s,%s,%s,%s,%s)'
-    values = (list(channel_ids),list(video_ids),list(user_ids),list(timestamps),list(is_members),list(member_statuses))
+    (channel_ids,video_ids,user_ids,timestamps,is_members,member_statuses,
+     message_ids,emote_counts,is_moderators,is_verifieds,is_owners,amounts,currencies) = zip(*batch)
+    query = 'SELECT record_message_stats_batch(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)'
+    values = (
+        list(channel_ids),list(video_ids),list(user_ids),list(timestamps),list(is_members),
+        list(member_statuses),list(message_ids),list(emote_counts),list(is_moderators),
+        list(is_verifieds),list(is_owners),list(amounts),list(currencies)
+    )
 
     if CFG.DB_VERBOSE == True:
         LOG.logger.info(query)
@@ -218,15 +225,46 @@ def FinalizeVideoMessageRate(cursor:psycopg2.extensions.cursor,video_id:str) -> 
 
     cursor.execute(query,values)
 
+def RecordSubtitleStats(cursor:psycopg2.extensions.cursor,video_id:str,channel_id:str,language:str,total_subtitles:int,total_words:int,speech_duration_ms:int) -> None:
+    """
+    Upserts video_subtitle_stats for one video/language from precomputed totals. Call this once
+    per video/language right after its cues are written -- see Get_Subtitles in modules/Classes.py,
+    which already has the parsed cue list in memory and passes its totals straight through rather
+    than reading them back from the subtitles table.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param video_id: The video these subtitles belong to.
+    :type video_id: String
+    :param channel_id: The channel the video belongs to (CFG.YT_USER_ID).
+    :type channel_id: String
+    :param language: Caption language code (yt-dlp subtitleslangs entry).
+    :type language: String
+    :param total_subtitles: Number of cues parsed for this video/language.
+    :type total_subtitles: Integer
+    :param total_words: Total word count across those cues.
+    :type total_words: Integer
+    :param speech_duration_ms: Summed (end_ms - start_ms) across those cues.
+    :type speech_duration_ms: Integer
+    """
+    query = 'SELECT record_subtitle_stats(%s,%s,%s,%s,%s,%s)'
+    values = (video_id,channel_id,language,total_subtitles,total_words,speech_duration_ms)
+
+    if CFG.DB_VERBOSE == True:
+        LOG.logger.info(query)
+        LOG.logger.info(values)
+
+    cursor.execute(query,values)
+
 def RefreshFirstMessageCounts(cursor:psycopg2.extensions.cursor) -> None:
     """
     Recomputes video_message_stats.first_messages/first_channel_messages from
-    user_first_message/user_first_channel_message. Call this once per full run -- see the bottom
+    user_first_message/user_channel_activity. Call this once per full run -- see the bottom
     of Main.py -- not per message: record_message_stats() no longer patches these columns
     incrementally, since doing so required reaching into a SECOND, unrelated video's
     video_message_stats row whenever a user's first-message pointer moved, which could deadlock
     against another worker thread's video (see record_message_stats()'s docstring in
-    sql/user_first_channel_message_stats.sql for the incident this replaced).
+    sql/user_channel_activity_stats.sql for the incident this replaced).
 
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
@@ -243,13 +281,36 @@ def RefreshUserMessageRankings(cursor:psycopg2.extensions.cursor) -> None:
     Refreshes the user_message_rankings materialized view (per-channel and global message-count
     leaderboard ranks). Call this once per full run -- see the bottom of Main.py -- not per
     message or per video; a rank isn't incrementally maintainable the way totals/counts are, and
-    this is a full recomputation over the user_first_channel_message rollup. Uses CONCURRENTLY so
+    this is a full recomputation over the user_channel_activity rollup. Uses CONCURRENTLY so
     readers (e.g. Grafana) keep seeing the previous ranks instead of being locked out mid-refresh.
 
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
     """
     query = 'SELECT refresh_user_message_rankings()'
+
+    if CFG.DB_VERBOSE == True:
+        LOG.logger.info(query)
+
+    cursor.execute(query)
+
+def RefreshUserSummary(cursor:psycopg2.extensions.cursor) -> None:
+    """
+    Refreshes the user_summary materialized view (one row per user: identity, global rank,
+    cross-channel activity, superchat totals). Call this once per full run -- see the bottom of
+    Main.py, after RefreshUserMessageRankings (user_summary reads from
+    user_global_message_rankings, so it must be refreshed after that matview is current) --
+    not per message or per video. Originally a plain view, but live-querying it took 60-90s for
+    a sorted top-N query (a GroupAggregate over the whole user_channel_activity rollup spilled
+    ~1.7GB to disk sorting by user_id) -- the same scaling problem that made
+    user_message_rankings/user_global_message_rankings materialized views instead of plain ones.
+    Uses CONCURRENTLY so readers (e.g. Grafana) keep seeing the previous snapshot instead of
+    being locked out mid-refresh.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    """
+    query = 'SELECT refresh_user_summary()'
 
     if CFG.DB_VERBOSE == True:
         LOG.logger.info(query)
@@ -360,9 +421,12 @@ _CORE_SQL_FILES = [
     ("messages","messages"),
     ("nicknames","nicknames"),
     ("subtitles","subtitles"),
-    ("user_first_channel_message_stats","user_first_channel_message"),
+    ("video_subtitle_stats","video_subtitle_stats"),
+    ("user_channel_activity_stats","user_channel_activity"),
     ("video_message_stats","video_message_stats"),
+    ("user_channel_superchats","user_channel_superchats"),
     ("user_global_message_rankings","user_message_rankings"),
+    ("user_summary","user_summary"),
 ]
 _MEMBERS_SQL_FILES = [
     ("emotes_members","emotes_calli_members"),
@@ -407,7 +471,7 @@ def EnsureSchema(cursor:psycopg2.extensions.cursor,members_only:bool) -> None:
             LOG.logger.error(f'Failed to build database structure from sql/{file_name}.sql: {e}')
             raise e
 
-def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:str,group:str) -> None:
+def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:str,group:str,branch:str,active:bool,debut:str,process:bool) -> None:
     """
     Registers a new channel: adds its row to channel_directory and creates its
     messages_<db_suffix> partition of the partitioned messages table. Caller is
@@ -424,10 +488,18 @@ def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:
     :type db_suffix: String
     :param group: Talent group/agency the channel belongs to.
     :type group: String
+    :param branch: Talent's branch/sub-agency.
+    :type branch: String
+    :param active: Whether the channel is currently active.
+    :type active: Boolean
+    :param debut: Channel's debut date, ISO format (YYYY-MM-DD).
+    :type debut: String
+    :param process: Whether this channel should be included when CFG.PROCESS_ALL is True.
+    :type process: Boolean
     """
     try:
-        insert_query = 'INSERT INTO channel_directory (name, user_id, db_suffix, "group") VALUES (%s, %s, %s, %s)'
-        insert_values = (name,user_id,db_suffix,group)
+        insert_query = 'INSERT INTO channel_directory (name, user_id, db_suffix, "group", branch, active, debut, process) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)'
+        insert_values = (name,user_id,db_suffix,group,branch,active,debut,process)
 
         if CFG.DB_VERBOSE == True:
             LOG.logger.info(insert_query)
@@ -480,3 +552,29 @@ def GetEntries(cursor:psycopg2.extensions.cursor,table:str,columns:str='*',filte
         results.append(row_dict)
 
     return results
+
+def GetVideosNeedingSubtitles(cursor:psycopg2.extensions.cursor,videos_table:str,channel_id:str,members:bool) -> list[dict[str,Any]]:
+    """
+    Videos for a channel that don't have subtitles yet and aren't currently live. Custom SQL
+    rather than GetEntries() -- GetEntries only ANDs plain equality filters, which can't
+    express "livestream IS NOT TRUE" (must include NULL rows for older/edge-case videos where
+    livestream was never set -- the column is nullable, and existing code always guards with
+    != True, never == False, for this reason).
+
+    Returns id + end_time (not just id) so the caller can tell a video that JUST stopped being
+    live (auto-captions may not be finalized yet -- see CFG.SUBTITLE_GRACE_HOURS) apart from
+    one that's been done processing for a while.
+
+    :param cursor: Database cursor object to execute commands.
+    :param videos_table: CFG.DB_TABLES["videos"].
+    :param channel_id: CFG.YT_USER_ID for the channel being processed.
+    :param members: CFG.GET_MEMBERS_ONLY -- videos.members distinguishes public vs
+        members-only rows within the single unified videos table.
+    :return: List of {"id":..., "end_time":...} dicts.
+    """
+    query = f'SELECT id,end_time FROM {videos_table} WHERE channel_id = %s AND members = %s AND subtitles_processed = false AND livestream IS NOT TRUE'
+    if CFG.DB_VERBOSE == True:
+        LOG.logger.info(query)
+    cursor.execute(query,(channel_id,members))
+    columns = [d[0] for d in cursor.description]
+    return [dict(zip(columns,row)) for row in cursor.fetchall()]

@@ -27,7 +27,7 @@ SELECT channel_id,
     user_id,
     total_messages AS channel_messages,
     rank() OVER (PARTITION BY channel_id ORDER BY total_messages DESC) AS channel_rank
-   FROM user_first_channel_message;
+   FROM user_channel_activity;
 CREATE UNIQUE INDEX idx_user_message_rankings_pk ON public.user_message_rankings USING btree (channel_id, user_id);
 
 
@@ -43,10 +43,10 @@ CREATE UNIQUE INDEX idx_user_message_rankings_pk ON public.user_message_rankings
 
 CREATE MATERIALIZED VIEW public.user_global_message_rankings AS
 WITH global_totals AS (
-         SELECT user_first_channel_message.user_id,
-            sum(user_first_channel_message.total_messages) AS global_messages
-           FROM user_first_channel_message
-          GROUP BY user_first_channel_message.user_id
+         SELECT user_channel_activity.user_id,
+            sum(user_channel_activity.total_messages) AS global_messages
+           FROM user_channel_activity
+          GROUP BY user_channel_activity.user_id
         )
  SELECT user_id,
     global_messages,

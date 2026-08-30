@@ -5,6 +5,13 @@
 
 -- public.videos definition
 
+-- subtitles_processed tracks the subtitle-download pipeline (Subtitles.py) independently
+-- of the chat/video 'processed' flag above -- the two used to be coupled (subtitles were
+-- only ever attempted once, inline, right after a video's chat finished), which meant a
+-- throttled/failed subtitle attempt was never retried once 'processed' went true. Backfilled
+-- once via backfill_subtitles_processed.py for videos that already had subtitle rows before
+-- this column existed.
+
 -- Drop table
 
 -- DROP TABLE public.videos;
@@ -22,6 +29,7 @@ CREATE TABLE public.videos (
 	duration int8 GENERATED ALWAYS AS (EXTRACT(epoch FROM (end_time - start_time))) STORED NULL,
 	members bool DEFAULT false NOT NULL,
 	channel_id text NOT NULL,
+	subtitles_processed bool DEFAULT false NOT NULL,
 	CONSTRAINT pk_videos_id PRIMARY KEY (id),
 	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id)
 );
@@ -30,3 +38,4 @@ CREATE INDEX idx_videos_end_time ON public.videos USING btree (end_time);
 CREATE INDEX idx_videos_published ON public.videos USING btree (publishedat);
 CREATE INDEX idx_videos_scheduled ON public.videos USING btree (scheduled_start);
 CREATE INDEX idx_videos_start_time ON public.videos USING btree (start_time);
+CREATE INDEX idx_videos_subtitles_processed ON public.videos USING btree (channel_id, members) WHERE (subtitles_processed = false);

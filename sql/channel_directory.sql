@@ -27,5 +27,9 @@ CREATE TABLE public.channel_directory (
 	"group" text NOT NULL,
 	color_1 text DEFAULT '#ffffff'::text NOT NULL,
 	color_2 text DEFAULT '#ffffff'::text NOT NULL,
+	branch text NOT NULL,
+	active bool NOT NULL,
+	debut date NOT NULL,
+	process bool NOT NULL,
 	CONSTRAINT channel_directory_unique UNIQUE (user_id)
 );

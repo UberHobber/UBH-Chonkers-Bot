@@ -53,89 +53,107 @@ CREATE TABLE public.video_user_seen (
 -- modules/Classes.py Get_Messages, one batched call per commit). refresh_first_message_counts()
 -- and refresh_user_message_rankings() are recomputed-from-scratch refreshes called once per
 -- full bot run (see the end of Main.py) rather than incrementally -- see each function's own
--- history in sql/video_message_stats.sql, sql/user_first_channel_message_stats.sql, and
+-- history in sql/video_message_stats.sql, sql/user_channel_activity_stats.sql, and
 -- sql/user_global_message_rankings.sql for the full rationale and past incidents that shaped them.
 
 -- public.record_message_stats definition
 
 -- Called once per newly-inserted chat message (via record_message_stats_batch(), below --
 -- not usually called directly anymore). Upserts video_message_stats totals for the message's
--- own video, the video_user_seen dedup row, and the user's global/per-channel first-message
--- pointers (user_first_message/user_first_channel_message). Deliberately never touches another
--- video's video_message_stats row -- an earlier version did, to move
+-- own video, the video_user_seen dedup row, the user's global/per-channel first-message
+-- pointers (user_first_message/user_channel_activity, now message_id-based -- see their own
+-- NARRATIVE entries), user_channel_activity's emote/mod-status columns, and (when the message
+-- carried a paid amount) user_channel_superchats. Deliberately never touches another video's
+-- video_message_stats row -- an earlier version did, to move
 -- first_messages/first_channel_messages credit between videos inline, which could deadlock two
 -- worker threads processing two different videos against each other. That accounting was moved
 -- out to refresh_first_message_counts() instead.
 
-CREATE OR REPLACE FUNCTION public.record_message_stats(p_channel_id text, p_video_id text, p_user_id text, p_timestamp double precision, p_is_member boolean, p_member_status bigint)
+CREATE OR REPLACE FUNCTION public.record_message_stats(p_channel_id text, p_video_id text, p_user_id text, p_timestamp double precision, p_is_member boolean, p_member_status bigint, p_message_id text, p_emote_count integer, p_is_moderator boolean, p_is_verified boolean, p_is_owner boolean, p_amount double precision, p_currency text)
  RETURNS void
  LANGUAGE plpgsql
 AS $function$
-DECLARE
-    v_prev_is_member boolean;
-    v_was_new_user boolean;
-BEGIN
-    INSERT INTO public.video_message_stats (video_id) VALUES (p_video_id)
-        ON CONFLICT (video_id) DO NOTHING;
+        DECLARE
+            v_prev_is_member boolean;
+            v_was_new_user boolean;
+        BEGIN
+            INSERT INTO public.video_message_stats (video_id) VALUES (p_video_id)
+                ON CONFLICT (video_id) DO NOTHING;
 
-    UPDATE public.video_message_stats
-    SET total_messages = total_messages + 1,
-        messages_nonmembers = messages_nonmembers + (CASE WHEN p_is_member THEN 0 ELSE 1 END),
-        messages_members = messages_members + (CASE WHEN p_is_member THEN 1 ELSE 0 END)
-    WHERE video_id = p_video_id;
+            UPDATE public.video_message_stats
+            SET total_messages = total_messages + 1,
+                messages_nonmembers = messages_nonmembers + (CASE WHEN p_is_member THEN 0 ELSE 1 END),
+                messages_members = messages_members + (CASE WHEN p_is_member THEN 1 ELSE 0 END)
+            WHERE video_id = p_video_id;
 
-    -- Lock any existing (video_id, user_id) row so concurrent messages for the same user
-    -- in the same video (rare, but possible across reprocessing) serialize correctly.
-    SELECT is_member INTO v_prev_is_member
-    FROM public.video_user_seen
-    WHERE video_id = p_video_id AND user_id = p_user_id
-    FOR UPDATE;
+            SELECT is_member INTO v_prev_is_member
+            FROM public.video_user_seen
+            WHERE video_id = p_video_id AND user_id = p_user_id
+            FOR UPDATE;
 
-    v_was_new_user := NOT FOUND;
+            v_was_new_user := NOT FOUND;
 
-    IF v_was_new_user THEN
-        INSERT INTO public.video_user_seen (video_id, user_id, is_member)
-        VALUES (p_video_id, p_user_id, p_is_member);
+            IF v_was_new_user THEN
+                INSERT INTO public.video_user_seen (video_id, user_id, is_member)
+                VALUES (p_video_id, p_user_id, p_is_member);
 
-        UPDATE public.video_message_stats
-        SET unique_users = unique_users + 1,
-            unique_members = unique_members + (CASE WHEN p_is_member THEN 1 ELSE 0 END),
-            unique_nonmembers = unique_nonmembers + (CASE WHEN p_is_member THEN 0 ELSE 1 END)
-        WHERE video_id = p_video_id;
-    ELSIF p_is_member AND NOT v_prev_is_member THEN
-        UPDATE public.video_user_seen SET is_member = true
-        WHERE video_id = p_video_id AND user_id = p_user_id;
+                UPDATE public.video_message_stats
+                SET unique_users = unique_users + 1,
+                    unique_members = unique_members + (CASE WHEN p_is_member THEN 1 ELSE 0 END),
+                    unique_nonmembers = unique_nonmembers + (CASE WHEN p_is_member THEN 0 ELSE 1 END)
+                WHERE video_id = p_video_id;
+            ELSIF p_is_member AND NOT v_prev_is_member THEN
+                UPDATE public.video_user_seen SET is_member = true
+                WHERE video_id = p_video_id AND user_id = p_user_id;
 
-        UPDATE public.video_message_stats
-        SET unique_members = unique_members + 1,
-            unique_nonmembers = unique_nonmembers - 1
-        WHERE video_id = p_video_id;
-    END IF;
+                UPDATE public.video_message_stats
+                SET unique_members = unique_members + 1,
+                    unique_nonmembers = unique_nonmembers - 1
+                WHERE video_id = p_video_id;
+            END IF;
 
-    -- Global first-message pointer. Single-row upsert -- Postgres handles the read-modify-write
-    -- atomically, so there's no separate lock step, and (critically) no reference to any OTHER
-    -- video's video_message_stats row anymore.
-    INSERT INTO public.user_first_message (user_id, video_id, "timestamp")
-    VALUES (p_user_id, p_video_id, p_timestamp)
-    ON CONFLICT (user_id) DO UPDATE
-    SET video_id = EXCLUDED.video_id,
-        "timestamp" = EXCLUDED."timestamp"
-    WHERE EXCLUDED."timestamp" < public.user_first_message."timestamp";
+            INSERT INTO public.user_first_message (user_id, channel_id, message_id, "timestamp")
+            VALUES (p_user_id, p_channel_id, p_message_id, p_timestamp)
+            ON CONFLICT (user_id) DO UPDATE
+            SET channel_id = EXCLUDED.channel_id,
+                message_id = EXCLUDED.message_id,
+                "timestamp" = EXCLUDED."timestamp"
+            WHERE EXCLUDED."timestamp" < public.user_first_message."timestamp";
 
-    -- Per-channel first-message pointer, plus the per-channel totals that live on the same row
-    -- (total_messages, last_message_ts, max_member_status). Same single-row-upsert treatment.
-    INSERT INTO public.user_first_channel_message
-        (channel_id, user_id, video_id, "timestamp", total_messages, last_message_ts, max_member_status)
-    VALUES (p_channel_id, p_user_id, p_video_id, p_timestamp, 1, p_timestamp, p_member_status)
-    ON CONFLICT (channel_id, user_id) DO UPDATE
-    SET total_messages = public.user_first_channel_message.total_messages + 1,
-        last_message_ts = GREATEST(public.user_first_channel_message.last_message_ts, EXCLUDED.last_message_ts),
-        max_member_status = GREATEST(public.user_first_channel_message.max_member_status, EXCLUDED.max_member_status),
-        video_id = CASE WHEN EXCLUDED."timestamp" < public.user_first_channel_message."timestamp"
-            THEN EXCLUDED.video_id ELSE public.user_first_channel_message.video_id END,
-        "timestamp" = LEAST(public.user_first_channel_message."timestamp", EXCLUDED."timestamp");
-END;
-$function$;
+            INSERT INTO public.user_channel_activity
+                (channel_id, user_id, first_message_id, "timestamp", total_messages, last_message_ts,
+                 max_member_status, emote_count, ever_moderator, ever_verified, ever_owner,
+                 last_is_moderator, last_is_verified, last_is_owner)
+            VALUES (p_channel_id, p_user_id, p_message_id, p_timestamp, 1, p_timestamp, p_member_status,
+                    p_emote_count, p_is_moderator, p_is_verified, p_is_owner,
+                    p_is_moderator, p_is_verified, p_is_owner)
+            ON CONFLICT (channel_id, user_id) DO UPDATE
+            SET total_messages = public.user_channel_activity.total_messages + 1,
+                last_message_ts = GREATEST(public.user_channel_activity.last_message_ts, EXCLUDED.last_message_ts),
+                max_member_status = GREATEST(public.user_channel_activity.max_member_status, EXCLUDED.max_member_status),
+                emote_count = public.user_channel_activity.emote_count + EXCLUDED.emote_count,
+                ever_moderator = public.user_channel_activity.ever_moderator OR EXCLUDED.ever_moderator,
+                ever_verified = public.user_channel_activity.ever_verified OR EXCLUDED.ever_verified,
+                ever_owner = public.user_channel_activity.ever_owner OR EXCLUDED.ever_owner,
+                last_is_moderator = CASE WHEN EXCLUDED."timestamp" >= public.user_channel_activity.last_message_ts
+                    THEN EXCLUDED.last_is_moderator ELSE public.user_channel_activity.last_is_moderator END,
+                last_is_verified = CASE WHEN EXCLUDED."timestamp" >= public.user_channel_activity.last_message_ts
+                    THEN EXCLUDED.last_is_verified ELSE public.user_channel_activity.last_is_verified END,
+                last_is_owner = CASE WHEN EXCLUDED."timestamp" >= public.user_channel_activity.last_message_ts
+                    THEN EXCLUDED.last_is_owner ELSE public.user_channel_activity.last_is_owner END,
+                first_message_id = CASE WHEN EXCLUDED."timestamp" < public.user_channel_activity."timestamp"
+                    THEN EXCLUDED.first_message_id ELSE public.user_channel_activity.first_message_id END,
+                "timestamp" = LEAST(public.user_channel_activity."timestamp", EXCLUDED."timestamp");
+
+            IF p_amount IS NOT NULL THEN
+                INSERT INTO public.user_channel_superchats (channel_id, user_id, currency, superchat_count, total_amount)
+                VALUES (p_channel_id, p_user_id, COALESCE(p_currency, 'UNKNOWN'), 1, p_amount)
+                ON CONFLICT (channel_id, user_id, currency) DO UPDATE
+                SET superchat_count = public.user_channel_superchats.superchat_count + 1,
+                    total_amount = public.user_channel_superchats.total_amount + EXCLUDED.total_amount;
+            END IF;
+        END;
+        $function$;
 
 
 -- public.record_message_stats_batch definition
@@ -148,21 +166,23 @@ $function$;
 -- commit. One call carrying all the rows removes N-1 round trips' worth of network
 -- latency from how long another worker can be blocked waiting on a contended user.
 
-CREATE OR REPLACE FUNCTION public.record_message_stats_batch(p_channel_ids text[], p_video_ids text[], p_user_ids text[], p_timestamps double precision[], p_is_members boolean[], p_member_statuses bigint[])
+CREATE OR REPLACE FUNCTION public.record_message_stats_batch(p_channel_ids text[], p_video_ids text[], p_user_ids text[], p_timestamps double precision[], p_is_members boolean[], p_member_statuses bigint[], p_message_ids text[], p_emote_counts integer[], p_is_moderators boolean[], p_is_verifieds boolean[], p_is_owners boolean[], p_amounts double precision[], p_currencies text[])
  RETURNS void
  LANGUAGE plpgsql
 AS $function$
-DECLARE
-    i int;
-BEGIN
-    FOR i IN 1..array_length(p_user_ids, 1) LOOP
-        PERFORM public.record_message_stats(
-            p_channel_ids[i], p_video_ids[i], p_user_ids[i],
-            p_timestamps[i], p_is_members[i], p_member_statuses[i]
-        );
-    END LOOP;
-END;
-$function$;
+        DECLARE
+            i int;
+        BEGIN
+            FOR i IN 1..array_length(p_user_ids, 1) LOOP
+                PERFORM public.record_message_stats(
+                    p_channel_ids[i], p_video_ids[i], p_user_ids[i],
+                    p_timestamps[i], p_is_members[i], p_member_statuses[i],
+                    p_message_ids[i], p_emote_counts[i], p_is_moderators[i], p_is_verifieds[i],
+                    p_is_owners[i], p_amounts[i], p_currencies[i]
+                );
+            END LOOP;
+        END;
+        $function$;
 
 
 -- public.finalize_video_message_rate definition

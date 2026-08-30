@@ -68,6 +68,14 @@ USER_WORKER_COUNT = 10
 # (a NoChatReplay for those is always permanent).
 CHAT_REPLAY_GRACE_HOURS = 24
 
+# Same idea as CHAT_REPLAY_GRACE_HOURS above, but for auto-generated (ASR) subtitles --
+# YouTube may not have finished processing captions for a video the instant it stops being
+# live, so a video that comes back with no captions this soon after ending isn't marked
+# subtitles_processed permanently; it's left for a later run to retry. A separate setting
+# from CHAT_REPLAY_GRACE_HOURS since caption finalization timing isn't necessarily the same
+# as chat replay finalization timing.
+SUBTITLE_GRACE_HOURS = 24
+
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
 QUICK_SETTINGS_DATA = "D:/CodingProjects/_Datafiles"
@@ -170,11 +178,12 @@ def load_channel_directory(cursor:cursor) -> None:
     """
     global CHANNEL_DIRECTORY,CHANNELS_TO_PROCESS
 
-    cursor.execute('SELECT name, user_id, db_suffix, "group" FROM channel_directory')
-    CHANNEL_DIRECTORY = {name:{"user_id":user_id,"db_suffix":db_suffix,"group":group} for name,user_id,db_suffix,group in cursor.fetchall()}
+    cursor.execute('SELECT name, user_id, db_suffix, "group", process FROM channel_directory')
+    rows = cursor.fetchall()
+    CHANNEL_DIRECTORY = {name:{"user_id":user_id,"db_suffix":db_suffix,"group":group} for name,user_id,db_suffix,group,process in rows}
 
-    # PROCESS_ALL loops over every entry in CHANNEL_DIRECTORY instead of just CHANNEL_SELECTION.
-    CHANNELS_TO_PROCESS = list(CHANNEL_DIRECTORY.keys()) if PROCESS_ALL else [CHANNEL_SELECTION]
+    # PROCESS_ALL loops over every entry in CHANNEL_DIRECTORY flagged "process" instead of just CHANNEL_SELECTION.
+    CHANNELS_TO_PROCESS = [name for name,_,_,_,process in rows if process] if PROCESS_ALL else [CHANNEL_SELECTION]
 
 def select_channel(channel_name:str) -> None:
     """Recomputes all channel-specific derived settings (paths, DB tables, YT IDs) for the given channel."""

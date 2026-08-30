@@ -103,24 +103,6 @@ class _RateLimiter:
             self._last = time.monotonic()
 
 rate_limiter = _RateLimiter(CFG.REQUEST_DELAY)
-subtitle_rate_limiter = C.AdaptiveRateLimiter(CFG.SUBTITLE_REQUEST_DELAY,CFG.SUBTITLE_REQUEST_DELAY_CEILING)
-
-class _SubtitleCircuitBreaker:
-    """Trips after N consecutive throttle-exhausted videos (within one channel's run), so a
-    blocked IP doesn't get hammered by every remaining video once yt-dlp starts failing."""
-    def __init__(self,threshold:int):
-        self._lock = threading.Lock()
-        self._consecutive = 0
-        self._threshold = threshold
-    def record_throttle(self):
-        with self._lock:
-            self._consecutive += 1
-    def record_success(self):
-        with self._lock:
-            self._consecutive = 0
-    @property
-    def tripped(self) -> bool:
-        return self._consecutive >= self._threshold
 
 # Users have to be done in batches of 50 manually because the API call does not give a "next page" item like the videos....
 def Batch_Users(users):
@@ -141,7 +123,6 @@ def process_channel(channel_name:str):
             os.makedirs(d_path)
 
     channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,CFG.LOCAL_DATA_PATH)
-    subtitle_breaker = _SubtitleCircuitBreaker(CFG.SUBTITLE_CIRCUIT_BREAKER_THRESHOLD)
 
     #################################
     ### VIDEO AND CHAT PROCESSING ###
@@ -207,25 +188,27 @@ def process_channel(channel_name:str):
         #-- GET VIDEO THUMBNAIL --#
         #-------------------------#
 
-        vid.Get_Thumbnail(channel_bucket)
+        with C.Stage_Bar("Fetching thumbnail",_thread_local.bar_position):
+            vid.Get_Thumbnail(channel_bucket)
 
         #---------------------------------------#
         #-- INSERT/UPDATE VIDEO INTO DATABASE --#
         #---------------------------------------#
 
-        try:
-            if not video_exists:
-                DB.InsertEntries(cursor=thread_db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
-            else:
-                update_data = {k: v for k, v in vid.entry.items() if k != "id"}
-                DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],update_data,"id",video_id)
-            thread_db.database.commit()
-        except Exception:
-            # Roll back so a failed insert doesn't leave this worker's connection aborted for
-            # every video it processes afterward (a query failure poisons the whole transaction
-            # until rolled back -- the connection is reused across videos and channels).
-            thread_db.database.rollback()
-            raise
+        with C.Stage_Bar("Updating video record",_thread_local.bar_position):
+            try:
+                if not video_exists:
+                    DB.InsertEntries(cursor=thread_db.cursor,table=CFG.DB_TABLES["videos"],data_list=[vid.entry])
+                else:
+                    update_data = {k: v for k, v in vid.entry.items() if k != "id"}
+                    DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],update_data,"id",video_id)
+                thread_db.database.commit()
+            except Exception:
+                # Roll back so a failed insert doesn't leave this worker's connection aborted for
+                # every video it processes afterward (a query failure poisons the whole transaction
+                # until rolled back -- the connection is reused across videos and channels).
+                thread_db.database.rollback()
+                raise
 
         #-----------------------------#
         #-- GET VIDEO CHAT MESSAGES --#
@@ -281,30 +264,6 @@ def process_channel(channel_name:str):
                     local_vid_stats.error_videos = 1
                     LOG.logger.error(f"{video_id}: Unknown error: {u}")
                     rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
-
-        #-------------------------#
-        #-- GET VIDEO SUBTITLES --#
-        #-------------------------#
-        # Independent of the chat try/except above -- a NoChatReplay or chat error shouldn't
-        # block subtitle capture and vice versa. Only attempted once the video is confirmed not
-        # currently live, same as _mark_processed() above -- auto-captions aren't finalized for
-        # an in-progress livestream.
-
-        if not CFG.SKIP_SUBTITLE_DOWNLOAD and vid.livestream != True:
-            if subtitle_breaker.tripped:
-                LOG.logger.warning(f"{video_id}: Skipping subtitles, circuit breaker tripped for this run.")
-            else:
-                try:
-                    yt.Get_Subtitles(vid,channel_bucket,db=thread_db,rate_limiter=subtitle_rate_limiter)
-                    subtitle_breaker.record_success()
-                    thread_db.database.commit()
-                except C.SubtitleThrottled:
-                    subtitle_breaker.record_throttle()
-                    thread_db.database.rollback()
-                    LOG.logger.warning(f"{video_id}: Subtitle download throttled, giving up on this video.")
-                except Exception as e:
-                    thread_db.database.rollback()
-                    LOG.logger.error(f"{video_id}: Subtitle download error: {e}")
 
         return local_vid_stats,local_chat_stats
 
@@ -423,10 +382,27 @@ for channel_name in CFG.CHANNELS_TO_PROCESS:
 
 # Recompute first_messages/first_channel_messages once per run -- see RefreshFirstMessageCounts
 # docstring for why these can't be maintained incrementally anymore.
+LOG.logger.info("Rebuilding First Message Counts...")
 DB.RefreshFirstMessageCounts(db.cursor)
 db.database.commit()
 
 # Refresh message-count leaderboard ranks once per run (not per channel/video/message -- see
 # RefreshUserMessageRankings docstring for why ranks can't be maintained incrementally).
+LOG.logger.info("Rebuilding Message Rankings...")
 DB.RefreshUserMessageRankings(db.cursor)
 db.database.commit()
+
+# Refresh the per-user summary once per run, after message rankings -- it reads from
+# user_global_message_rankings, so it must be refreshed after that matview is current. See
+# RefreshUserSummary docstring for why this is a materialized view rather than a plain one.
+LOG.logger.info("Rebuilding User Summary...")
+DB.RefreshUserSummary(db.cursor)
+db.database.commit()
+
+# Subtitle downloading runs as its own pass, after every channel's chat/video processing is
+# done, rather than inline per-video -- see Subtitles.py module docstring for why (subtitle
+# rate-limit waits used to stall chat throughput on the same worker pool). Reuses this
+# process's already-open db/s3/yt so it doesn't re-open connections or re-fire CFG's
+# interactive prompts the way a fresh subprocess would.
+import Subtitles
+Subtitles.run(db,s3,yt,CFG.CHANNELS_TO_PROCESS)

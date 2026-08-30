@@ -58,6 +58,7 @@ CREATE TABLE public.messages_ina PARTITION OF public.messages FOR VALUES IN ('Mw
 CREATE TABLE public.messages_irys PARTITION OF public.messages FOR VALUES IN ('8rcEBzJSleTkf_-agPM20g');
 CREATE TABLE public.messages_kiara PARTITION OF public.messages FOR VALUES IN ('Hsx4Hqa-1ORjQTh9TYDhww');
 CREATE TABLE public.messages_kronii PARTITION OF public.messages FOR VALUES IN ('mbs8T6MWqUHP1tIQvSgKrg');
+CREATE TABLE public.messages_moona PARTITION OF public.messages FOR VALUES IN ('P0BspO_AMEe3aQqqpo89Dg');
 CREATE TABLE public.messages_mumei PARTITION OF public.messages FOR VALUES IN ('3n5uGu18FoCy23ggWWp8tA');
 CREATE TABLE public.messages_nerissa PARTITION OF public.messages FOR VALUES IN ('_sFNM0z0MWm9A6WlKPuMMg');
 CREATE TABLE public.messages_raora PARTITION OF public.messages FOR VALUES IN ('l69AEx4MdqMZH7Jtsm7Tig');
