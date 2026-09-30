@@ -44,26 +44,37 @@ END) STORED NULL,
 PARTITION BY LIST (channel_id);
 
 CREATE TABLE public.messages_ame PARTITION OF public.messages FOR VALUES IN ('yl1z3jo3XHR1riLFKG5UAg');
+CREATE TABLE public.messages_anya PARTITION OF public.messages FOR VALUES IN ('727SQYUvx5pDDGQpTICNWg');
 CREATE TABLE public.messages_bae PARTITION OF public.messages FOR VALUES IN ('gmPnx-EEeOrZSg5Tiw7ZRQ');
 CREATE TABLE public.messages_biboo PARTITION OF public.messages FOR VALUES IN ('9p_lqQ0FEDz327Vgf5JwqA');
 CREATE TABLE public.messages_calli PARTITION OF public.messages FOR VALUES IN ('L_qhgtOy0dy1Agp8vkySQg');
 CREATE TABLE public.messages_ceci PARTITION OF public.messages FOR VALUES IN ('vN5h1ShZtc7nly3pezRayg');
 CREATE TABLE public.messages_erb PARTITION OF public.messages FOR VALUES IN ('W5uhrG1eCBYditmhL0Ykjw');
 CREATE TABLE public.messages_fauna PARTITION OF public.messages FOR VALUES IN ('O_aKKYxn4tvrqPjcTzZ6EQ');
+CREATE TABLE public.messages_flowglow PARTITION OF public.messages FOR VALUES IN ('u2n3qHuOuQIygREMnWeQWg');
 CREATE TABLE public.messages_fwmc PARTITION OF public.messages FOR VALUES IN ('t9H_RpQzhxzlyBxFqrdHqA');
 CREATE TABLE public.messages_gigi PARTITION OF public.messages FOR VALUES IN ('DHABijvPBnJm7F-KlNME3w');
 CREATE TABLE public.messages_gura PARTITION OF public.messages FOR VALUES IN ('oSrY_IQQVpmIRZ9Xf-y93g');
 CREATE TABLE public.messages_holoen PARTITION OF public.messages FOR VALUES IN ('otXwY6s8pWmuWd_snKYjhg');
+CREATE TABLE public.messages_hololive PARTITION OF public.messages FOR VALUES IN ('JFZiqLMntJufDCHc6bQixg');
 CREATE TABLE public.messages_ina PARTITION OF public.messages FOR VALUES IN ('MwGHR0BTZuLsmjY_NT5Pwg');
+CREATE TABLE public.messages_iofi PARTITION OF public.messages FOR VALUES IN ('Aoy6rzhSf4ydcYjJw3WoVg');
 CREATE TABLE public.messages_irys PARTITION OF public.messages FOR VALUES IN ('8rcEBzJSleTkf_-agPM20g');
+CREATE TABLE public.messages_kaela PARTITION OF public.messages FOR VALUES IN ('ZLZ8Jjx_RN2CXloOmgTHVg');
 CREATE TABLE public.messages_kiara PARTITION OF public.messages FOR VALUES IN ('Hsx4Hqa-1ORjQTh9TYDhww');
+CREATE TABLE public.messages_kobo PARTITION OF public.messages FOR VALUES IN ('jLEmnpCNeisMxy134KPwWw');
 CREATE TABLE public.messages_kronii PARTITION OF public.messages FOR VALUES IN ('mbs8T6MWqUHP1tIQvSgKrg');
 CREATE TABLE public.messages_moona PARTITION OF public.messages FOR VALUES IN ('P0BspO_AMEe3aQqqpo89Dg');
 CREATE TABLE public.messages_mumei PARTITION OF public.messages FOR VALUES IN ('3n5uGu18FoCy23ggWWp8tA');
 CREATE TABLE public.messages_nerissa PARTITION OF public.messages FOR VALUES IN ('_sFNM0z0MWm9A6WlKPuMMg');
+CREATE TABLE public.messages_ollie PARTITION OF public.messages FOR VALUES IN ('Yz_5n-uDuChHtLo7My1HnQ');
 CREATE TABLE public.messages_raora PARTITION OF public.messages FOR VALUES IN ('l69AEx4MdqMZH7Jtsm7Tig');
+CREATE TABLE public.messages_regloss PARTITION OF public.messages FOR VALUES IN ('10wVt6hoQiwySRhz7RdOUA');
+CREATE TABLE public.messages_reine PARTITION OF public.messages FOR VALUES IN ('hgTyjG-pdNvxxhdsXfHQ5Q');
+CREATE TABLE public.messages_risu PARTITION OF public.messages FOR VALUES IN ('OyYb1c43VlX9rc_lT6NKQw');
 CREATE TABLE public.messages_sana PARTITION OF public.messages FOR VALUES IN ('sUj0dszADCGbF3gNrQEuSQ');
 CREATE TABLE public.messages_shiori PARTITION OF public.messages FOR VALUES IN ('gnfPPb9JI3e9A4cXHnWbyg');
+CREATE TABLE public.messages_zeta PARTITION OF public.messages FOR VALUES IN ('TvHWSfBZgtxE4sILOaurIQ');
 -- idx_messages_video_user_status and idx_messages_user_timestamp were added by
 -- sql/video_message_stats.sql to make its one-time backfill (and future ad-hoc
 -- reconciliation queries) feasible against the 200M+ row table. Not yet attached on the

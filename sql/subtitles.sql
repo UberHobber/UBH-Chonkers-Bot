@@ -19,6 +19,22 @@
 
 -- public.subtitles definition
 
+-- idx_subtitles_text_fts and idx_subtitles_text_trgm exist for this table's primary
+-- use case: searching cue text for words a specific talent said (filtered by channel_id,
+-- which is already indexed for free as the PK's leading column). fts is a GIN index over
+-- to_tsvector('simple', text) for exact whole-word/phrase search (query with
+-- to_tsvector('simple', text) @@ plainto_tsquery('simple', 'word') -- the query must match
+-- the indexed expression exactly to use the index); 'simple' rather than 'english' is
+-- deliberate, since stemming would match word forms that weren't actually said. trgm is a
+-- GIN pg_trgm index over the raw text for fuzzy/partial search (ILIKE '%word%', or
+-- similarity via text % 'word') -- useful since YouTube's ASR frequently mishears names/
+-- words. Both are expression/plain-column indexes rather than a stored generated tsvector
+-- column -- measured against a live sample, a stored column would have added ~2.9GB of
+-- heap bloat across the full table for no query-time benefit over just recomputing
+-- to_tsvector(text) at search time. Built CONCURRENTLY against the live table (~5GB, no
+-- separate migration step needed since Get_Subtitles never runs DDL).
+
+
 -- Drop table
 
 -- DROP TABLE public.subtitles;
@@ -35,4 +51,6 @@ CREATE TABLE public.subtitles (
 	CONSTRAINT subtitles_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
 	CONSTRAINT subtitles_video_id_fk FOREIGN KEY (video_id) REFERENCES public.videos(id)
 );
+CREATE INDEX idx_subtitles_text_fts ON public.subtitles USING gin (to_tsvector('simple'::regconfig, text));
+CREATE INDEX idx_subtitles_text_trgm ON public.subtitles USING gin (text gin_trgm_ops);
 CREATE INDEX idx_subtitles_video_id ON public.subtitles USING btree (video_id);

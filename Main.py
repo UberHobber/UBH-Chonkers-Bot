@@ -144,6 +144,12 @@ def process_channel(channel_name:str):
     known_user_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id"))
     LOG.logger.info(f"  {len(known_user_ids):,} known user ID(s) loaded.")
 
+    # Public mode's "emotes" table is shared across every channel (PK is channel_id+id), so it
+    # must be filtered to this channel; members-only mode already uses a per-channel table.
+    emote_filter = {"channel_id":CFG.YT_USER_ID} if CFG.GET_MEMBERS_ONLY is False else None
+    known_emote_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["emotes"],"id",emote_filter))
+    LOG.logger.info(f"  {len(known_emote_ids):,} known emote(s) loaded.")
+
     nickname_entries = DB.GetEntries(db.cursor,CFG.DB_TABLES["nicknames"],"nickname",{"channel_id":CFG.YT_USER_ID})
     sorted_nicknames:list[str] = sorted([e["nickname"] for e in nickname_entries], key=len, reverse=True)
     LOG.logger.info(f"  {len(sorted_nicknames):,} nickname(s) loaded.")
@@ -235,7 +241,7 @@ def process_channel(channel_name:str):
                         raise
 
                 try:
-                    message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,bar_position=_thread_local.bar_position)
+                    message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,known_emote_ids=known_emote_ids,bar_position=_thread_local.bar_position)
                     message_stats.append_all(local_chat_stats)
                     if vid.livestream == False:
                         _mark_processed()

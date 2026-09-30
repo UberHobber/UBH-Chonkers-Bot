@@ -29,7 +29,7 @@ SUBTITLE_LANGUAGES = ["en"]
 # a throttle is observed, and slowly relaxes it back down after a long clean streak -- a
 # flat few-second gap was still drawing HTTP 429s on a large fraction of videos during a
 # real backfill run, so guessing one fixed number up front isn't reliable.
-SUBTITLE_REQUEST_DELAY = 8.0
+SUBTITLE_REQUEST_DELAY = 22.0
 
 # Upper bound the adaptive delay above is allowed to grow to, no matter how much throttling
 # is observed -- a sanity cap so a very strict period slows the run down rather than
@@ -37,6 +37,15 @@ SUBTITLE_REQUEST_DELAY = 8.0
 # still occurring even once the delay had climbed all the way to that ceiling -- anonymous
 # (no-cookies) requests appear to need more room than that to fully clear.
 SUBTITLE_REQUEST_DELAY_CEILING = 180.0
+
+# Fraction of extra random jitter added on top of the adaptive delay before it's handed to
+# yt-dlp's sleep_interval_subtitles/sleep_interval_requests options, e.g. 0.2 turns a 30s
+# delay into a random value in [30s, 36s]. Mirrors yt-dlp's own --sleep-interval/
+# --max-sleep-interval randomized-range behavior (actual sleep is random.uniform(min,max))
+# -- sleep_interval_subtitles/sleep_interval_requests have no such range support built in and
+# would otherwise sleep the exact same number of seconds every single time, which is itself
+# a pattern YouTube's throttling can key off of. 0 to disable.
+SUBTITLE_REQUEST_JITTER = 0.2
 
 # Number of attempts for a subtitle download before giving up -- only retried when the
 # failure looks like YouTube throttling (see _is_throttled in Classes.py), not for

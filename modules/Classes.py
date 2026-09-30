@@ -1,5 +1,5 @@
 # Native Stuff
-import os,json,pickle,requests,re,xxhash,threading,queue,time
+import os,json,pickle,requests,re,xxhash,threading,queue,time,random
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from contextlib import contextmanager
 from typing import Any
@@ -473,8 +473,8 @@ class UserClass:
             self.id = user.get("id") # Back-end ID for user
             self._snippet:dict[str,Any]|None = user.get("snippet")
             if self._snippet is not None:
-                self.name = self._snippet.get("title") # Most current username
-                self.custom_url = self._snippet.get("customUrl") # Custom URL if one was set
+                self.name = _strip_nul(self._snippet.get("title")) # Most current username
+                self.custom_url = _strip_nul(self._snippet.get("customUrl")) # Custom URL if one was set
                 self._created = self._snippet.get("publishedAt") # Date channel was created
                 self.created = _get_date_time(self._created) if self._created is not None else None
                 self.region = self._snippet.get("country")
@@ -882,7 +882,7 @@ class YT_API:
             result[vid_id] = VideoClass(video,video_detail_status)
         return result
 
-    def Get_Messages(self,video:VideoClass,bucket:H3Bucket,known_user_ids:set,sorted_nicknames:list[str],db=None,user_id_lock=None,bar_position:int=1,skip_download=False):
+    def Get_Messages(self,video:VideoClass,bucket:H3Bucket,known_user_ids:set,sorted_nicknames:list[str],db=None,user_id_lock=None,known_emote_ids:set|None=None,bar_position:int=1,skip_download=False):
         """
         Retrieves all chat messages from a given video, saves them to JSON files, and enters them into the database.
 
@@ -926,6 +926,7 @@ class YT_API:
         v = video
         _db = db if db is not None else self.db
         _lock = user_id_lock if user_id_lock is not None else threading.Lock()
+        _emote_ids = known_emote_ids if known_emote_ids is not None else set()
 
         with Stage_Bar("Checking existing messages",bar_position):
             message_object = f"{CFG.MESSAGES_TAG}/{v.id}.json"
@@ -1063,10 +1064,25 @@ class YT_API:
                         #-- EMOTE DATABASE --#
                         #--------------------#
 
-                        # Add Unique Emotes if they don't already exist in DB
+                        # Add Unique Emotes if they don't already exist in DB. Checked against a
+                        # shared known_emote_ids cache (loaded once per channel -- see Main.py)
+                        # instead of relying solely on ON CONFLICT DO NOTHING, since every video's
+                        # worker thread otherwise re-inserts the channel's whole recurring emote
+                        # set on every message: two threads' uncommitted transactions doing that
+                        # concurrently can lock overlapping emote rows in a different relative
+                        # order and deadlock (see the "deadlock detected ... emotes" incident).
+                        # Skipping already-known emotes here removes nearly all of that traffic;
+                        # the lock serializes the rare genuinely-new-emote case so two threads
+                        # can't race to insert the same brand-new emote at once, and
+                        # InsertEntriesRetryOnDeadlock is a backstop for any residual race.
                         if len(msg.e_emote_entries) > 0:
                             emote_conflict = "channel_id,id" if CFG.GET_MEMBERS_ONLY is False else "id"
-                            DB.InsertEntries(_db.cursor,CFG.DB_TABLES["emotes"],msg.e_emote_entries,emote_conflict)
+                            with _lock:
+                                new_emotes = [e for e in msg.e_emote_entries if e["id"] not in _emote_ids]
+                                for e in new_emotes:
+                                    _emote_ids.add(e["id"])
+                                if new_emotes:
+                                    DB.InsertEntriesRetryOnDeadlock(_db.cursor,CFG.DB_TABLES["emotes"],new_emotes,emote_conflict)
 
                         #----------------------#
                         #-- MESSAGE DATABASE --#
@@ -1204,6 +1220,7 @@ class YT_API:
         for lang in CFG.SUBTITLE_LANGUAGES:
             temp_dir = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}"
             current_delay = rate_limiter.current if rate_limiter is not None else CFG.SUBTITLE_REQUEST_DELAY
+            jitter_ceiling = current_delay * (1 + CFG.SUBTITLE_REQUEST_JITTER)
             ydl_opts:dict[str,Any] = {
                 "writeautomaticsub": True,
                 "subtitleslangs": [lang],
@@ -1214,8 +1231,8 @@ class YT_API:
                 "noprogress": True,
                 "logger": _YtdlpSilentLogger(),
                 "outtmpl": f"{temp_dir}/%(id)s_TEMP.%(ext)s",
-                "sleep_interval_subtitles": current_delay,
-                "sleep_interval_requests": current_delay,
+                "sleep_interval_subtitles": random.uniform(current_delay,jitter_ceiling),
+                "sleep_interval_requests": random.uniform(current_delay,jitter_ceiling),
                 "extractor_retries": CFG.SUBTITLE_MAX_ATTEMPTS,
                 "cookiefile": CFG.COOKIES,
                 "impersonate": _SUBTITLE_IMPERSONATE_TARGET,
@@ -1395,6 +1412,14 @@ class YT_API:
 ########################
 ### HELPER FUNCTIONS ###
 ########################
+
+def _strip_nul(value:str|None) -> str|None:
+    """Postgres text columns can't store NUL (0x00) bytes -- psycopg2 raises ValueError on them.
+    Some YouTube channel names/custom URLs contain literal NULs (seen in troll/spam accounts), so
+    strip them before the value ever reaches a query."""
+    if value is None:
+        return None
+    return value.replace("\x00","")
 
 def _get_date_time(timestamp:str):
     """Some timestamp strings in the API include fractions of a second."""

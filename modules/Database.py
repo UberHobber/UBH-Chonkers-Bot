@@ -75,6 +75,45 @@ def InsertEntries(cursor:psycopg2.extensions.cursor,table:str,data_list:list[dic
         LOG.logger.error(f'Query: {query} ({type(query)})\nValues: {values} ({type(values)})\n')
         raise e
 
+def InsertEntriesRetryOnDeadlock(cursor:psycopg2.extensions.cursor,table:str,data_list:list[dict[str,Any]],conflict:str|None=None,max_attempts:int=5) -> None:
+    """
+    Same as InsertEntries, but retries on a deadlock instead of aborting the caller's whole
+    transaction. Use this for tables where independent worker threads can race to insert
+    overlapping keys within the same uncommitted transaction window -- e.g. emotes, which is
+    shared across every video/worker of a channel (see the "deadlock detected ... emotes"
+    incident this covers: two workers' batches each inserted the same handful of emotes for
+    the channel in a different relative order, so their still-uncommitted transactions ended
+    up wanting each other's row locks in opposite order). A savepoint scopes any rollback to
+    just this insert instead of the whole transaction; retrying is safe since ON CONFLICT DO
+    NOTHING makes the insert idempotent.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param table: Target table
+    :type table: String
+    :param data_list: A list of entries to input into the target table.
+    :type data_list: List of Dictionaries
+    :param conflict: A column name that is either a Primary Key, or contains a Unique Constraint
+    :type conflict: String
+    :param max_attempts: Number of times to retry after a deadlock before giving up.
+    :type max_attempts: Integer
+    """
+    if len(data_list) == 0:
+        return
+
+    for attempt in range(1,max_attempts + 1):
+        cursor.execute("SAVEPOINT insert_entries_sp")
+        try:
+            InsertEntries(cursor,table,data_list,conflict)
+            cursor.execute("RELEASE SAVEPOINT insert_entries_sp")
+            return
+        except psycopg2.errors.DeadlockDetected:
+            cursor.execute("ROLLBACK TO SAVEPOINT insert_entries_sp")
+            if attempt == max_attempts:
+                raise
+            LOG.logger.warning(f'InsertEntries deadlock on table {table} ({len(data_list)} row(s)), retrying (attempt {attempt}/{max_attempts})...')
+            time.sleep(random.uniform(0.05,0.25) * attempt)
+
 def UpdateEntry(cursor:psycopg2.extensions.cursor,table:str,data_column:str,data_value:Any,filter_column:str,filter_value:Any):
     """
     Updates an entry with a new value for a single column.
