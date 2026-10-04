@@ -48,14 +48,19 @@ Later files have foreign keys pointing at tables created by earlier ones:
     and `user_channel_activity` (both step 10), `user_channel_superchats` (step 12), and
     `user_global_message_rankings` (step 13) into one row per user. Refreshed once per bot run,
     after `user_global_message_rankings` (see `refresh_user_summary()`, defined here).
+15. `refresh_state.sql` — no FKs; bookkeeping that lets the end-of-run rebuilds in steps 10,
+    13, and 14 skip themselves when their source tables haven't changed (see
+    `modules.Database.RefreshRollupsIfChanged`).
+16. `channel_video_summary.sql` — a plain view over `channel_directory` (step 1) and `videos`
+    (step 3): per-channel video counts and hours, split public vs. members-only.
 
 **Members-only files** (only needed/run if you're tracking members-only content — see below):
 
-15. `emotes_members.sql`
-16. `messages_members.sql` — must come before `nicknames_members.sql`: its
+17. `emotes_members.sql`
+18. `messages_members.sql` — must come before `nicknames_members.sql`: its
     `nickname_matches_<talent>_members` tables FK to `messages_<talent>_members(message_id)`.
-17. `nicknames_members.sql`
-18. `subtitles_members.sql`
+19. `nicknames_members.sql`
+20. `subtitles_members.sql`
 
 After creating the `channel_directory` row(s) for whichever channels you're tracking, also
 create their `messages_<db_suffix>` partition of `public.messages` — see

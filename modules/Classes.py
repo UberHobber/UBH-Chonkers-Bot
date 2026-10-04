@@ -1246,7 +1246,7 @@ class YT_API:
                         sub_bar.set_description_str(f"Subtitles ({lang}): rate-limit wait (~{rate_limiter.current:.1f}s)")
                         rate_limiter.wait()
                     try:
-                        sub_bar.set_description_str(f"Subtitles ({lang}): downloading")
+                        sub_bar.set_description_str(f"Subtitles ({lang}): downloading (delay ~{current_delay:.1f}s)")
                         ydl = yt_dlp.YoutubeDL(ydl_opts) #type:ignore
                         ydl.extract_info(url,download=True)
                         if rate_limiter is not None and attempt == 1:

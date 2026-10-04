@@ -11,6 +11,14 @@
 -- throttled/failed subtitle attempt was never retried once 'processed' went true. Backfilled
 -- once via backfill_subtitles_processed.py for videos that already had subtitle rows before
 -- this column existed.
+--
+-- subtitles_fail_count counts separate runs (not in-run retries) where this video's
+-- subtitle download exhausted every attempt throttled (see RecordSubtitleThrottle in
+-- Database.py, called from Subtitles.py). Once it reaches CFG.SUBTITLE_GIVEUP_AFTER_RUNS,
+-- subtitles_processed is forced true so the video stops being retried forever -- some
+-- videos (seen on a YouTube Short) get a real, consistent 429 from YouTube's caption
+-- endpoint no matter how the request is paced, which is not something retrying within a
+-- run can ever get past.
 
 -- Drop table
 
@@ -30,6 +38,7 @@ CREATE TABLE public.videos (
 	members bool DEFAULT false NOT NULL,
 	channel_id text NOT NULL,
 	subtitles_processed bool DEFAULT false NOT NULL,
+	subtitles_fail_count int4 DEFAULT 0 NOT NULL,
 	CONSTRAINT pk_videos_id PRIMARY KEY (id),
 	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id)
 );

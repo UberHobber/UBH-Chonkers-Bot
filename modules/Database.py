@@ -356,6 +356,86 @@ def RefreshUserSummary(cursor:psycopg2.extensions.cursor) -> None:
 
     cursor.execute(query)
 
+# (refresh_state.refresh_name, log label, rebuild function, source tables it reads). Order
+# matters: user_summary reads user_global_message_rankings, so rankings must be rebuilt first.
+# The matview isn't listed as a source for user_summary -- it only changes when
+# user_channel_activity does, which user_summary already watches.
+_ROLLUP_REFRESHES = [
+    ("first_message_counts","First Message Counts",RefreshFirstMessageCounts,
+        ["user_first_message","user_channel_activity"]),
+    ("user_message_rankings","Message Rankings",RefreshUserMessageRankings,
+        ["user_channel_activity"]),
+    ("user_summary","User Summary",RefreshUserSummary,
+        ["user_ids","user_first_message","user_channel_activity","user_channel_superchats"]),
+]
+
+def GetTableChangeCount(cursor:psycopg2.extensions.cursor,tables:list[str]) -> int:
+    """
+    Sums Postgres' cumulative insert/update/delete counters (pg_stat_user_tables) across the
+    given public tables. Only meaningful compared against an earlier reading -- see
+    RefreshRollupsIfChanged.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param tables: Table names in the public schema.
+    :type tables: list[str]
+    :return: Summed n_tup_ins + n_tup_upd + n_tup_del.
+    :rtype: Integer
+    """
+    # Stats are cached per transaction once read -- clear so this sees other connections'
+    # latest flushed counters, not a reading from earlier in the same transaction.
+    cursor.execute('SELECT pg_stat_clear_snapshot()')
+    query = 'SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del),0) FROM pg_stat_user_tables WHERE schemaname = %s AND relname = ANY(%s)'
+    values = ('public',tables)
+
+    if CFG.DB_VERBOSE == True:
+        LOG.logger.info(query)
+        LOG.logger.info(values)
+
+    cursor.execute(query,values)
+    return int(cursor.fetchone()[0])
+
+def RefreshRollupsIfChanged(cursor:psycopg2.extensions.cursor) -> None:
+    """
+    Runs the once-per-run rebuilds (RefreshFirstMessageCounts, RefreshUserMessageRankings,
+    RefreshUserSummary) only when one of their source tables has been written to since that
+    rebuild last ran, committing after each. Call once at the end of a full run (see the bottom
+    of Main.py).
+
+    Change detection compares GetTableChangeCount over each rebuild's source tables against the
+    value stored in refresh_state at its last successful rebuild. This works across runs and
+    processes -- writes from a run that died before reaching this step, or from backfill
+    scripts/manual SQL, are still caught next time -- and adds nothing to the ingestion write
+    path (no triggers on the hot rollup tables, which have a deadlock history).
+
+    The counter snapshot is taken BEFORE each rebuild, so anything written while it runs shows
+    up as a difference next run rather than being silently absorbed. Counters can over-report
+    (e.g. an UPDATE that rewrote identical values) -- that only costs an unneeded rebuild, never
+    a stale one. A stats reset (Postgres crash, pg_stat_reset()) lowers the sum, which also
+    counts as a difference. Delete a refresh_state row to force that rebuild on the next run.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    """
+    for name,label,refresh,tables in _ROLLUP_REFRESHES:
+        current = GetTableChangeCount(cursor,tables)
+        cursor.execute('SELECT change_count,refreshed_at FROM refresh_state WHERE refresh_name = %s',(name,))
+        row = cursor.fetchone()
+
+        if row is not None and row[0] == current:
+            LOG.logger.info(f"Skipping {label} rebuild -- no changes since it last ran ({row[1]:%Y-%m-%d %H:%M:%S}).")
+            cursor.connection.commit()
+            continue
+
+        LOG.logger.info(f"Rebuilding {label}...")
+        refresh(cursor)
+        cursor.execute(
+            'INSERT INTO refresh_state (refresh_name,change_count,refreshed_at) VALUES (%s,%s,now()) '
+            'ON CONFLICT (refresh_name) DO UPDATE SET change_count = EXCLUDED.change_count, refreshed_at = EXCLUDED.refreshed_at',
+            (name,current)
+        )
+        cursor.connection.commit()
+
 def DeleteEntries(cursor:psycopg2.extensions.cursor,table:str,filter:dict[str,Any]|None=None) -> None:
     """
     Deletes an entry in the target table matching a given filter. Deletes ALL entries if no filter given.
@@ -466,6 +546,8 @@ _CORE_SQL_FILES = [
     ("user_channel_superchats","user_channel_superchats"),
     ("user_global_message_rankings","user_message_rankings"),
     ("user_summary","user_summary"),
+    ("refresh_state","refresh_state"),
+    ("channel_video_summary","channel_video_summary"),
 ]
 _MEMBERS_SQL_FILES = [
     ("emotes_members","emotes_calli_members"),
@@ -617,3 +699,28 @@ def GetVideosNeedingSubtitles(cursor:psycopg2.extensions.cursor,videos_table:str
     cursor.execute(query,(channel_id,members))
     columns = [d[0] for d in cursor.description]
     return [dict(zip(columns,row)) for row in cursor.fetchall()]
+
+def RecordSubtitleThrottle(cursor:psycopg2.extensions.cursor,videos_table:str,video_id:str,give_up_after:int) -> bool:
+    """
+    Increments videos.subtitles_fail_count for a video whose subtitle download exhausted every
+    retry this run with throttling (see SubtitleThrottled in Classes.py). Once give_up_after
+    separate runs have each ended in a throttle for this video, flips subtitles_processed to
+    true so it stops being re-queued forever -- some videos get a real, consistent 429 from
+    YouTube's caption endpoint no matter how the request is paced (seen on a YouTube Short),
+    which no amount of retrying within a run will ever get past.
+
+    :param cursor: Database cursor object to execute commands.
+    :param videos_table: CFG.DB_TABLES["videos"].
+    :param video_id: ID of the video that was just throttled.
+    :param give_up_after: CFG.SUBTITLE_GIVEUP_AFTER_RUNS.
+    :return: True if this call tipped the video over the threshold and gave up on it permanently.
+    """
+    query = f'UPDATE {videos_table} SET subtitles_fail_count = subtitles_fail_count + 1 WHERE id = %s RETURNING subtitles_fail_count'
+    if CFG.DB_VERBOSE == True:
+        LOG.logger.info(query)
+    cursor.execute(query,(video_id,))
+    fail_count = cursor.fetchone()[0]
+    gave_up = fail_count >= give_up_after
+    if gave_up:
+        cursor.execute(f'UPDATE {videos_table} SET subtitles_processed = true WHERE id = %s',(video_id,))
+    return gave_up

@@ -17,7 +17,7 @@ USE_COOKIES = False
 REQUEST_DELAY = 2.0
 
 # Just process video/chat data and skip fetching auto-generated subtitles.
-SKIP_SUBTITLE_DOWNLOAD = False
+SKIP_SUBTITLE_DOWNLOAD = True
 
 # Language codes to request auto-generated subtitles for (yt-dlp subtitleslangs).
 SUBTITLE_LANGUAGES = ["en"]
@@ -50,7 +50,7 @@ SUBTITLE_REQUEST_JITTER = 0.2
 # Number of attempts for a subtitle download before giving up -- only retried when the
 # failure looks like YouTube throttling (see _is_throttled in Classes.py), not for
 # videos that simply have no auto-captions.
-SUBTITLE_MAX_ATTEMPTS = 3
+SUBTITLE_MAX_ATTEMPTS = 5
 
 # Base for the exponential backoff between throttled subtitle download retries
 # (wait = SUBTITLE_BACKOFF_BASE ** attempt).
@@ -60,9 +60,17 @@ SUBTITLE_BACKOFF_BASE = 5
 # subtitles for the rest of that run, so a blocked IP doesn't get hammered further.
 SUBTITLE_CIRCUIT_BREAKER_THRESHOLD = 3
 
+# Separate throttle-exhausted *runs* (not retries within one run) a single video can rack up
+# before it's given up on permanently (videos.subtitles_processed is forced true). Some videos
+# (seen on a YouTube Short) get a real, consistent 429 from YouTube's caption endpoint on every
+# attempt regardless of pacing/backoff -- not a transient rate limit at all, just a dead end for
+# that one video -- so without this they'd be retried, and burn through SUBTITLE_MAX_ATTEMPTS'
+# worth of backoff, forever.
+SUBTITLE_GIVEUP_AFTER_RUNS = 3
+
 # Number of videos to process in parallel. 2 is the safe default — going above 3
 # risks hitting YouTube's rate limits and getting temporarily blocked.
-WORKER_COUNT = 2
+WORKER_COUNT = 6
 
 # Number of users to process in parallel WITHIN each batch of 50. This only parallelizes
 # file I/O (PFP downloads, S3 uploads) — the YouTube API call stays one-per-batch and
@@ -116,7 +124,7 @@ if QUICK_SETTINGS is True:
     # Set this if you want to write to a member's only database.
     GET_MEMBERS_ONLY = False
     # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
-    SKIP_CHAT_DOWNLOAD = False
+    SKIP_CHAT_DOWNLOAD = True
     # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
     TIMEOUT = True
     # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)

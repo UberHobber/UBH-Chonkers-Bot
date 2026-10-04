@@ -141,18 +141,29 @@ def process_channel(channel_name:str):
     video_db_status = {r["id"]: r["processed"] for r in all_video_records}
     LOG.logger.info(f"  {len(video_db_status):,} video record(s) loaded from database.")
 
-    known_user_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id"))
-    LOG.logger.info(f"  {len(known_user_ids):,} known user ID(s) loaded.")
+    # known_user_ids/known_emote_ids/sorted_nicknames are only ever consumed by Get_Messages()
+    # below, which never runs when CFG.SKIP_CHAT_DOWNLOAD is set -- skip loading them in that
+    # mode. This matters because members-only mode's emotes/nicknames tables are per-channel and
+    # only get created by hand once a channel's chat has actually been downloaded (see
+    # sql/README.md); a members-only channel being processed purely for video metadata (chat
+    # download skipped) may never have had that table created at all.
+    if CFG.SKIP_CHAT_DOWNLOAD:
+        known_user_ids:set = set()
+        known_emote_ids:set = set()
+        sorted_nicknames:list[str] = []
+    else:
+        known_user_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id"))
+        LOG.logger.info(f"  {len(known_user_ids):,} known user ID(s) loaded.")
 
-    # Public mode's "emotes" table is shared across every channel (PK is channel_id+id), so it
-    # must be filtered to this channel; members-only mode already uses a per-channel table.
-    emote_filter = {"channel_id":CFG.YT_USER_ID} if CFG.GET_MEMBERS_ONLY is False else None
-    known_emote_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["emotes"],"id",emote_filter))
-    LOG.logger.info(f"  {len(known_emote_ids):,} known emote(s) loaded.")
+        # Public mode's "emotes" table is shared across every channel (PK is channel_id+id), so it
+        # must be filtered to this channel; members-only mode already uses a per-channel table.
+        emote_filter = {"channel_id":CFG.YT_USER_ID} if CFG.GET_MEMBERS_ONLY is False else None
+        known_emote_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["emotes"],"id",emote_filter))
+        LOG.logger.info(f"  {len(known_emote_ids):,} known emote(s) loaded.")
 
-    nickname_entries = DB.GetEntries(db.cursor,CFG.DB_TABLES["nicknames"],"nickname",{"channel_id":CFG.YT_USER_ID})
-    sorted_nicknames:list[str] = sorted([e["nickname"] for e in nickname_entries], key=len, reverse=True)
-    LOG.logger.info(f"  {len(sorted_nicknames):,} nickname(s) loaded.")
+        nickname_entries = DB.GetEntries(db.cursor,CFG.DB_TABLES["nicknames"],"nickname",{"channel_id":CFG.YT_USER_ID})
+        sorted_nicknames:list[str] = sorted([e["nickname"] for e in nickname_entries], key=len, reverse=True)
+        LOG.logger.info(f"  {len(sorted_nicknames):,} nickname(s) loaded.")
 
     unprocessed_ids = [vid_id for vid_id in video_ids if video_db_status.get(vid_id) is not True]
     LOG.logger.info(f"  {len(unprocessed_ids):,} unprocessed video(s) to fetch.")
@@ -327,13 +338,20 @@ def process_channel(channel_name:str):
     ### USER PROCESSING ###
     #######################
 
-    LOG.logger.info("Obtaining all unprocessed users from database...")
-    # Get fresh users from the DB
-    unique_users = DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id",{"processed":False})
-    LOG.logger.info(f"Total of {len(unique_users):,} unique user(s) aquired.")
+    # Unprocessed users only ever come from Get_Messages(), which doesn't run when
+    # CFG.SKIP_CHAT_DOWNLOAD is set. Any stragglers left over from an earlier interrupted run are
+    # picked up by the next run that does download chat (the query isn't channel-scoped).
+    if CFG.SKIP_CHAT_DOWNLOAD:
+        user_list:list[str] = []
+        LOG.logger.info("Skipping user processing (chat download skipped).")
+    else:
+        LOG.logger.info("Obtaining all unprocessed users from database...")
+        # Get fresh users from the DB
+        unique_users = DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id",{"processed":False})
+        LOG.logger.info(f"Total of {len(unique_users):,} unique user(s) aquired.")
 
-    # List of IDs
-    user_list = [str(v) for d in unique_users for v in d.values()]
+        # List of IDs
+        user_list = [str(v) for d in unique_users for v in d.values()]
 
     if len(user_list) > 0:
 
@@ -386,24 +404,11 @@ for channel_name in CFG.CHANNELS_TO_PROCESS:
         db.database.commit()
     process_channel(channel_name)
 
-# Recompute first_messages/first_channel_messages once per run -- see RefreshFirstMessageCounts
-# docstring for why these can't be maintained incrementally anymore.
-LOG.logger.info("Rebuilding First Message Counts...")
-DB.RefreshFirstMessageCounts(db.cursor)
-db.database.commit()
-
-# Refresh message-count leaderboard ranks once per run (not per channel/video/message -- see
-# RefreshUserMessageRankings docstring for why ranks can't be maintained incrementally).
-LOG.logger.info("Rebuilding Message Rankings...")
-DB.RefreshUserMessageRankings(db.cursor)
-db.database.commit()
-
-# Refresh the per-user summary once per run, after message rankings -- it reads from
-# user_global_message_rankings, so it must be refreshed after that matview is current. See
-# RefreshUserSummary docstring for why this is a materialized view rather than a plain one.
-LOG.logger.info("Rebuilding User Summary...")
-DB.RefreshUserSummary(db.cursor)
-db.database.commit()
+# Recompute first_messages/first_channel_messages, the message-count leaderboard ranks, and the
+# per-user summary once per run (none can be maintained incrementally -- see each Refresh*
+# docstring), skipping any whose source tables haven't changed since they last ran. See
+# RefreshRollupsIfChanged for how changes are detected.
+DB.RefreshRollupsIfChanged(db.cursor)
 
 # Subtitle downloading runs as its own pass, after every channel's chat/video processing is
 # done, rather than inline per-video -- see Subtitles.py module docstring for why (subtitle
