@@ -548,6 +548,7 @@ _CORE_SQL_FILES = [
     ("user_summary","user_summary"),
     ("refresh_state","refresh_state"),
     ("channel_video_summary","channel_video_summary"),
+    ("processed_status","processed_status"),
 ]
 _MEMBERS_SQL_FILES = [
     ("emotes_members","emotes_calli_members"),
@@ -592,7 +593,7 @@ def EnsureSchema(cursor:psycopg2.extensions.cursor,members_only:bool) -> None:
             LOG.logger.error(f'Failed to build database structure from sql/{file_name}.sql: {e}')
             raise e
 
-def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:str,group:str,branch:str,active:bool,debut:str,process:bool) -> None:
+def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:str,group:str,branch:str,active:bool,debut:str,process:bool,channel_type:str='talent') -> None:
     """
     Registers a new channel: adds its row to channel_directory and creates its
     messages_<db_suffix> partition of the partitioned messages table. Caller is
@@ -609,7 +610,7 @@ def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:
     :type db_suffix: String
     :param group: Talent group/agency the channel belongs to.
     :type group: String
-    :param branch: Talent's branch/sub-agency.
+    :param branch: Talent's branch/sub-agency. Must already exist in the branches table.
     :type branch: String
     :param active: Whether the channel is currently active.
     :type active: Boolean
@@ -617,10 +618,12 @@ def AddChannel(cursor:psycopg2.extensions.cursor,name:str,user_id:str,db_suffix:
     :type debut: String
     :param process: Whether this channel should be included when CFG.PROCESS_ALL is True.
     :type process: Boolean
+    :param channel_type: 'talent' for a talent's own channel, 'official' for a branch or unit channel.
+    :type channel_type: String
     """
     try:
-        insert_query = 'INSERT INTO channel_directory (name, user_id, db_suffix, "group", branch, active, debut, process) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)'
-        insert_values = (name,user_id,db_suffix,group,branch,active,debut,process)
+        insert_query = 'INSERT INTO channel_directory (name, user_id, db_suffix, "group", branch, active, debut, process, channel_type) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)'
+        insert_values = (name,user_id,db_suffix,group,branch,active,debut,process,channel_type)
 
         if CFG.DB_VERBOSE == True:
             LOG.logger.info(insert_query)

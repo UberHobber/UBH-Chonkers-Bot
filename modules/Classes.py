@@ -8,6 +8,7 @@ from datetime import datetime
 # Installed Stuff
 from tqdm import tqdm
 from chat_downloader import ChatDownloader
+from chat_downloader.sites.youtube import YouTubeChatDownloader
 import yt_dlp
 from yt_dlp.utils import DownloadError
 from yt_dlp.networking.impersonate import ImpersonateTarget
@@ -19,6 +20,12 @@ from yt_dlp.networking.impersonate import ImpersonateTarget
 # like automated traffic to YouTube's abuse detection, independent of how well-paced the
 # requests are.
 _SUBTITLE_IMPERSONATE_TARGET = ImpersonateTarget()
+
+# Videos behind YouTube's "may be inappropriate for some users" interstitial report a
+# CONTENT_CHECK_REQUIRED playability status, which chat_downloader doesn't recognise and raises
+# as VideoUnavailable. bpctr/has_verified are the same params yt-dlp sends to say the warning was
+# already accepted -- the watch page then comes back OK with the chat intact.
+YouTubeChatDownloader._YT_VIDEO_TEMPLATE = YouTubeChatDownloader._YT_HOME + '/watch?v={}&bpctr=9999999999&has_verified=1'
 
 # Google Stuff
 import google.auth
@@ -111,6 +118,9 @@ class H3Client():
                 bucket_list.append(bucket_name)
         return bucket_list
 
+class BucketUnavailableError(Exception):
+    """Raised when a bucket doesn't exist and can't be created (e.g. the name is rejected by S3)."""
+
 class H3Bucket:
     def __init__(self,client:S3Client,bucket_name:str,local_dir:str) -> None:
         self.name = bucket_name
@@ -127,7 +137,7 @@ class H3Bucket:
                     LOG.logger.info(f"Bucket {self.name} created.")
                 except ClientError as create_error:
                     LOG.logger.error(f"Error creating bucket {self.name}:\n{create_error}")
-                    raise
+                    raise BucketUnavailableError(self.name) from create_error
             elif error_code == '403':
                 LOG.logger.error(f"No permission to access bucket {self.name}!")
             else:
@@ -291,6 +301,7 @@ class VideoClass:
 
                     self.thumbnail:str|None = self._thumbnail.get("url") if self._thumbnail is not None else None
 
+            self.video_type,self.content_duration = Classify_Video(video)
 
             self.entry:dict[str,Any] = {
                 "id":self.id,
@@ -302,7 +313,9 @@ class VideoClass:
                 "start_time":self.actual_start,
                 "end_time":self.actual_end,
                 "members":self.members,
-                "channel_id":CFG.YT_USER_ID
+                "channel_id":CFG.YT_USER_ID,
+                "video_type":self.video_type,
+                "content_duration":self.content_duration
             }
         except Exception as e:
             LOG.logger.error(f"Video file {self.id} not initialized:\n{e}")
@@ -1437,6 +1450,70 @@ def _get_date_time(timestamp:str):
     else:
         formatted_string = f"{base}.000000"
     return datetime.strptime(formatted_string, "%Y-%m-%dT%H:%M:%S.%f")
+
+_ISO_DURATION_PATTERN = re.compile(r'^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$')
+
+def _parse_iso_duration(value:str|None) -> int|None:
+    """
+    contentDetails.duration (ISO 8601, e.g. "PT1H2M3S", "P1DT2H") -> whole seconds. YouTube reports
+    "P0D" for a livestream that's upcoming or still live, which is returned as None rather than 0 --
+    the real length isn't known yet, and 0 would silently drag down any averages/sums over it.
+    """
+    if not value:
+        return None
+    match = _ISO_DURATION_PATTERN.match(value)
+    if not match:
+        LOG.logger.warning(f"Unrecognized ISO 8601 duration: {value}")
+        return None
+    days,hours,minutes,seconds = (int(g) if g else 0 for g in match.groups())
+    total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    return total if total > 0 else None
+
+def _check_is_short(video_id:str) -> bool|None:
+    """
+    The Data API has no "is this a Short" flag, so this asks youtube.com directly:
+    /shorts/{id} answers 200 for a Short, and redirects (303) to /watch?v={id} for anything else.
+    Returns None when the answer is inconclusive (network error, consent-page redirect, removed
+    video, etc.) so callers can leave video_type unset and retry later instead of guessing.
+    """
+    try:
+        response = requests.head(f"https://www.youtube.com/shorts/{video_id}",allow_redirects=False,timeout=10)
+    except requests.RequestException as e:
+        LOG.logger.warning(f"{video_id}: Shorts check failed: {e}")
+        return None
+    if response.status_code == 200:
+        return True
+    if response.is_redirect and "/watch" in response.headers.get("Location",""):
+        return False
+    LOG.logger.warning(f"{video_id}: Shorts check inconclusive (HTTP {response.status_code}, Location: {response.headers.get('Location')})")
+    return None
+
+def Classify_Video(video:dict[str,Any]) -> tuple[str|None,int|None]:
+    """
+    Works out a video's videos.video_type and videos.content_duration from its raw videos().list
+    item (needs the contentDetails, snippet and liveStreamingDetails parts). Shared by VideoClass
+    and backfill_video_types.py so both classify identically.
+
+    video_type is one of:
+        'stream' -- has liveStreamingDetails (a livestream, upcoming/live/archived). Premieres
+                    also carry liveStreamingDetails and are deliberately counted as streams --
+                    they can only be told apart while upcoming/live, which would need much
+                    more frequent polling of new uploads than this bot does.
+        'short'/'upload' -- no liveStreamingDetails, split by _check_is_short()
+        None     -- not a stream, and the Shorts check was inconclusive
+
+    :return: (video_type, content_duration in seconds or None)
+    """
+    content_details:dict[str,Any] = video.get("contentDetails") or {}
+    content_duration = _parse_iso_duration(content_details.get("duration"))
+
+    if video.get("liveStreamingDetails") is not None:
+        return "stream",content_duration
+
+    is_short = _check_is_short(video["id"])
+    if is_short is None:
+        return None,content_duration
+    return ("short" if is_short else "upload"),content_duration
 
 def _check_and_upload_file(bucket:H3Bucket,temp_path:str,file_name:str,file_extension:str,file_tag:str|None=None):
 

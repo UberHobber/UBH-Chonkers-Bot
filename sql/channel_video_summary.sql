@@ -6,10 +6,13 @@
 -- public.channel_video_summary definition
 
 -- One row per channel_directory entry (LEFT JOIN, so channels with no videos yet show 0s),
--- with video counts and summed duration split by public vs. members-only (videos.members).
--- Durations are hours rounded to the nearest whole hour (videos.duration is seconds).
--- Videos with a NULL duration (still live/upcoming, or missing start/end times) count toward
--- the video totals but add nothing to the hour totals. A plain view rather than a
+-- with video counts and summed duration split by public vs. members-only (videos.members),
+-- and public videos further split by videos.video_type (public_unclassified = video_type
+-- still NULL). Durations are hours rounded to the nearest whole hour. Streams use
+-- videos.duration (actual live time), uploads/Shorts use videos.content_duration (file
+-- length), each falling back to the other
+-- when NULL. Videos with neither (still upcoming/live) count toward the video totals but add
+-- nothing to the hour totals. A plain view rather than a
 -- materialized one -- it only aggregates public.videos (tens of thousands of rows), which is
 -- cheap enough to compute live on every query.
 
@@ -19,9 +22,24 @@ SELECT cd.name AS channel_name,
     count(v.id) AS total_videos,
     count(v.id) FILTER (WHERE (NOT v.members)) AS public_videos,
     count(v.id) FILTER (WHERE v.members) AS members_videos,
-    (round((COALESCE(sum(v.duration), (0)::numeric) / 3600.0)))::bigint AS total_hours,
-    (round((COALESCE(sum(v.duration) FILTER (WHERE (NOT v.members)), (0)::numeric) / 3600.0)))::bigint AS public_hours,
-    (round((COALESCE(sum(v.duration) FILTER (WHERE v.members), (0)::numeric) / 3600.0)))::bigint AS members_hours
+    count(v.id) FILTER (WHERE ((NOT v.members) AND (v.video_type = 'stream'::text))) AS public_streams,
+    count(v.id) FILTER (WHERE ((NOT v.members) AND (v.video_type = 'upload'::text))) AS public_uploads,
+    count(v.id) FILTER (WHERE ((NOT v.members) AND (v.video_type = 'short'::text))) AS public_shorts,
+    count(v.id) FILTER (WHERE ((NOT v.members) AND (v.video_type IS NULL))) AS public_unclassified,
+    (round((COALESCE(sum(v.seconds), (0)::numeric) / 3600.0)))::bigint AS total_hours,
+    (round((COALESCE(sum(v.seconds) FILTER (WHERE (NOT v.members)), (0)::numeric) / 3600.0)))::bigint AS public_hours,
+    (round((COALESCE(sum(v.seconds) FILTER (WHERE v.members), (0)::numeric) / 3600.0)))::bigint AS members_hours,
+    (round((COALESCE(sum(v.seconds) FILTER (WHERE ((NOT v.members) AND (v.video_type = 'stream'::text))), (0)::numeric) / 3600.0)))::bigint AS public_stream_hours,
+    (round((COALESCE(sum(v.seconds) FILTER (WHERE ((NOT v.members) AND (v.video_type = ANY (ARRAY['upload'::text, 'short'::text])))), (0)::numeric) / 3600.0)))::bigint AS public_video_hours
    FROM (channel_directory cd
-     LEFT JOIN videos v ON ((v.channel_id = cd.user_id)))
+     LEFT JOIN ( SELECT videos.id,
+            videos.channel_id,
+            videos.members,
+            videos.video_type,
+            COALESCE(
+                CASE
+                    WHEN (videos.video_type = 'stream'::text) THEN videos.duration
+                    ELSE NULL::bigint
+                END, videos.content_duration, videos.duration) AS seconds
+           FROM videos) v ON ((v.channel_id = cd.user_id)))
   GROUP BY cd.name, cd.user_id;

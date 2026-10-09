@@ -19,6 +19,26 @@
 -- videos (seen on a YouTube Short) get a real, consistent 429 from YouTube's caption
 -- endpoint no matter how the request is paced, which is not something retrying within a
 -- run can ever get past.
+--
+-- video_type is 'stream', 'upload' or 'short' -- set by Classify_Video in
+-- modules/Classes.py. Use it rather than livestream (which clears once YouTube finishes
+-- processing a stream). 'stream' = has liveStreamingDetails, which deliberately includes
+-- Premieres -- they can only be told apart from streams while upcoming/live, which would
+-- need far more frequent polling of new uploads than this bot does. Shorts come from
+-- asking youtube.com/shorts/{id} directly (200 = Short, redirect to /watch = not), since
+-- the Data API has no Shorts flag. NULL = not yet classified (Shorts check inconclusive)
+-- -- Main.py never overwrites a known type with NULL; re-run backfill_video_types.py to
+-- retry those.
+--
+-- content_duration is contentDetails.duration in seconds -- the length of the video file
+-- itself. Unlike duration (end_time - start_time, only ever set for livestreams), it's
+-- known for uploads and Shorts too. NULL while a stream is upcoming/live (API reports P0D).
+--
+-- login_required is set by Main.py when chat_downloader raises LoginRequired (YouTube's
+-- LOGIN_REQUIRED playability status: age-restricted, members-only or private videos).
+-- The video is left unprocessed, but runs without cookies (CFG.COOKIES is None) skip it
+-- before fetching details, so it's only retried on a run that might succeed. Cleared
+-- again once the video is processed.
 
 -- Drop table
 
@@ -39,8 +59,12 @@ CREATE TABLE public.videos (
 	channel_id text NOT NULL,
 	subtitles_processed bool DEFAULT false NOT NULL,
 	subtitles_fail_count int4 DEFAULT 0 NOT NULL,
+	video_type text NULL,
+	content_duration int8 NULL,
+	login_required bool DEFAULT false NOT NULL,
 	CONSTRAINT pk_videos_id PRIMARY KEY (id),
-	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id)
+	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
+	CONSTRAINT videos_video_type_check CHECK ((video_type = ANY (ARRAY['stream'::text, 'upload'::text, 'short'::text])))
 );
 CREATE INDEX idx_videos_duration ON public.videos USING btree (duration);
 CREATE INDEX idx_videos_end_time ON public.videos USING btree (end_time);

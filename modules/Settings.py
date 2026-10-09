@@ -11,6 +11,7 @@ from psycopg2.extensions import cursor
 PROCESS_ALL = True
 CHANNEL_SELECTION = "Kiara"
 USE_COOKIES = False
+SKIP_ROLLUPS = False
 
 # Seconds to wait between starting each chat download. The rate limiter enforces this
 # gap even across concurrent workers so YouTube isn't hit simultaneously. 0 to disable.
@@ -124,7 +125,7 @@ if QUICK_SETTINGS is True:
     # Set this if you want to write to a member's only database.
     GET_MEMBERS_ONLY = False
     # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
-    SKIP_CHAT_DOWNLOAD = True
+    SKIP_CHAT_DOWNLOAD = False
     # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
     TIMEOUT = True
     # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
@@ -195,7 +196,15 @@ def load_channel_directory(cursor:cursor) -> None:
     """
     global CHANNEL_DIRECTORY,CHANNELS_TO_PROCESS
 
-    cursor.execute('SELECT name, user_id, db_suffix, "group", process FROM channel_directory')
+    # Processing order: by branch (branches.sort_order), talents before that branch's official
+    # channels, then oldest debut first. name is a final tiebreak so same-day debuts stay stable.
+    # Mirrored by the processed_status view's processing_order -- keep the two in sync.
+    cursor.execute('''
+        SELECT cd.name, cd.user_id, cd.db_suffix, cd."group", cd.process
+        FROM channel_directory cd
+        JOIN branches b ON b.name = cd.branch
+        ORDER BY b.sort_order, (cd.channel_type = 'official'), cd.debut, cd.name
+    ''')
     rows = cursor.fetchall()
     CHANNEL_DIRECTORY = {name:{"user_id":user_id,"db_suffix":db_suffix,"group":group} for name,user_id,db_suffix,group,process in rows}
 

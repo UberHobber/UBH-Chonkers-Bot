@@ -3,6 +3,26 @@
 -- in that script instead, then re-run it, or they'll be lost on the next regeneration.
 -- See sql/README.md for the order these files must be run in on a fresh database.
 
+-- public.branches definition
+
+-- Lookup table for channel_directory.branch. sort_order is the order Main.py processes
+-- branches in (see load_channel_directory in modules/Settings.py): each branch's talents
+-- oldest debut first, then that branch's official channels. Add a branch by inserting a
+-- row -- no code change needed. A fresh database needs these rows before any
+-- channel_directory rows can be inserted.
+
+-- Drop table
+
+-- DROP TABLE public.branches;
+
+CREATE TABLE public.branches (
+	"name" text NOT NULL,
+	sort_order int4 NOT NULL,
+	CONSTRAINT pk_branches PRIMARY KEY (name),
+	CONSTRAINT branches_sort_order_unique UNIQUE (sort_order)
+);
+
+
 -- NOTE: The *_members tables (emotes_<talent>_members, messages_<talent>_members,
 -- nickname_matches_<talent>_members) predate the unified channel_id / channel_directory
 -- schema used by emotes, nicknames, nickname_matches, and the partitioned messages table.
@@ -15,6 +35,12 @@
 -- color_1/color_2: the channel's two brand colors, used to keep Grafana series colors
 -- consistent for a given channel across every panel/dashboard (see "Config from query
 -- results" transform usage in Grafana dashboards built against this schema).
+--
+-- channel_type: 'talent' (a talent's own channel) or 'official' (a branch's main channel,
+-- e.g. HoloEN, or a unit's channel, e.g. ReGLOSS). Official channels sit in the branch
+-- they belong to; branch-level ones use "group" = 'Branch', unit-level ones use their
+-- unit's group. Replaces the old 'Official' pseudo-branch -- see
+-- migrate_channel_branches.py.
 
 -- Drop table
 
@@ -31,5 +57,8 @@ CREATE TABLE public.channel_directory (
 	active bool NOT NULL,
 	debut date NOT NULL,
 	process bool NOT NULL,
-	CONSTRAINT channel_directory_unique UNIQUE (user_id)
+	channel_type text DEFAULT 'talent'::text NOT NULL,
+	CONSTRAINT channel_directory_unique UNIQUE (user_id),
+	CONSTRAINT channel_directory_branches_fk FOREIGN KEY (branch) REFERENCES public.branches(name),
+	CONSTRAINT channel_directory_channel_type_check CHECK ((channel_type = ANY (ARRAY['talent'::text, 'official'::text])))
 );

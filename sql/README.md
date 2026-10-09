@@ -24,7 +24,7 @@ it doesn't need.
 
 Later files have foreign keys pointing at tables created by earlier ones:
 
-1. `channel_directory.sql`
+1. `channel_directory.sql` — also creates `branches`, which `channel_directory.branch` FKs to.
 2. `user_ids.sql`
 3. `videos.sql`
 4. `tags.sql`
@@ -53,14 +53,20 @@ Later files have foreign keys pointing at tables created by earlier ones:
     `modules.Database.RefreshRollupsIfChanged`).
 16. `channel_video_summary.sql` — a plain view over `channel_directory` (step 1) and `videos`
     (step 3): per-channel video counts and hours, split public vs. members-only.
+17. `processed_status.sql` — a plain view over `branches`/`channel_directory` (step 1) and
+    `videos` (step 3): per-channel count and percentage of public videos processed (members-only
+    and upcoming/live videos excluded), with each channel's processing order.
 
 **Members-only files** (only needed/run if you're tracking members-only content — see below):
 
-17. `emotes_members.sql`
-18. `messages_members.sql` — must come before `nicknames_members.sql`: its
+18. `emotes_members.sql`
+19. `messages_members.sql` — must come before `nicknames_members.sql`: its
     `nickname_matches_<talent>_members` tables FK to `messages_<talent>_members(message_id)`.
-19. `nicknames_members.sql`
-20. `subtitles_members.sql`
+20. `nicknames_members.sql`
+21. `subtitles_members.sql`
+
+Insert the `branches` rows (name + `sort_order`, the order channels get processed in) before
+any `channel_directory` rows — see `migrate_channel_branches.py` for the current set.
 
 After creating the `channel_directory` row(s) for whichever channels you're tracking, also
 create their `messages_<db_suffix>` partition of `public.messages` — see

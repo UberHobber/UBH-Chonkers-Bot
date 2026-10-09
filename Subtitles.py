@@ -73,7 +73,11 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
         CFG.select_channel(channel_name)
         LOG.logger.info(f"Subtitle pass: {channel_name}")
         local_root = _local_root()
-        channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,local_root)
+        try:
+            channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,local_root)
+        except C.BucketUnavailableError:
+            LOG.logger.error(f"Skipping subtitle pass for {channel_name}: bucket unavailable.")
+            continue
         os.makedirs(f"{local_root}/{CFG.SUBTITLE_TAG}",exist_ok=True)
 
         breaker = C.SubtitleCircuitBreaker(CFG.SUBTITLE_CIRCUIT_BREAKER_THRESHOLD)
