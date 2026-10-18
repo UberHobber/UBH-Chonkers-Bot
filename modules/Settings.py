@@ -11,7 +11,7 @@ from psycopg2.extensions import cursor
 PROCESS_ALL = True
 CHANNEL_SELECTION = "Kiara"
 USE_COOKIES = False
-SKIP_ROLLUPS = False
+SKIP_ROLLUPS = True
 
 # Seconds to wait between starting each chat download. The rate limiter enforces this
 # gap even across concurrent workers so YouTube isn't hit simultaneously. 0 to disable.

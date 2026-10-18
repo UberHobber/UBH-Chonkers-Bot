@@ -8,6 +8,10 @@
 -- Each talent has its own partition of public.messages, keyed by their YouTube channel_id.
 -- Partition tables inherit the parent's columns, constraints, and indexes -- they are not
 -- redefined per-partition.
+--
+-- Only holds chat for videos that aren't archived yet: archive_chat.py moves processed videos'
+-- rows into Parquet on S3 (see chat_archive) and deletes them here. Query archived and live
+-- chat together through modules/Archive.py (DuckDB) -- plain Postgres SQL only sees this table.
 
 -- Drop table
 
@@ -140,6 +144,7 @@ CREATE TABLE public.messages_shion PARTITION OF public.messages FOR VALUES IN ('
 CREATE TABLE public.messages_shiori PARTITION OF public.messages FOR VALUES IN ('gnfPPb9JI3e9A4cXHnWbyg');
 CREATE TABLE public.messages_sopia PARTITION OF public.messages FOR VALUES IN ('ROQtXcp2loQEmvpe5rhJzQ');
 CREATE TABLE public.messages_sora PARTITION OF public.messages FOR VALUES IN ('p6993wxpyDPHUpavwDFqgg');
+CREATE TABLE public.messages_stars PARTITION OF public.messages FOR VALUES IN ('WsfcksUUpoEvhia0_ut0bA');
 CREATE TABLE public.messages_starsen PARTITION OF public.messages FOR VALUES IN ('JxZpzx4wHzEYD-eCiZPikg');
 CREATE TABLE public.messages_subaru PARTITION OF public.messages FOR VALUES IN ('vzGlP9oQwU--Y0r9id_jnA');
 CREATE TABLE public.messages_suchan PARTITION OF public.messages FOR VALUES IN ('jk2nKmHzgH5Xy-C5qYRd5A');
@@ -152,14 +157,12 @@ CREATE TABLE public.messages_vesper PARTITION OF public.messages FOR VALUES IN (
 CREATE TABLE public.messages_vivi PARTITION OF public.messages FOR VALUES IN ('GzTVXqMQHa4AgJVJIVvtDQ');
 CREATE TABLE public.messages_watame PARTITION OF public.messages FOR VALUES IN ('qm3BQLlJfvkTsX_hvm0UmA');
 CREATE TABLE public.messages_zeta PARTITION OF public.messages FOR VALUES IN ('TvHWSfBZgtxE4sILOaurIQ');
--- idx_messages_video_user_status and idx_messages_user_timestamp were added by
--- sql/video_message_stats.sql to make its one-time backfill (and future ad-hoc
--- reconciliation queries) feasible against the 200M+ row table. Not yet attached on the
--- messages_holoen partition -- see conversation notes.
-CREATE INDEX idx_messages_datetime ON ONLY public.messages USING btree (datetime);
-CREATE INDEX idx_messages_message_text ON ONLY public.messages USING btree (message) WHERE (message ~ ':[a-zA-Z0-9_-]+:'::text);
-CREATE INDEX idx_messages_null ON ONLY public.messages USING btree (message) WHERE (message IS NOT NULL);
+-- Deliberately minimal: every index here is maintained on every chat message inserted,
+-- and index maintenance I/O was the ingestion bottleneck. pk_messages is the uniqueness/
+-- FK/join key, idx_messages_video_id backs Get_Messages' per-video lookup, and
+-- idx_messages_user_id backs the user_ids FK (and per-user queries). Everything else was
+-- dropped by migrate_drop_unused_message_indexes.py -- including (user_id, timestamp)
+-- and (video_id, user_id) covering indexes that only existed for video_message_stats'
+-- one-time backfill. Recreate those temporarily if a backfill over messages is re-run.
 CREATE INDEX idx_messages_user_id ON ONLY public.messages USING btree (user_id);
-CREATE INDEX idx_messages_user_timestamp ON ONLY public.messages USING btree (user_id, "timestamp") INCLUDE (video_id);
 CREATE INDEX idx_messages_video_id ON ONLY public.messages USING btree (video_id);
-CREATE INDEX idx_messages_video_user_status ON ONLY public.messages USING btree (video_id, user_id) INCLUDE (user_member_status);

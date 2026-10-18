@@ -1,5 +1,5 @@
 # Native Stuff
-import os,json,pickle,requests,re,xxhash,threading,queue,time,random
+import os,json,gzip,pickle,requests,re,xxhash,threading,queue,time,random
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from contextlib import contextmanager
 from typing import Any
@@ -37,6 +37,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import httplib2,ssl
 
 # S3 API
 import boto3
@@ -106,7 +107,12 @@ class H3Client():
         aws_access_key_id=CFG.ENDPOINT_ID,
         aws_secret_access_key=CFG.ENDPOINT_KEY,
         region_name=CFG.ENDPOINT_REGION,
-        config=BotocoreConfig(max_pool_connections=max(25, CFG.WORKER_COUNT * 15))
+        # response_checksum_validation: this S3 store reports a CRC32 for multipart-uploaded
+        # objects (ETag ending "-N") that never matches the bytes it serves, so boto3's default
+        # strict validation fails every full-object GET of one even though the data is intact
+        # (verified: full length, valid JSON). Callers that need integrity verify content
+        # themselves (see compress_raw_chat.py / archive_chat.py).
+        config=BotocoreConfig(max_pool_connections=max(25, CFG.WORKER_COUNT * 15),response_checksum_validation="when_required")
     )
     def get_all_buckets(self):
         response = self.client.list_buckets()
@@ -179,6 +185,14 @@ class H3Bucket:
         except ClientError as e:
             LOG.logger.error(f"Error deleting object(s): {e}")
             return -1
+
+    def delete_object(self,object_name:str):
+        try:
+            self.client.delete_object(Bucket=self.name,Key=object_name)
+            return True
+        except ClientError as e:
+            LOG.logger.error(f"Client Error while deleting {object_name}: {e}")
+            return e
 
     def check_object_exists(self,object_name:str):
         try:
@@ -338,6 +352,37 @@ class VideoClass:
 
             _check_and_upload_file(bucket,temp_thumb,self.id,"jpg",CFG.THUMBNAIL_TAG)
 
+def Raw_Chat_Keys(video_id:str) -> tuple[str,str]:
+    """
+    Returns (current_key, legacy_key) for a video's raw chat_downloader JSON in its channel
+    bucket. Current objects are minified JSON, gzip-compressed (~17x smaller than the legacy
+    indented .json objects, measured); compress_raw_chat.py converts legacy objects in place.
+    """
+    base = f"{CFG.MESSAGES_TAG}/{video_id}.json"
+    return f"{base}.gz", base
+
+def Write_Raw_Chat(path:str,messages:list[dict[str,Any]]) -> None:
+    """Writes raw chat messages to `path` in the current storage format (minified JSON, gzip)."""
+    with gzip.open(path,'wt',encoding='utf-8',compresslevel=6) as file:
+        json.dump(messages,file,separators=(',',':'),ensure_ascii=False)
+
+def Read_Raw_Chat(path:str,legacy:bool=False) -> list[dict[str,Any]]:
+    """Reads raw chat messages written by Write_Raw_Chat, or a legacy uncompressed .json file."""
+    opener = open if legacy else gzip.open
+    with opener(path,'rt',encoding='utf-8') as file:
+        return json.load(file)
+
+def Badge_Flags(badges:list[dict[str,Any]]|None) -> tuple[bool,bool,bool]:
+    """
+    Returns (is_moderator, is_verified, is_owner) from a chat_downloader author's badge list.
+    Each flag is set if ANY badge carries that title -- a user can hold several badges at once
+    (e.g. Moderator + Member). The old per-badge loop overwrote all three flags on every badge,
+    so only the last badge counted; compress_raw_chat.py uses this same function to correct
+    the rows that bug wrote.
+    """
+    titles = {badge.get("title") for badge in badges or []}
+    return "Moderator" in titles, "Verified" in titles, "Owner" in titles
+
 class MessageClass:
     """
     A Class that will nab all the data currently implemented into the database structure.
@@ -371,20 +416,7 @@ class MessageClass:
 
                 if self._badges is not None:
                     self.member_months = self._Membership_Level(self._badges)
-                    for badge in self._badges:
-                        _title = badge.get("title")
-                        if _title == "Verified":
-                            self.is_verified = True
-                        else:
-                            self.is_verified = False
-                        if _title == "Moderator":
-                            self.is_moderator = True
-                        else:
-                            self.is_moderator = False
-                        if _title == "Owner":
-                            self.is_owner = True
-                        else:
-                            self.is_owner = False
+                    self.is_moderator,self.is_verified,self.is_owner = Badge_Flags(self._badges)
                 else:
                     self.member_months = -1
                     self.is_moderator = False
@@ -531,13 +563,19 @@ class UserClass:
             raise e
 
 _RETRYABLE_HTTP_STATUSES = {429,500,503}
+# Network-level failures that never produce an HTTP status at all -- the socket gets reset/aborted
+# mid-request (WinError 10053/10054), a TLS hiccup, a DNS blip, or the OAuth token refresh that
+# runs inside request.execute() losing its connection. All transient. Deliberately NOT
+# google.auth.exceptions.RefreshError (revoked/expired refresh token) -- retrying that is pointless.
+_RETRYABLE_NETWORK_ERRORS = (ConnectionError,TimeoutError,ssl.SSLError,httplib2.HttpLib2Error,google.auth.exceptions.TransportError)
 
 def _execute_with_retry(request,max_attempts:int=5):
     """
     Executes a googleapiclient request, retrying with exponential backoff on transient errors
     (429 rate limit, 500/503 backend errors) -- YouTube's API intermittently returns these under
     normal load, not just when something's actually broken (e.g. a bare "503 The service is
-    currently unavailable" mid-pagination once killed a whole channel's run). Any other status
+    currently unavailable" mid-pagination once killed a whole channel's run). Dropped connections
+    (_RETRYABLE_NETWORK_ERRORS) are retried the same way. Any other status
     (404, 400, etc.) is raised immediately, same as calling request.execute() directly.
 
     :param request: A googleapiclient request object (not yet executed).
@@ -552,6 +590,12 @@ def _execute_with_retry(request,max_attempts:int=5):
                 raise
             wait = 2 ** attempt
             LOG.logger.warning(f"YouTube API returned {e.resp.status}, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+            time.sleep(wait)
+        except _RETRYABLE_NETWORK_ERRORS as e:
+            if attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt
+            LOG.logger.warning(f"YouTube API connection error ({type(e).__name__}: {e}), retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
             time.sleep(wait)
 
 class SubtitleThrottled(Exception):
@@ -929,35 +973,49 @@ class YT_API:
                 else:
                     messages_to_save.append(message)
 
-            with open(object_path,"w") as file:
-                file.write(json.dumps(messages_to_save,indent=4))
+            Write_Raw_Chat(object_path,messages_to_save)
 
             upload_status = bucket.upload_object(object_path,object_name)
             if isinstance(upload_status,ClientError):
                 raise upload_status
+
+            # Merged into the compressed object above, so the legacy uncompressed copy is now
+            # redundant -- see Raw_Chat_Keys.
+            if legacy_on_file:
+                delete_status = bucket.delete_object(legacy_object)
+                if isinstance(delete_status,ClientError):
+                    raise delete_status
 
         v = video
         _db = db if db is not None else self.db
         _lock = user_id_lock if user_id_lock is not None else threading.Lock()
         _emote_ids = known_emote_ids if known_emote_ids is not None else set()
 
+        # A video whose chat was moved to the Parquet archive (archive_chat.py) has no rows left
+        # in messages, so known_message_ids below would come back empty and every message would be
+        # inserted -- and counted into video_message_stats/user_channel_activity -- a second time.
+        # Processed videos are already filtered out before this point; this only guards against
+        # one being manually flipped back to unprocessed.
+        if CFG.GET_MEMBERS_ONLY is False:
+            archived_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["videos"],"chat_archived",{"id":v.id})
+            if archived_rows and archived_rows[0]["chat_archived"]:
+                LOG.logger.warning(f"Video {v.id}'s chat is already archived to Parquet -- skipping to avoid double-counting.")
+                return ChatStats()
+
         with Stage_Bar("Checking existing messages",bar_position):
-            message_object = f"{CFG.MESSAGES_TAG}/{v.id}.json"
+            message_object,legacy_object = Raw_Chat_Keys(v.id)
             existing_messages_local = f'{bucket.local_root}/{message_object}'
-            messages_exist = bucket.check_object_exists(message_object)
-            if isinstance(messages_exist,ClientError):
-                raise messages_exist
-            elif messages_exist is True:
-                downloaded_object = bucket.download_object(message_object,existing_messages_local)
+            legacy_on_file = False
+            messages_on_file:list[dict[str,Any]] = []
+            for key,is_legacy in ((message_object,False),(legacy_object,True)):
+                local_path = f'{bucket.local_root}/{key}'
+                downloaded_object = bucket.download_object(key,local_path)
                 if isinstance(downloaded_object,ClientError):
                     raise downloaded_object
-                elif os.path.isfile(existing_messages_local):
-                    with open(existing_messages_local,'r') as file:
-                        messages_on_file:list[dict[str,Any]] = json.load(file) #type: list[dict]
-                else:
-                    messages_on_file = []
-            else:
-                messages_on_file = []
+                if downloaded_object is True and os.path.isfile(local_path):
+                    messages_on_file = Read_Raw_Chat(local_path,legacy=is_legacy)
+                    legacy_on_file = is_legacy
+                    break
 
             # Pre-load existing message IDs for this video to avoid per-message DB lookups
             existing_msg_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["messages"],"message_id",{"video_id":v.id})

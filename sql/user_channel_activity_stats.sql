@@ -6,10 +6,11 @@
 -- public.user_first_message definition
 
 -- Pointer: the earliest message (by timestamp) this user has ever sent, across every channel.
--- channel_id/message_id carry a composite FK into messages(channel_id, message_id) -- video_id
--- is deliberately not stored here (join through message_id when needed); this closes a gap
--- where the old video_id-only FK never verified the video actually belonged to this row's
--- channel. timestamp is kept alongside message_id (not dropped) so record_message_stats()'s
+-- channel_id/message_id/video_id identify that message. There's deliberately no FK into
+-- messages: archived chat (see chat_archive) is no longer in Postgres, and the old composite
+-- FK made every user's first message undeletable. video_id is stored (and FKs to videos) so
+-- refresh_first_message_counts() never needs the message row. timestamp is kept alongside
+-- message_id so record_message_stats()'s
 -- per-message "is this earlier than what's stored" check stays a cheap in-row comparison
 -- instead of a join into messages on every single call.
 
@@ -22,128 +23,19 @@ CREATE TABLE public.user_first_message (
 	"timestamp" float8 NOT NULL,
 	channel_id text NOT NULL,
 	message_id text NOT NULL,
+	video_id text NOT NULL,
 	CONSTRAINT user_first_message_pkey PRIMARY KEY (user_id),
-	CONSTRAINT user_first_message_message_fkey FOREIGN KEY (channel_id, message_id) REFERENCES public.messages(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_1 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_mumei(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_10 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kronii(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_100 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_jurard(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_101 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_niko(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_102 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_octavio(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_103 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_raden(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_104 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_riona(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_105 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ruze(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_106 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_vivi(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_107 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_suchan(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_108 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_holoid(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_109 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_starsen(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_11 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ina(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_12 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_fauna(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_13 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_gura(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_14 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_holoen(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_15 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_nerissa(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_16 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_sana(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_17 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_fwmc(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_18 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ceci(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_19 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_erb(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_2 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_irys(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_20 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ame(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_21 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_moona(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_22 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_iofi(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_23 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ollie(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_24 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_anya(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_25 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_reine(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_26 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_zeta(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_27 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kaela(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_28 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kobo(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_29 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_hololive(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_3 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_biboo(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_30 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_regloss(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_31 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_flowglow(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_32 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_risu(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_33 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_sora(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_34 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_roboco(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_35 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_suisei(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_36 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_fubuki(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_37 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_matsuri(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_38 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_mela(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_39 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_sopia(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_4 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_gigi(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_40 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_tsuzuri(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_41 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kyoko(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_42 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_asobi(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_43 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_aki(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_44 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_haachama(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_45 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_miko(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_46 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_aqua(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_47 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_shion(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_48 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ayame(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_49 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_choco(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_5 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_bae(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_50 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_subaru(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_51 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_azki(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_52 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_mio(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_53 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_okayu(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_54 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_korone(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_55 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_miyabi(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_56 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kira(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_57 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_izuru(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_58 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_pekora(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_59 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_flare(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_6 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_shiori(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_60 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_noel(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_61 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_marine(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_62 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_aruran(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_63 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_rikka(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_64 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_astel(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_65 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_temma(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_66 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_roberu(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_67 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kanata(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_68 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_coco(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_69 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_watame(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_7 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kiara(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_70 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_towa(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_71 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_luna(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_72 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_shien(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_73 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_oga(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_74 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_lamy(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_75 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_nene(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_76 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_botan(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_77 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_polka(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_78 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_laplus(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_79 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_lui(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_8 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_raora(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_80 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_koyori(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_81 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_chloe(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_82 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_iroha(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_83 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_fuma(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_84 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_uyu(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_85 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_rio(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_86 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_altare(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_87 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_magni(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_88 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_axel(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_89 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_vesper(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_9 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_calli(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_90 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_bettel(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_91 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_flayon(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_92 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_hakka(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_93 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_shinri(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_94 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_kanade(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_95 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_ririka(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_96 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_aokun(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_97 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_chihaya(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_98 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_gibby(channel_id, message_id),
-	CONSTRAINT user_first_message_message_fkey_99 FOREIGN KEY (channel_id, message_id) REFERENCES public.messages_hajime(channel_id, message_id),
-	CONSTRAINT user_first_message_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_ids(id)
+	CONSTRAINT user_first_message_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+	CONSTRAINT user_first_message_video_id_fkey FOREIGN KEY (video_id) REFERENCES public.videos(id)
 );
 
 
 -- public.user_channel_activity definition
 
 -- Per-user, per-channel/talent activity rollup (renamed from user_first_channel_message --
--- it holds far more than a first-message pointer now). first_message_id/timestamp point to
--- this user's earliest message in this channel (message_id carries a composite FK into
--- messages(channel_id, message_id); timestamp is kept alongside it for the same cheap-comparison
--- reason as user_first_message, above). total_messages, last_message_ts, and max_member_status
+-- it holds far more than a first-message pointer now). first_message_id/first_video_id/
+-- timestamp point to this user's earliest message in this channel (no FK into messages, for
+-- the same archive reason as user_first_message, above; first_video_id FKs to videos). total_messages, last_message_ts, and max_member_status
 -- track running totals, last-seen timestamp, and highest membership tier (user_member_status)
 -- ever observed in this channel. emote_count is a running total of emote usages (accurate only
 -- from the day this column shipped -- historical emote usage was never persisted per-message,
@@ -177,118 +69,10 @@ CREATE TABLE public.user_channel_activity (
 	last_is_moderator bool DEFAULT false NOT NULL,
 	last_is_verified bool DEFAULT false NOT NULL,
 	last_is_owner bool DEFAULT false NOT NULL,
+	first_video_id text NOT NULL,
 	CONSTRAINT user_channel_activity_pkey PRIMARY KEY (channel_id, user_id),
 	CONSTRAINT user_channel_activity_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
-	CONSTRAINT user_channel_activity_message_fkey FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_1 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_mumei(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_10 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kronii(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_100 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_jurard(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_101 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_niko(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_102 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_octavio(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_103 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_raden(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_104 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_riona(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_105 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ruze(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_106 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_vivi(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_107 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_suchan(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_108 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_holoid(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_109 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_starsen(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_11 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ina(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_12 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_fauna(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_13 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_gura(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_14 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_holoen(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_15 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_nerissa(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_16 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_sana(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_17 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_fwmc(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_18 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ceci(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_19 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_erb(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_2 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_irys(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_20 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ame(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_21 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_moona(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_22 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_iofi(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_23 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ollie(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_24 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_anya(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_25 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_reine(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_26 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_zeta(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_27 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kaela(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_28 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kobo(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_29 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_hololive(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_3 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_biboo(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_30 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_regloss(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_31 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_flowglow(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_32 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_risu(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_33 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_sora(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_34 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_roboco(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_35 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_suisei(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_36 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_fubuki(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_37 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_matsuri(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_38 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_mela(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_39 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_sopia(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_4 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_gigi(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_40 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_tsuzuri(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_41 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kyoko(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_42 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_asobi(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_43 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_aki(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_44 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_haachama(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_45 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_miko(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_46 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_aqua(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_47 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_shion(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_48 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ayame(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_49 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_choco(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_5 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_bae(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_50 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_subaru(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_51 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_azki(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_52 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_mio(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_53 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_okayu(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_54 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_korone(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_55 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_miyabi(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_56 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kira(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_57 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_izuru(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_58 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_pekora(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_59 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_flare(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_6 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_shiori(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_60 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_noel(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_61 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_marine(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_62 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_aruran(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_63 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_rikka(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_64 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_astel(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_65 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_temma(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_66 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_roberu(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_67 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kanata(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_68 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_coco(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_69 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_watame(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_7 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kiara(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_70 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_towa(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_71 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_luna(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_72 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_shien(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_73 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_oga(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_74 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_lamy(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_75 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_nene(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_76 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_botan(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_77 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_polka(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_78 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_laplus(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_79 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_lui(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_8 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_raora(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_80 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_koyori(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_81 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_chloe(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_82 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_iroha(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_83 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_fuma(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_84 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_uyu(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_85 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_rio(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_86 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_altare(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_87 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_magni(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_88 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_axel(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_89 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_vesper(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_9 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_calli(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_90 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_bettel(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_91 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_flayon(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_92 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_hakka(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_93 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_shinri(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_94 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_kanade(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_95 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_ririka(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_96 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_aokun(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_97 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_chihaya(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_98 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_gibby(channel_id, message_id),
-	CONSTRAINT user_channel_activity_message_fkey_99 FOREIGN KEY (channel_id, first_message_id) REFERENCES public.messages_hajime(channel_id, message_id),
+	CONSTRAINT user_channel_activity_first_video_id_fkey FOREIGN KEY (first_video_id) REFERENCES public.videos(id),
 	CONSTRAINT user_channel_activity_user_ids_fk FOREIGN KEY (user_id) REFERENCES public.user_ids(id)
 );
 CREATE INDEX idx_user_channel_activity_channel_totals ON public.user_channel_activity USING btree (channel_id, total_messages DESC);
@@ -297,9 +81,9 @@ CREATE INDEX idx_user_channel_activity_channel_totals ON public.user_channel_act
 -- public.refresh_first_message_counts definition
 
 -- Recomputes video_message_stats.first_messages/first_channel_messages from scratch by
--- aggregating user_first_message/user_channel_activity, joining each through to messages via
--- message_id/first_message_id to recover video_id (neither table stores video_id directly --
--- see their own NARRATIVE entries). Call once per full bot run (see RefreshFirstMessageCounts
+-- grouping user_first_message.video_id/user_channel_activity.first_video_id (it used to join
+-- through messages to recover the video, which stopped working once chat started being
+-- archived out of messages -- see chat_archive). Call once per full bot run (see RefreshFirstMessageCounts
 -- in modules/Database.py and its call at the end of Main.py) -- these columns are no longer
 -- patched incrementally per-message (see record_message_stats()).
 
@@ -313,20 +97,18 @@ AS $function$
             UPDATE public.video_message_stats vms
             SET first_messages = fg.cnt
             FROM (
-                SELECT m.video_id, COUNT(*) AS cnt
-                FROM public.user_first_message ufm
-                JOIN public.messages m ON m.channel_id = ufm.channel_id AND m.message_id = ufm.message_id
-                GROUP BY m.video_id
+                SELECT video_id, COUNT(*) AS cnt
+                FROM public.user_first_message
+                GROUP BY video_id
             ) fg
             WHERE fg.video_id = vms.video_id;
 
             UPDATE public.video_message_stats vms
             SET first_channel_messages = fc.cnt
             FROM (
-                SELECT m.video_id, COUNT(*) AS cnt
-                FROM public.user_channel_activity uca
-                JOIN public.messages m ON m.channel_id = uca.channel_id AND m.message_id = uca.first_message_id
-                GROUP BY m.video_id
+                SELECT first_video_id AS video_id, COUNT(*) AS cnt
+                FROM public.user_channel_activity
+                GROUP BY first_video_id
             ) fc
             WHERE fc.video_id = vms.video_id;
         $function$;

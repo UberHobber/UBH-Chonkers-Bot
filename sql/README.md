@@ -56,14 +56,17 @@ Later files have foreign keys pointing at tables created by earlier ones:
 17. `processed_status.sql` — a plain view over `branches`/`channel_directory` (step 1) and
     `videos` (step 3): per-channel count and percentage of public videos processed (members-only
     and upcoming/live videos excluded), with each channel's processing order.
+18. `chat_archive.sql` — `chat_archive` (manifest of chat moved to Parquet on S3 by
+    `archive_chat.py`; FKs to `videos`, step 3, and `channel_directory`, step 1) and
+    `badge_fix_pending` (`compress_raw_chat.py`'s work queue; no FKs).
 
 **Members-only files** (only needed/run if you're tracking members-only content — see below):
 
-18. `emotes_members.sql`
-19. `messages_members.sql` — must come before `nicknames_members.sql`: its
+19. `emotes_members.sql`
+20. `messages_members.sql` — must come before `nicknames_members.sql`: its
     `nickname_matches_<talent>_members` tables FK to `messages_<talent>_members(message_id)`.
-20. `nicknames_members.sql`
-21. `subtitles_members.sql`
+21. `nicknames_members.sql`
+22. `subtitles_members.sql`
 
 Insert the `branches` rows (name + `sort_order`, the order channels get processed in) before
 any `channel_directory` rows — see `migrate_channel_branches.py` for the current set.

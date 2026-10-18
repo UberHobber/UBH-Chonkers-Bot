@@ -61,7 +61,7 @@ CREATE TABLE public.video_user_seen (
 -- Called once per newly-inserted chat message (via record_message_stats_batch(), below --
 -- not usually called directly anymore). Upserts video_message_stats totals for the message's
 -- own video, the video_user_seen dedup row, the user's global/per-channel first-message
--- pointers (user_first_message/user_channel_activity, now message_id-based -- see their own
+-- pointers (user_first_message/user_channel_activity, message_id + video_id -- see their own
 -- NARRATIVE entries), user_channel_activity's emote/mod-status columns, and (when the message
 -- carried a paid amount) user_channel_superchats. Deliberately never touches another video's
 -- video_message_stats row -- an earlier version did, to move
@@ -112,19 +112,20 @@ AS $function$
                 WHERE video_id = p_video_id;
             END IF;
 
-            INSERT INTO public.user_first_message (user_id, channel_id, message_id, "timestamp")
-            VALUES (p_user_id, p_channel_id, p_message_id, p_timestamp)
+            INSERT INTO public.user_first_message (user_id, channel_id, message_id, video_id, "timestamp")
+            VALUES (p_user_id, p_channel_id, p_message_id, p_video_id, p_timestamp)
             ON CONFLICT (user_id) DO UPDATE
             SET channel_id = EXCLUDED.channel_id,
                 message_id = EXCLUDED.message_id,
+                video_id = EXCLUDED.video_id,
                 "timestamp" = EXCLUDED."timestamp"
             WHERE EXCLUDED."timestamp" < public.user_first_message."timestamp";
 
             INSERT INTO public.user_channel_activity
-                (channel_id, user_id, first_message_id, "timestamp", total_messages, last_message_ts,
+                (channel_id, user_id, first_message_id, first_video_id, "timestamp", total_messages, last_message_ts,
                  max_member_status, emote_count, ever_moderator, ever_verified, ever_owner,
                  last_is_moderator, last_is_verified, last_is_owner)
-            VALUES (p_channel_id, p_user_id, p_message_id, p_timestamp, 1, p_timestamp, p_member_status,
+            VALUES (p_channel_id, p_user_id, p_message_id, p_video_id, p_timestamp, 1, p_timestamp, p_member_status,
                     p_emote_count, p_is_moderator, p_is_verified, p_is_owner,
                     p_is_moderator, p_is_verified, p_is_owner)
             ON CONFLICT (channel_id, user_id) DO UPDATE
@@ -143,6 +144,8 @@ AS $function$
                     THEN EXCLUDED.last_is_owner ELSE public.user_channel_activity.last_is_owner END,
                 first_message_id = CASE WHEN EXCLUDED."timestamp" < public.user_channel_activity."timestamp"
                     THEN EXCLUDED.first_message_id ELSE public.user_channel_activity.first_message_id END,
+                first_video_id = CASE WHEN EXCLUDED."timestamp" < public.user_channel_activity."timestamp"
+                    THEN EXCLUDED.first_video_id ELSE public.user_channel_activity.first_video_id END,
                 "timestamp" = LEAST(public.user_channel_activity."timestamp", EXCLUDED."timestamp");
 
             IF p_amount IS NOT NULL THEN

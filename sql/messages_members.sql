@@ -37,9 +37,6 @@ END) STORED NULL,
 );
 CREATE INDEX idx_mesages_user_id_calli_members ON public.messages_calli_members USING btree (user_id);
 CREATE INDEX idx_mesages_video_id_calli_members ON public.messages_calli_members USING btree (video_id);
-CREATE INDEX idx_messages_datetime_calli_members ON public.messages_calli_members USING btree (datetime);
-CREATE INDEX idx_messages_message_text_calli_members ON public.messages_calli_members USING btree (message) WHERE (message ~ ':[a-zA-Z0-9_-]+:'::text);
-CREATE INDEX idx_messages_null_calli_members ON public.messages_calli_members USING btree (message) WHERE (message IS NOT NULL);
 
 
 -- public.messages_gura_members definition
@@ -76,9 +73,6 @@ END) STORED NULL,
 );
 CREATE INDEX idx_mesages_user_id_gura_members ON public.messages_gura_members USING btree (user_id);
 CREATE INDEX idx_mesages_video_id_gura_members ON public.messages_gura_members USING btree (video_id);
-CREATE INDEX idx_messages_datetime_gura_members ON public.messages_gura_members USING btree (datetime);
-CREATE INDEX idx_messages_message_text_gura_members ON public.messages_gura_members USING btree (message) WHERE (message ~ ':[a-zA-Z0-9_-]+:'::text);
-CREATE INDEX idx_messages_null_gura_members ON public.messages_gura_members USING btree (message) WHERE (message IS NOT NULL);
 
 
 -- public.messages_ina_members definition
@@ -115,9 +109,6 @@ END) STORED NULL,
 );
 CREATE INDEX idx_mesages_user_id_ina_members ON public.messages_ina_members USING btree (user_id);
 CREATE INDEX idx_mesages_video_id_ina_members ON public.messages_ina_members USING btree (video_id);
-CREATE INDEX idx_messages_datetime_ina_members ON public.messages_ina_members USING btree (datetime);
-CREATE INDEX idx_messages_message_text_ina_members ON public.messages_ina_members USING btree (message) WHERE (message ~ ':[a-zA-Z0-9_-]+:'::text);
-CREATE INDEX idx_messages_null_ina_members ON public.messages_ina_members USING btree (message) WHERE (message IS NOT NULL);
 
 
 -- public.messages_kiara_members definition
@@ -154,6 +145,3 @@ END) STORED NULL,
 );
 CREATE INDEX idx_mesages_user_id_kiara_members ON public.messages_kiara_members USING btree (user_id);
 CREATE INDEX idx_mesages_video_id_kiara_members ON public.messages_kiara_members USING btree (video_id);
-CREATE INDEX idx_messages_datetime_kiara_members ON public.messages_kiara_members USING btree (datetime);
-CREATE INDEX idx_messages_message_text_kiara_members ON public.messages_kiara_members USING btree (message) WHERE (message ~ ':[a-zA-Z0-9_-]+:'::text);
-CREATE INDEX idx_messages_null_kiara_members ON public.messages_kiara_members USING btree (message) WHERE (message IS NOT NULL);

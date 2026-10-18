@@ -39,6 +39,12 @@
 -- The video is left unprocessed, but runs without cookies (CFG.COOKIES is None) skip it
 -- before fetching details, so it's only retried on a run that might succeed. Cleared
 -- again once the video is processed.
+--
+-- raw_chat_compressed is set by compress_raw_chat.py once this video's raw chat JSON on S3
+-- is gzip-compressed (messages/{id}.json.gz) and its messages rows' badge flags have been
+-- corrected from it. chat_archived is set by archive_chat.py once this video's chat has
+-- been moved out of messages into Parquet (see chat_archive); Get_Messages refuses to
+-- re-ingest an archived video, since its messages rows (and so known_message_ids) are gone.
 
 -- Drop table
 
@@ -62,6 +68,8 @@ CREATE TABLE public.videos (
 	video_type text NULL,
 	content_duration int8 NULL,
 	login_required bool DEFAULT false NOT NULL,
+	raw_chat_compressed bool DEFAULT false NOT NULL,
+	chat_archived bool DEFAULT false NOT NULL,
 	CONSTRAINT pk_videos_id PRIMARY KEY (id),
 	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
 	CONSTRAINT videos_video_type_check CHECK ((video_type = ANY (ARRAY['stream'::text, 'upload'::text, 'short'::text])))

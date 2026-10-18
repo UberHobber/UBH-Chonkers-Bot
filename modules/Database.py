@@ -549,6 +549,7 @@ _CORE_SQL_FILES = [
     ("refresh_state","refresh_state"),
     ("channel_video_summary","channel_video_summary"),
     ("processed_status","processed_status"),
+    ("chat_archive","chat_archive"),
 ]
 _MEMBERS_SQL_FILES = [
     ("emotes_members","emotes_calli_members"),
