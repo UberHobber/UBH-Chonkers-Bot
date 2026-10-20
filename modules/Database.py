@@ -16,8 +16,26 @@ class PostgresClass:
     """
     def __init__(self):
         LOG.logger.debug('Connecting to database...')
-        self.database = psycopg2.connect(host=CFG.DB_HOST,port=CFG.DB_PORT,database=CFG.DB_NAME,user=CFG.DB_USR,password=CFG.DB_PASS)
+        self.database = self._Connect()
         self.cursor = self.database.cursor()
+        self._side = None
+
+    def _Connect(self):
+        return psycopg2.connect(host=CFG.DB_HOST,port=CFG.DB_PORT,database=CFG.DB_NAME,user=CFG.DB_USR,password=CFG.DB_PASS)
+
+    @property
+    def side_cursor(self) -> psycopg2.extensions.cursor:
+        """
+        Cursor on a second, autocommit connection, for writes that must be visible to every
+        other connection immediately without committing this connection's in-progress
+        transaction -- see the new-user insert in Get_Messages (modules/Classes.py). Opened on
+        first use, so connections that never need it don't hold an extra session.
+        """
+        if self._side is None:
+            self._side = self._Connect()
+            self._side.autocommit = True
+            self._side_cursor = self._side.cursor()
+        return self._side_cursor
 
     def Close(self):
         """
@@ -26,6 +44,8 @@ class PostgresClass:
         LOG.logger.debug('Closing SQL Database...')
         self.cursor.close()
         self.database.close()
+        if self._side is not None:
+            self._side.close()
 
     def ClearDB(self,tables:list[str]):
         """

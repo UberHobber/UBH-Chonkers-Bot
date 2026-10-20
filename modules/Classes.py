@@ -1107,22 +1107,19 @@ class YT_API:
                         #----------------------#
 
                         # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
-                        # Lock covers check+insert+commit atomically. The commit MUST happen inside the lock so the
-                        # user row is visible to all connections before any thread inserts a message referencing it.
-                        # Without the commit here, a concurrent thread can see the user in known_user_ids (set already
-                        # updated) but fail the FK check because the insert hasn't been flushed to the DB yet.
-                        with _lock:
-                            _is_new_user = msg.usr_id not in known_user_ids
-                            if _is_new_user:
-                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}])
-                                # Flush first -- otherwise this commit durably records every message
-                                # inserted so far in this batch while their still-buffered
-                                # record_message_stats() calls stay unexecuted, and a crash before the
-                                # next flush would lose that message's stats contribution for good
-                                # (known_message_ids skips re-inserting it, and the stats call, on retry).
-                                _flush_pending_stats()
-                                _db.database.commit()  # flush immediately — FK must be satisfied for all connections
-                                uncommitted = 0
+                        # The user row must be committed before it goes into known_user_ids: another thread that sees
+                        # the user in the set inserts messages referencing it straight away, and would fail the FK
+                        # check if the row weren't visible yet. It's inserted on _db's autocommit side connection so
+                        # that doesn't mean committing this thread's in-progress 500-message batch (which used to cost
+                        # a disk flush per new chatter, inside the lock every worker shares). ON CONFLICT covers two
+                        # threads racing to insert the same user; the lock only decides which one counts it as new.
+                        # If this batch later rolls back, the user row stays -- harmless, it's a real user that user
+                        # processing picks up like any other.
+                        _is_new_user = False
+                        if msg.usr_id not in known_user_ids:
+                            DB.InsertEntries(_db.side_cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}],"id")
+                            with _lock:
+                                _is_new_user = msg.usr_id not in known_user_ids
                                 known_user_ids.add(msg.usr_id)
                         if _is_new_user:
                             chat_stats.new_user_ids.add(msg.usr_id)

@@ -173,6 +173,10 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
         sorted_nicknames:list[str] = sorted([e["nickname"] for e in nickname_entries], key=len, reverse=True)
         LOG.logger.info(f"  {len(sorted_nicknames):,} nickname(s) loaded.")
 
+    # End the read-only transaction the preload SELECTs opened -- otherwise this connection sits
+    # "idle in transaction" (holding its table locks) for the whole worker phase below.
+    db.database.commit()
+
     unprocessed_ids = [vid_id for vid_id in video_ids if video_db_status.get(vid_id) is not True and vid_id not in login_required_ids]
     LOG.logger.info(f"  {len(unprocessed_ids):,} unprocessed video(s) to fetch.")
     if login_required_ids:
@@ -403,6 +407,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
         LOG.logger.info("Obtaining all unprocessed users from database...")
         # Get fresh users from the DB
         unique_users = DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id",{"processed":False})
+        db.database.commit()  # same reason as after the preload above
         LOG.logger.info(f"Total of {len(unique_users):,} unique user(s) aquired.")
 
         # List of IDs
