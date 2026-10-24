@@ -55,6 +55,24 @@ Steps 3 and 4 run automatically for every channel that finishes cleanly. Run the
 3. **Prepare finished chat for archiving:** `Launch.bat compress_raw_chat.py --workers 4`. For each processed video it compresses any raw chat still in the old format and corrects badge flags from it. Videos the bot downloaded in one go are already marked done, so this only has real work for older videos. It's safe to run while the bot is running.
 4. **Archive finished chat:** `Launch.bat archive_chat.py`. It moves processed videos' chat out of Postgres into Parquet files under `chat_archive/` in each channel's bucket, verifies every file, then empties the moved rows from the database. Don't run it for a channel the bot is processing at that moment. Other channels are fine.
 
+### Watching a run
+
+`Monitor.py` is a live status view that runs in its own window. `Launch_With_Monitor.bat` opens it alongside the bot, or start it on its own with `Launch.bat Monitor.py`. It reads the `status_<script>.json` files that `Main.py`, `Subtitles.py`, `compress_raw_chat.py` and `archive_chat.py` write every few seconds. It shows:
+
+- each running script, with its channel and phase;
+- what each worker is doing (video, stage, message count and rate), plus the **Archive** slot and how many channels are queued behind it;
+- the last few warnings and errors.
+
+Opening, closing or resizing the monitor never affects the bot.
+
+| Status | Meaning |
+|---|---|
+| **NOT RESPONDING** | The process is still alive but has stopped updating. |
+| **TERMINATED** | The process was killed, for example its window was closed. |
+| **FINISHED**, **CRASHED** or **STOPPED** | The run ended. CRASHED shows the error; STOPPED means Ctrl+C. |
+
+Ended runs stay on screen for 5 minutes (`--keep-ended <minutes>`), then disappear until that script starts again. If `STATUS_DIRECTORY` is set, pass the same folder with `--dir`.
+
 ### Querying chat
 
 - **Totals, leaderboards and per-user summaries** live in Postgres. The rollup tables and views (`video_message_stats`, `user_channel_activity`, `user_summary` and so on) work in any SQL client and cover all chat, archived or not.
@@ -107,6 +125,8 @@ The main flags at the top of [`modules/Settings.py`](modules/Settings.py):
 | `USE_COOKIES` | Use `cookies.txt` for public runs (for age-restricted videos) |
 | `AUTO_ARCHIVE` | Compress and archive each channel that finishes with no errors, in the background while the next channel runs |
 | `PROGRESS_BARS` | Also draw progress bars in the bot's own console (`Monitor.py` shows the same progress without the line spam) |
+| `STATUS_INTERVAL` / `STATUS_DIRECTORY` | How often the status files for `Monitor.py` are written, and where (blank = the launch folder) |
+| `LOG_VERBOSE` | Also log debug lines, including the per-file and per-50-video archive progress |
 | `QUICK_SETTINGS` | `True` uses the folders and flags in the file. `False` prompts with dialogs at launch, including members-only mode, chat timeout and livestream skipping. |
 
 Members-only mode (`GET_MEMBERS_ONLY`) writes to the legacy `*_members` tables, which `archive_chat.py` doesn't archive.

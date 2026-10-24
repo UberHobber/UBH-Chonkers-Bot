@@ -5,9 +5,11 @@
 
 -- Per-video message stats: an incrementally-maintained rollup table (NOT a materialized view --
 -- messages has 200M+ rows, so recomputing a full aggregate on every refresh doesn't scale).
--- Maintained one message at a time by public.record_message_stats(), called from
--- modules/Classes.py Get_Messages via modules/Database.py's RecordMessageStats(). See
--- sql/video_message_stats.sql for full DDL, the maintenance functions, and the one-time backfill.
+-- Maintained per message by public.record_message_stats(), applied in batches through
+-- public.record_message_stats_batch() -- one call per commit from modules/Classes.py
+-- Get_Messages via modules/Database.py's RecordMessageStatsBatch(). Archiving chat (see
+-- chat_archive) doesn't touch these totals. See sql/video_message_stats.sql for full DDL,
+-- the maintenance functions, and the one-time backfill.
 
 -- public.video_message_stats definition
 

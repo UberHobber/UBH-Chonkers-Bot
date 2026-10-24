@@ -211,7 +211,7 @@ def archive_channel(db:DB.PostgresClass,client,duck,channel_name:str,max_rows:in
             for i,batch in enumerate(batches,1):
                 files.append((_export_batch(cur,duck,bucket,partition,batch),batch))
                 bar.update(sum(b[1] for b in batch))
-                LOG.logger.info(f"  {log_prefix}{channel_name}: file {i}/{len(batches)} -- {len(batch):,} video(s), {bar.n:,}/{rows:,} message(s) exported and verified ({time.time()-start:,.0f}s)")
+                LOG.logger.debug(f"  {log_prefix}{channel_name}: file {i}/{len(batches)} --{len(batch):,} video(s), {bar.n:,}/{rows:,} message(s) exported and verified ({time.time()-start:,.0f}s)")
             bar.set_description_str("Archiving: committing")
             kept = _commit_channel(db,channel_id,partition,files)
         except BaseException:
@@ -229,9 +229,8 @@ def archive_channel(db:DB.PostgresClass,client,duck,channel_name:str,max_rows:in
     cur.execute("SELECT pg_total_relation_size(%s)",(f"public.{partition}",))
     size_after = cur.fetchone()[0]
     db.database.commit()
-    LOG.logger.info(f"  {log_prefix}{channel_name}: {partition} truncated, {kept:,} row(s) of unarchived videos kept -- "
-                    f"{size_before/1024**3:,.2f} GB -> {size_after/1024**3:,.2f} GB")
-    LOG.logger.info(f"{log_prefix}{channel_name}: {rows:,} message(s) from {len(counts):,} video(s) archived in {time.time()-start:,.0f}s")
+    LOG.logger.info(f"{log_prefix}{channel_name}: {rows:,} message(s) from {len(counts):,} video(s) archived in {time.time()-start:,.0f}s -- "
+                    f"{partition} {size_before/1024**3:,.2f} GB -> {size_after/1024**3:,.2f} GB, {kept:,} row(s) of unarchived videos kept")
     return rows,len(counts)
 
 def main() -> None:

@@ -10,8 +10,16 @@
 -- redefined per-partition.
 --
 -- Only holds chat for videos that aren't archived yet: archive_chat.py moves processed videos'
--- rows into Parquet on S3 (see chat_archive) and deletes them here. Query archived and live
--- chat together through modules/Archive.py (DuckDB) -- plain Postgres SQL only sees this table.
+-- rows into Parquet on S3 (see chat_archive) and removes them here -- by copying the rows it
+-- keeps aside, TRUNCATEing the partition and putting them back, which frees the space at once
+-- and writes almost no WAL (row-by-row DELETE took ~25min per 10M rows, then a VACUUM FULL).
+-- Query archived and live chat together through modules/Archive.py (DuckDB) -- plain
+-- Postgres SQL only sees this table.
+--
+-- Main.py reads and writes each channel's partition directly (CFG.DB_TABLES["messages"] =
+-- messages_<db_suffix>), never this parent table, so archiving one channel (an ACCESS
+-- EXCLUSIVE lock on its partition) can't block the bot while it works on another channel.
+-- Keep it that way: a query against the parent would lock every partition.
 
 -- Drop table
 

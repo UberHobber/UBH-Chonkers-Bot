@@ -8,10 +8,12 @@
 -- that holds its rows, how many, and their timestamp range. Files are zstd Parquet sorted by
 -- (video_id, timestamp), ~10M messages each, with messages' own columns. A video only gets a
 -- row here after its file was read back and verified (per-video row + distinct message_id
--- counts), in the same transaction that deletes its rows from messages -- so this table, not
+-- counts), in the same transaction that removes its rows from messages -- so this table, not
 -- an S3 listing, is the source of truth for which files exist (modules/Archive.py reads it;
 -- archive_chat.py deletes any chat_archive/ object not listed here as an interrupted-run
--- orphan).
+-- orphan). Only processed, public videos with raw_chat_compressed set are archived.
+-- Main.py runs archive_chat.archive_channel() automatically, in a background thread, for
+-- each channel that finishes with no errors (CFG.AUTO_ARCHIVE, modules/ChannelArchiver.py).
 
 -- public.chat_archive definition
 
@@ -39,7 +41,10 @@ CREATE INDEX idx_chat_archive_channel_file ON public.chat_archive USING btree (c
 -- (channel, user) pairs whose messages rows compress_raw_chat.py corrected moderator/verified/
 -- owner flags for (the old MessageClass badge loop kept only the LAST badge's flags), and
 -- whose user_channel_activity ever_*/last_is_* still need recomputing from those messages.
--- Cleared per channel once that's done; archive_chat.py refuses a channel with rows here.
+-- Cleared per channel once that's done; archive_chat.py refuses a channel with rows here,
+-- since the recompute reads the very messages rows archiving removes. Only chat ingested
+-- before 2026-10-18 (commit b7df4fc, C.Badge_Flags) can have wrong flags -- newer videos are
+-- marked raw_chat_compressed by Main.py and never need correcting.
 
 -- Drop table
 

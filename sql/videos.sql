@@ -40,11 +40,17 @@
 -- before fetching details, so it's only retried on a run that might succeed. Cleared
 -- again once the video is processed.
 --
--- raw_chat_compressed is set by compress_raw_chat.py once this video's raw chat JSON on S3
--- is gzip-compressed (messages/{id}.json.gz) and its messages rows' badge flags have been
--- corrected from it. chat_archived is set by archive_chat.py once this video's chat has
--- been moved out of messages into Parquet (see chat_archive); Get_Messages refuses to
--- re-ingest an archived video, since its messages rows (and so known_message_ids) are gone.
+-- raw_chat_compressed means this video's raw chat on S3 is gzip-compressed
+-- (messages/{id}.json.gz) and its messages rows' badge flags are correct (see
+-- badge_fix_pending). Main.py sets it itself when marking a video processed if that one
+-- download wrote every row the video has (ChatStats.preexisting_rows == 0 -- current code
+-- always writes .json.gz and correct flags); otherwise compress_raw_chat.py sets it after
+-- converting/correcting. chat_archived is set by archive_chat.py once this video's chat has
+-- been moved out of messages into Parquet (see chat_archive). Both scripts run
+-- automatically, in a background thread, for each channel that finishes a Main.py run with
+-- no errors (CFG.AUTO_ARCHIVE, modules/ChannelArchiver.py), or by hand. Get_Messages
+-- refuses to re-ingest an archived video, since its messages rows (and so
+-- known_message_ids) are gone.
 
 -- Drop table
 

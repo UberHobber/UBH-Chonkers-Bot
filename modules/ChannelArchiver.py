@@ -43,17 +43,32 @@ class ChannelArchiver:
         self.done:list[str] = []
         self.failed:list[str] = []
         self.rows = 0
+        # Tracked here rather than via queue.qsize(), which would also count finish()'s sentinel.
+        self._waiting:list[str] = []
+        self._current:str|None = None
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run,name="channel-archiver",daemon=True)
         self._thread.start()
 
     def submit(self,channel_name:str):
         """Queue a channel the bot has finished with."""
+        with self._lock:
+            self._waiting.append(channel_name)
+            self._show_status()
         self._queue.put(channel_name)
+
+    def _show_status(self):
+        """Archive slot's task line: the channel being worked on plus how many wait behind it. Call with _lock held."""
+        if self._current is None:
+            return # The thread picks the new channel up immediately and shows it then
+        queued = f" (+{len(self._waiting)} queued)" if self._waiting else ""
+        ST.set_task(self.position,f"{self._current}{queued}",label="Archive")
 
     def finish(self):
         """Wait for every queued channel, then log a summary."""
         if self._thread.is_alive():
-            pending = self._queue.qsize()
+            with self._lock:
+                pending = len(self._waiting) + (self._current is not None)
             if pending:
                 LOG.logger.info(f"{LOG_PREFIX}Waiting for {pending:,} queued channel(s) to finish compressing/archiving...")
             self._queue.put(None)
@@ -70,7 +85,10 @@ class ChannelArchiver:
                 channel_name = self._queue.get()
                 if channel_name is None:
                     break
-                ST.set_task(self.position,channel_name,label="Archive")
+                with self._lock:
+                    self._waiting.remove(channel_name)
+                    self._current = channel_name
+                    self._show_status()
                 start = time.time()
                 try:
                     if db is None:
@@ -83,7 +101,7 @@ class ChannelArchiver:
                                                                bar_position=self.position,log_prefix=LOG_PREFIX)
                     self.rows += rows
                     self.done.append(channel_name)
-                    LOG.logger.info(f"{LOG_PREFIX}{channel_name}: done in {time.time()-start:,.0f}s ({videos:,} video(s) archived).")
+                    LOG.logger.debug(f"{LOG_PREFIX}{channel_name}: done in{time.time()-start:,.0f}s ({videos:,} video(s) archived).")
                 except Exception as e:
                     self.failed.append(channel_name)
                     LOG.logger.error(f"{LOG_PREFIX}{channel_name}: {e}")
@@ -93,6 +111,8 @@ class ChannelArchiver:
                         except Exception:
                             db = None # Connection is gone -- reconnect for the next channel
                 finally:
-                    ST.set_task(self.position,None)
+                    with self._lock:
+                        self._current = None
+                        ST.set_task(self.position,None)
         if db is not None:
             db.Close()

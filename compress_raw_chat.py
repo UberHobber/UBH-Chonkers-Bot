@@ -269,8 +269,8 @@ def compress_channel(db:DB.PostgresClass,client,channel_name:str,tmp_dir:str,wor
             cur.execute("UPDATE public.videos SET raw_chat_compressed = true WHERE id = %s",(video_id,))
             db.database.commit()
             bar.update(1)
-            if bar.n % 50 == 0:
-                LOG.logger.info(f"  {log_prefix}{channel_name}: {bar.n:,}/{len(videos):,} video(s)...")
+            if bar.n % 50 == 0: # Live progress is on the status bar/Monitor.py; this is for LOG_VERBOSE logs
+                LOG.logger.debug(f"  {log_prefix}{channel_name}: {bar.n:,}/{len(videos):,} video(s)...")
 
     users = _recompute_pending(db,channel_id,partition) if has_partition else 0
     counts["videos"] += len(videos); counts["users"] += users
