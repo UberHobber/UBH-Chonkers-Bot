@@ -15,6 +15,8 @@ import modules.Settings as CFG
 import modules.logconfig as LOG
 import modules.Classes as C
 import modules.Database as DB
+import modules.Status as ST
+import modules.ChannelArchiver as CA
 
 """
 ---------------
@@ -57,6 +59,10 @@ I never made it far enough to figure out how and judging by how infinitely bette
 https://github.com/xenova/chat-downloader
 
 """
+
+# Live status for Monitor.py (see modules/Status.py)
+ST.start("Main",LOG.logger)
+ST.set_info(phase="Starting up")
 
 # Initialize database connection and setup the API calls (shared across all channels)
 db = DB.PostgresClass()
@@ -111,10 +117,15 @@ def Batch_Users(users):
     for i in range(0,len(users),50):
         yield users[i:i + 50]
 
-def process_channel(channel_name:str,current_channel:int,channels_total:int):
-    """Runs the full video/chat/user pipeline for whichever channel CFG.select_channel() last selected."""
+def process_channel(channel_name:str,current_channel:int,channels_total:int) -> int:
+    """
+    Runs the full video/chat/user pipeline for whichever channel CFG.select_channel() last selected.
+    Returns how many errors the channel hit (video errors, failed video detail fetches, an
+    unavailable bucket) -- only a channel with 0 is handed to the background compress/archive.
+    """
 
     LOG.logger.info(f"\n{'='*20} Processing channel: {channel_name} | Channel: {current_channel}/{channels_total} | {LOG.TimeCurrent()} | Elapsed: {LOG.TimeDurration()} {'='*20}")
+    ST.set_info(channel=channel_name,channel_progress=f"{current_channel}/{channels_total}",phase="Fetching video list")
 
     # Create the data paths if they don't exist
     for d_path in CFG.DATA_PATHS:
@@ -127,7 +138,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
         channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,CFG.LOCAL_DATA_PATH)
     except C.BucketUnavailableError:
         LOG.logger.error(f"Skipping channel {channel_name}: bucket unavailable.")
-        return
+        return 1
 
     #################################
     ### VIDEO AND CHAT PROCESSING ###
@@ -183,9 +194,11 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
         LOG.logger.info(f"  {len(login_required_ids):,} login-required video(s) skipped (no cookies provided).")
 
     LOG.logger.info("Fetching video details in batches of 50...")
+    ST.set_info(phase="Fetching video details")
     video_info_cache:dict[str,C.VideoClass] = {}
+    fetch_errors = 0 # Videos whose details couldn't be fetched (not ones the API just doesn't return)
     with LOG.TQDM_Logging():
-        with tqdm(desc='Video Info Fetched',total=len(unprocessed_ids),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=0,leave=False) as fetchbar:
+        with ST.Bar(desc='Video Info Fetched',total=len(unprocessed_ids),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=0,leave=False) as fetchbar:
             for i in range(0,len(unprocessed_ids),50):
                 batch = unprocessed_ids[i:i+50]
                 try:
@@ -199,6 +212,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
                             if vid:
                                 video_info_cache[vid_id] = vid
                         except Exception as e2:
+                            fetch_errors += 1
                             LOG.logger.error(f"Individual fetch failed for {vid_id}: {e2}")
                 fetchbar.update(len(batch))
     LOG.logger.info(f"{len(video_info_cache):,} video(s) ready for processing.")
@@ -211,6 +225,13 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
         """
         thread_db = get_thread_db()
         vid = video_info_cache[video_id]
+        ST.set_task(_thread_local.bar_position,f"{video_id} {getattr(vid,'title',None) or ''}")
+        try:
+            return _process_video(video_id,vid,thread_db)
+        finally:
+            ST.set_task(_thread_local.bar_position,None)
+
+    def _process_video(video_id:str,vid:C.VideoClass,thread_db:DB.PostgresClass) -> tuple[C.VideoStats, C.ChatStats]:
         video_exists = video_id in video_db_status
         local_vid_stats = C.VideoStats()
         local_chat_stats = C.ChatStats()
@@ -263,9 +284,17 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
                 LOG.logger.info(f"{video_id}: Skipping livestream.")
                 rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
             else:
-                def _mark_processed():
+                def _mark_processed(compressed:bool=False):
+                    """
+                    :param compressed: Also set raw_chat_compressed -- only when this download wrote
+                        every one of the video's rows (see ChatStats.preexisting_rows), so there's
+                        nothing for compress_raw_chat.py to convert or correct.
+                    """
+                    fields = {"processed":True,"login_required":False}
+                    if compressed:
+                        fields["raw_chat_compressed"] = True
                     try:
-                        DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],{"processed":True,"login_required":False},"id",video_id)
+                        DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],fields,"id",video_id)
                         # duration (and therefore messages_per_min) is only known once the video
                         # has actually finished, which is exactly the condition under which
                         # _mark_processed() gets called.
@@ -288,7 +317,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
                         message_stats = yt.Get_Messages(vid,channel_bucket,known_user_ids,sorted_nicknames,db=thread_db,user_id_lock=user_id_lock,known_emote_ids=known_emote_ids,bar_position=_thread_local.bar_position)
                     message_stats.append_all(local_chat_stats)
                     if vid.livestream == False:
-                        _mark_processed()
+                        _mark_processed(compressed=message_stats.preexisting_rows == 0)
                     local_vid_stats.success_videos = 1
                     if vid.livestream == True:
                         local_vid_stats.still_live = 1
@@ -355,8 +384,9 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
     _available_positions = list(range(1, CFG.WORKER_COUNT + 1))
 
     LOG.logger.info(f"Processing videos with {CFG.WORKER_COUNT} worker(s)...")
+    ST.set_info(phase="Processing videos")
     with LOG.TQDM_Logging():
-        with tqdm(desc='Videos Processed',total=len(video_ids),bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix="",position=0,leave=False) as vidbar:
+        with ST.Bar(desc='Videos Processed',total=len(video_ids),bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix="",position=0,leave=False) as vidbar:
 
             def Update_Postfix_Videos():
                 return f"Successful: {vid_stats.success_videos:,} | Skipped: {vid_stats.skipped_videos:,} | No Chat: {vid_stats.no_chat_videos:,} | Unavailable: {vid_stats.unavailable_videos:,} | Errors: {vid_stats.error_videos:,}"
@@ -405,6 +435,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
         LOG.logger.info("Skipping user processing (chat download skipped).")
     else:
         LOG.logger.info("Obtaining all unprocessed users from database...")
+        ST.set_info(phase="Processing users")
         # Get fresh users from the DB
         unique_users = DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id",{"processed":False})
         db.database.commit()  # same reason as after the preload above
@@ -419,7 +450,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int):
             return f"Skipped: {all_chat_stats.invalid_users:,}"
 
         with LOG.TQDM_Logging():
-            with tqdm(total=len(user_list),desc='Users Processed',bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
+            with ST.Bar(total=len(user_list),desc='Users Processed',bar_format='{desc}: {n_fmt}/{total_fmt} {postfix}',ncols=80,postfix=Update_Postfix_Users(),position=0,leave=False) as userbar:
                 for users in Batch_Users(user_list):
                     all_chat_stats.invalid_users += yt.Get_User_Batch(users,user_bucket)
                     userbar.set_postfix_str(Update_Postfix_Users())
@@ -457,18 +488,30 @@ Existing:       {len(all_chat_stats.exist_user_ids - all_chat_stats.new_user_ids
 Invalid:        {all_chat_stats.invalid_users:,}
 """)
 
+    return vid_stats.error_videos + fetch_errors
+
+# Compresses and archives each channel that finishes cleanly in a background thread while the
+# next channel processes -- see modules/ChannelArchiver.py. Its status slot sits after the workers'.
+archiver = CA.ChannelArchiver(CFG.WORKER_COUNT + 1) if CFG.AUTO_ARCHIVE and not CFG.GET_MEMBERS_ONLY else None
+
 for channel_index,channel_name in enumerate(CFG.CHANNELS_TO_PROCESS):
     CFG.select_channel(channel_name)
     if not CFG.GET_MEMBERS_ONLY:
         DB.EnsureMessagesPartition(db.cursor,CFG.DB_TABLES["messages"],CFG.YT_USER_ID)
         db.database.commit()
-    process_channel(channel_name,channel_index + 1,len(CFG.CHANNELS_TO_PROCESS))
+    channel_errors = process_channel(channel_name,channel_index + 1,len(CFG.CHANNELS_TO_PROCESS))
+    if archiver is not None:
+        if channel_errors == 0:
+            archiver.submit(channel_name)
+        else:
+            LOG.logger.warning(f"{channel_name}: {channel_errors:,} error(s) this run -- skipping compress/archive until a clean run.")
 
 # Recompute first_messages/first_channel_messages, the message-count leaderboard ranks, and the
 # per-user summary once per run (none can be maintained incrementally -- see each Refresh*
 # docstring), skipping any whose source tables haven't changed since they last ran. See
 # RefreshRollupsIfChanged for how changes are detected.
 if not CFG.SKIP_ROLLUPS:
+    ST.set_info(channel=None,channel_progress=None,phase="Refreshing rollups")
     DB.RefreshRollupsIfChanged(db.cursor)
 
 # Subtitle downloading runs as its own pass, after every channel's chat/video processing is
@@ -478,3 +521,7 @@ if not CFG.SKIP_ROLLUPS:
 # interactive prompts the way a fresh subprocess would.
 import Subtitles
 Subtitles.run(db,s3,yt,CFG.CHANNELS_TO_PROCESS)
+
+if archiver is not None:
+    ST.set_info(channel=None,channel_progress=None,phase="Waiting for archive")
+    archiver.finish()

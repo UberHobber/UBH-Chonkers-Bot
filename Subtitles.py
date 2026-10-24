@@ -4,14 +4,12 @@ from datetime import datetime,timedelta,timezone
 
 sys.path.append(os.getcwd())
 
-# Installed Stuff
-from tqdm import tqdm
-
 # Other Project Files
 import modules.Settings as CFG
 import modules.logconfig as LOG
 import modules.Classes as C
 import modules.Database as DB
+import modules.Status as ST
 
 """
 Runs the subtitle-download pass for every channel, independent of chat/video processing.
@@ -72,6 +70,7 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
     for channel_name in channel_names:
         CFG.select_channel(channel_name)
         LOG.logger.info(f"Subtitle pass: {channel_name}")
+        ST.set_info(channel=channel_name,channel_progress=f"{channel_names.index(channel_name) + 1}/{len(channel_names)}",phase="Subtitle pass")
         local_root = _local_root()
         try:
             channel_bucket = C.H3Bucket(s3.client,CFG.CHANNEL_SUFFIX,local_root)
@@ -86,6 +85,7 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
 
         def process_subtitle(video:dict) -> None:
             video_id = video["id"]
+            ST.set_task(BAR_POSITION,video_id)
             try:
                 stats = yt.Get_Subtitles(video_id,channel_bucket,db=worker_db,rate_limiter=subtitle_rate_limiter,bar_position=BAR_POSITION)
                 breaker.record_success()
@@ -118,10 +118,12 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
                 tally["errors"] += 1
                 worker_db.database.rollback()
                 LOG.logger.error(f"{video_id}: Subtitle download error: {e}")
+            finally:
+                ST.set_task(BAR_POSITION,None)
 
         try:
             with LOG.TQDM_Logging():
-                with tqdm(desc='Subtitles Processed',total=len(videos),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=0,leave=False) as bar:
+                with ST.Bar(desc='Subtitles Processed',total=len(videos),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=0,leave=False) as bar:
                     for video in videos:
                         if breaker.tripped:
                             LOG.logger.warning(f"Circuit breaker tripped -- skipping the remaining {len(videos) - bar.n:,} video(s) for {channel_name} this run.")
@@ -137,6 +139,8 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
 
 if __name__ == "__main__":
     # Standalone invocation needs its own bootstrap, same as Main.py's top.
+    ST.start("Subtitles",LOG.logger)
+    ST.set_info(phase="Starting up")
     db = DB.PostgresClass()
     DB.EnsureSchema(db.cursor,CFG.GET_MEMBERS_ONLY)
     db.database.commit()

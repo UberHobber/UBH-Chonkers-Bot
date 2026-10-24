@@ -6,7 +6,6 @@ from typing import Any
 from datetime import datetime
 
 # Installed Stuff
-from tqdm import tqdm
 from chat_downloader import ChatDownloader
 from chat_downloader.sites.youtube import YouTubeChatDownloader
 import yt_dlp
@@ -49,6 +48,7 @@ from botocore.exceptions import ClientError
 import modules.logconfig as LOG
 import modules.Settings as CFG
 import modules.Database as DB
+import modules.Status as ST
 
 @contextmanager
 def Stage_Bar(desc:str,position:int):
@@ -60,7 +60,7 @@ def Stage_Bar(desc:str,position:int):
     line is overwritten by whatever comes next and never accumulates as a completed bar once the
     stage finishes.
     """
-    with tqdm(desc=desc,bar_format='{desc}',ncols=80,position=position,leave=False) as bar:
+    with ST.Bar(desc=desc,bar_format='{desc}',ncols=80,position=position,leave=False) as bar:
         yield bar
 
 class VideoStats:
@@ -82,6 +82,11 @@ class ChatStats:
         self.new_user_ids:set = set()
         self.exist_user_ids:set = set()
         self.invalid_users:int = 0
+        # Per video only (not summed by append_all): rows this video already had in messages
+        # before this download. 0 means every row was written by the current code -- correct
+        # badge flags, raw file already .json.gz -- so Main.py can mark the video
+        # raw_chat_compressed itself instead of leaving it for compress_raw_chat.py.
+        self.preexisting_rows:int = 0
 
     def append_all(self,all_chat_stats:'ChatStats'):
         """Updates the total stats with additional numbers"""
@@ -396,7 +401,7 @@ class MessageClass:
     def __init__(self,message:dict[str,Any],video:VideoClass):
         try:
             self.id = message.get("message_id") # Back-end ID for message
-            self.message:str|None = message.get("message") # Message contents
+            self.message:str|None = _strip_nul(message.get("message")) # Message contents
             self._time_absolute = message.get("timestamp")
             if self._time_absolute is not None:
                 self.time_absolute = self._time_absolute/1000000 # Exact time the message was sent (Timestamp is in microseconds so need to convert it)
@@ -410,7 +415,7 @@ class MessageClass:
 
             if self._author is not None:
                 self.usr_id = self._author.get("id")
-                self.usr_name = self._author.get("name")
+                self.usr_name = _strip_nul(self._author.get("name"))
 
                 self._badges:list[dict[str,Any]]|None = self._author.get("badges")
 
@@ -443,7 +448,7 @@ class MessageClass:
             if self._emotes is not None:
                 for emote in self._emotes:
                     e_id = emote.get("id")
-                    e_name = emote.get("name")
+                    e_name = _strip_nul(emote.get("name"))
                     e_custom = emote.get("is_custom_emoji")
                     e_images:list[dict[str,Any]]|None = emote.get("images")
                     e_url = None
@@ -880,7 +885,7 @@ class YT_API:
         :rtype: List of Strings
         """
         with LOG.TQDM_Logging():
-            with tqdm(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
+            with ST.Bar(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
 
                 request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
                 try:
@@ -1027,6 +1032,7 @@ class YT_API:
 
         message_list:list[dict[str,Any]] = []
         chat_stats = ChatStats()
+        chat_stats.preexisting_rows = len(known_message_ids)
 
         if skip_download == False:
             # chat_downloader's built-in inactivity_timeout calls _thread.interrupt_main(),
@@ -1092,7 +1098,7 @@ class YT_API:
             DB.RecordMessageStatsBatch(_db.cursor, pending_stats)
             pending_stats.clear()
 
-        with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
+        with ST.Bar(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
             try:
                 unique_user_ids = set()
                 uncommitted = 0
@@ -1483,8 +1489,8 @@ class YT_API:
 
 def _strip_nul(value:str|None) -> str|None:
     """Postgres text columns can't store NUL (0x00) bytes -- psycopg2 raises ValueError on them.
-    Some YouTube channel names/custom URLs contain literal NULs (seen in troll/spam accounts), so
-    strip them before the value ever reaches a query."""
+    Some YouTube channel names/custom URLs and chat messages contain literal NULs (seen in troll/spam
+    accounts and the odd superchat), so strip them before the value ever reaches a query."""
     if value is None:
         return None
     return value.replace("\x00","")

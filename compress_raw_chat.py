@@ -14,6 +14,7 @@ import modules.Settings as CFG
 import modules.logconfig as LOG
 import modules.Database as DB
 import modules.Classes as C
+import modules.Status as ST
 
 """
 Converts each processed video's raw chat_downloader JSON on S3 from the legacy indented
@@ -38,6 +39,11 @@ is running -- the bot converts unprocessed videos' files itself the next time it
 them. Videos with no raw file at all are still marked raw_chat_compressed (nothing to correct
 from), and counted in the summary. Members-only videos are compressed but not corrected (their
 rows live in the legacy *_members tables, which are out of scope).
+
+Main.py runs compress_channel() automatically for each channel that finishes cleanly
+(CFG.AUTO_ARCHIVE, see modules/ChannelArchiver.py), and marks videos it downloaded in one go
+raw_chat_compressed itself (see ChatStats.preexisting_rows) -- so this mostly has work left for
+videos processed before the badge fix, or ones that already had rows from an earlier download.
 
 Bucket versioning must be OFF on the S3 store, or deleting the legacy objects frees nothing.
 Idempotent -- safe to re-run.
@@ -179,6 +185,99 @@ def _recompute_pending(db:DB.PostgresClass,channel_id:str,partition:str) -> int:
     db.database.commit()
     return updated
 
+def compress_channel(db:DB.PostgresClass,client,channel_name:str,tmp_dir:str,workers:int,dry_run:bool=False,bar_position:int=0,log_prefix:str="") -> dict[str,int]:
+    """
+    Compresses and corrects one channel's processed videos. Returns this channel's counts
+    (videos, converted, no_raw, fixes, users, freed, written). Uses CFG.channel_targets rather
+    than CFG.select_channel, so Main.py can run it in a background thread (modules/ChannelArchiver.py)
+    while the main thread works on another channel.
+    """
+    cur = db.cursor
+    channel_id,partition,bucket = CFG.channel_targets(channel_name)
+    has_partition = DB.TableExists(cur,partition)
+    counts = {"videos":0,"converted":0,"no_raw":0,"fixes":0,"users":0,"freed":0,"written":0}
+
+    # Finish any recompute an interrupted run left behind before queueing more.
+    if has_partition and not dry_run:
+        counts["users"] += _recompute_pending(db,channel_id,partition)
+
+    cur.execute("""SELECT id, members FROM public.videos
+                   WHERE channel_id = %s AND processed AND NOT raw_chat_compressed ORDER BY id""",(channel_id,))
+    videos = cur.fetchall()
+    db.database.commit() # End the read so this connection isn't left idle in transaction
+    if not videos:
+        return counts
+
+    # Channels processed before S3 storage existed may have no bucket at all -- every
+    # video is then simply "no raw file". Only a definite "no such bucket" counts: any
+    # other error (store down, 5xx, auth) would otherwise permanently mark the whole
+    # channel compressed without correcting its flags, so skip it for this run instead.
+    try:
+        client.head_bucket(Bucket=bucket)
+        bucket_exists = True
+    except ClientError as e:
+        if e.response["Error"]["Code"] not in ("404","NoSuchBucket"): #type:ignore
+            raise RuntimeError(f"{channel_name}: S3 bucket '{bucket}' isn't reachable ({e})") from e
+        bucket_exists = False
+    if not bucket_exists:
+        LOG.logger.warning(f"{log_prefix}{channel_name}: no S3 bucket '{bucket}' -- {len(videos):,} video(s) have no raw chat to compress or correct from.")
+        if not dry_run:
+            cur.execute("UPDATE public.videos SET raw_chat_compressed = true WHERE id = ANY(%s)",([v[0] for v in videos],))
+            db.database.commit()
+        counts["videos"] += len(videos); counts["no_raw"] += len(videos)
+        return counts
+
+    if dry_run:
+        legacy_bytes = legacy_count = biggest = 0
+        for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket,Prefix=f"{CFG.MESSAGES_TAG}/"):
+            for o in page.get("Contents",[]):
+                if o["Key"].endswith(".json"):
+                    legacy_bytes += o["Size"]; legacy_count += 1; biggest = max(biggest,o["Size"])
+        LOG.logger.info(f"{log_prefix}{channel_name}: {len(videos):,} video(s) to check; {legacy_count:,} legacy file(s), "
+                        f"{legacy_bytes/1024**3:,.1f} GB -> ~{legacy_bytes*0.057/1024**3:,.1f} GB; largest {biggest/1024**2:,.0f} MB")
+        counts["videos"] += len(videos); counts["freed"] += legacy_bytes; counts["written"] += int(legacy_bytes*0.057)
+        return counts
+
+    start = time.time()
+    with ST.Bar(desc="Compressing raw chat",total=len(videos),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=bar_position,leave=False) as bar, \
+         ThreadPoolExecutor(max_workers=workers) as pool:
+        # S3 work (download/compress/upload/verify) and each video's read-only flag lookup
+        # run in the pool, so the NAS downloads keep going while a lookup waits on the DB's
+        # disks; only the (rare) fix UPDATEs and the progress marker run on this thread's
+        # connection, in video order. Up to 2x `workers` videos are in flight -- results
+        # are small (the parsed chat is dropped in the worker), so this costs little memory.
+        pending:deque = deque()
+        queue_iter = iter(videos)
+        def _top_up():
+            while len(pending) < workers * 2:
+                nxt = next(queue_iter,None)
+                if nxt is None:
+                    return
+                part = partition if has_partition and not nxt[1] else None
+                pending.append((nxt[0],nxt[1],pool.submit(_process_video,client,bucket,nxt[0],tmp_dir,part)))
+        _top_up()
+        while pending:
+            video_id,members,future = pending.popleft()
+            has_raw,freed,written,fixes = future.result()
+            _top_up()
+            if not has_raw:
+                counts["no_raw"] += 1
+            else:
+                counts["converted"] += 1 if freed else 0
+                counts["freed"] += freed; counts["written"] += written
+                counts["fixes"] += _apply_flag_fixes(cur,partition,channel_id,fixes)
+            cur.execute("UPDATE public.videos SET raw_chat_compressed = true WHERE id = %s",(video_id,))
+            db.database.commit()
+            bar.update(1)
+            if bar.n % 50 == 0:
+                LOG.logger.info(f"  {log_prefix}{channel_name}: {bar.n:,}/{len(videos):,} video(s)...")
+
+    users = _recompute_pending(db,channel_id,partition) if has_partition else 0
+    counts["videos"] += len(videos); counts["users"] += users
+    LOG.logger.info(f"{log_prefix}{channel_name}: {len(videos):,} video(s) compressed in {time.time()-start:,.0f}s -- {counts['converted']:,} converted, "
+                    f"{counts['no_raw']:,} without a raw file, {counts['fixes']:,} message flag fix(es), {counts['users']:,} user rollup(s) updated")
+    return counts
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compress raw chat JSON on S3 and correct badge flags.")
     parser.add_argument("--channel",action="append",help="Channel name to process (repeatable). Default: every channel.")
@@ -190,6 +289,7 @@ def main() -> None:
         LOG.logger.error("Run this in public mode (GET_MEMBERS_ONLY = False) -- it corrects public messages partitions.")
         return
 
+    ST.start("compress",LOG.logger)
     db = DB.PostgresClass()
     cur = db.cursor
     CFG.load_channel_directory(cur)
@@ -198,88 +298,14 @@ def main() -> None:
 
     totals = {"videos":0,"converted":0,"no_raw":0,"fixes":0,"users":0,"freed":0,"written":0}
     with tempfile.TemporaryDirectory() as tmp_dir:
-        for channel_name in channels:
-            CFG.select_channel(channel_name)
-            channel_id,partition,bucket = CFG.YT_USER_ID,CFG.DB_TABLES["messages"],CFG.CHANNEL_SUFFIX
-            has_partition = DB.TableExists(cur,partition)
-
-            # Finish any recompute an interrupted run left behind before queueing more.
-            if has_partition and not args.dry_run:
-                users = _recompute_pending(db,channel_id,partition)
-                totals["users"] += users
-
-            cur.execute("""SELECT id, members FROM public.videos
-                           WHERE channel_id = %s AND processed AND NOT raw_chat_compressed ORDER BY id""",(channel_id,))
-            videos = cur.fetchall()
-            if not videos:
-                continue
-
-            # Channels processed before S3 storage existed may have no bucket at all -- every
-            # video is then simply "no raw file".
+        for index,channel_name in enumerate(channels,1):
+            ST.set_info(channel=channel_name,channel_progress=f"{index}/{len(channels)}",phase="Compressing raw chat")
             try:
-                client.head_bucket(Bucket=bucket)
-                bucket_exists = True
-            except ClientError:
-                bucket_exists = False
-            if not bucket_exists:
-                LOG.logger.warning(f"{channel_name}: no S3 bucket '{bucket}' -- {len(videos):,} video(s) have no raw chat to compress or correct from.")
-                if not args.dry_run:
-                    cur.execute("UPDATE public.videos SET raw_chat_compressed = true WHERE id = ANY(%s)",([v[0] for v in videos],))
-                    db.database.commit()
-                totals["videos"] += len(videos); totals["no_raw"] += len(videos)
+                counts = compress_channel(db,client,channel_name,tmp_dir,args.workers,args.dry_run)
+            except RuntimeError as e:
+                LOG.logger.error(f"{e} -- skipped.")
                 continue
-
-            if args.dry_run:
-                legacy_bytes = legacy_count = biggest = 0
-                for page in client.get_paginator("list_objects_v2").paginate(Bucket=bucket,Prefix=f"{CFG.MESSAGES_TAG}/"):
-                    for o in page.get("Contents",[]):
-                        if o["Key"].endswith(".json"):
-                            legacy_bytes += o["Size"]; legacy_count += 1; biggest = max(biggest,o["Size"])
-                LOG.logger.info(f"{channel_name}: {len(videos):,} video(s) to check; {legacy_count:,} legacy file(s), "
-                                f"{legacy_bytes/1024**3:,.1f} GB -> ~{legacy_bytes*0.057/1024**3:,.1f} GB; largest {biggest/1024**2:,.0f} MB")
-                totals["videos"] += len(videos); totals["freed"] += legacy_bytes; totals["written"] += int(legacy_bytes*0.057)
-                continue
-
-            start = time.time()
-            ch = {"converted":0,"no_raw":0,"fixes":0}
-            with ThreadPoolExecutor(max_workers=args.workers) as pool:
-                # S3 work (download/compress/upload/verify) and each video's read-only flag lookup
-                # run in the pool, so the NAS downloads keep going while a lookup waits on the DB's
-                # disks; only the (rare) fix UPDATEs and the progress marker run on this thread's
-                # connection, in video order. Up to 2x `workers` videos are in flight -- results
-                # are small (the parsed chat is dropped in the worker), so this costs little memory.
-                pending:deque = deque()
-                queue_iter = iter(videos)
-                def _top_up():
-                    while len(pending) < args.workers * 2:
-                        nxt = next(queue_iter,None)
-                        if nxt is None:
-                            return
-                        part = partition if has_partition and not nxt[1] else None
-                        pending.append((nxt[0],nxt[1],pool.submit(_process_video,client,bucket,nxt[0],tmp_dir,part)))
-                _top_up()
-                i = 0
-                while pending:
-                    video_id,members,future = pending.popleft()
-                    has_raw,freed,written,fixes = future.result()
-                    _top_up()
-                    i += 1
-                    if not has_raw:
-                        ch["no_raw"] += 1
-                    else:
-                        ch["converted"] += 1 if freed else 0
-                        totals["freed"] += freed; totals["written"] += written
-                        ch["fixes"] += _apply_flag_fixes(cur,partition,channel_id,fixes)
-                    cur.execute("UPDATE public.videos SET raw_chat_compressed = true WHERE id = %s",(video_id,))
-                    db.database.commit()
-                    if i % 50 == 0:
-                        LOG.logger.info(f"  {channel_name}: {i:,}/{len(videos):,} video(s)...")
-
-            users = _recompute_pending(db,channel_id,partition) if has_partition else 0
-            totals["videos"] += len(videos); totals["users"] += users
-            for k in ch: totals[k] += ch[k]
-            LOG.logger.info(f"{channel_name}: {len(videos):,} video(s) in {time.time()-start:,.0f}s -- {ch['converted']:,} converted, "
-                            f"{ch['no_raw']:,} without a raw file, {ch['fixes']:,} message flag fix(es), {users:,} user rollup(s) updated")
+            for k in totals: totals[k] += counts[k]
 
     db.Close()
     verb = "Would convert" if args.dry_run else "Done:"

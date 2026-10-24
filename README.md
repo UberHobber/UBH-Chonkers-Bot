@@ -39,19 +39,21 @@ Downloads the metadata, thumbnails and full chat history (messages, Super Chats,
 
 ### Routine run
 
-Do these in order. Each one is safe to re-run, and each picks up where it left off if it's interrupted.
+Each step is safe to re-run, and each picks up where it left off if it's interrupted.
 
-1. **Download new videos and chat:** `Launch.bat` runs `Main.py`. For each channel it:
+1. **Download new videos and chat:** `Launch_With_Monitor.bat` runs `Main.py` in one window and a live status view (`Monitor.py`) in another. `Launch.bat` runs `Main.py` alone. For each channel the bot:
    - lists every upload;
    - saves metadata and thumbnails for new videos;
-   - downloads chat for every unprocessed video into Postgres, keeping the raw chat as `messages/<video>.json.gz` in the channel's bucket.
+   - downloads chat for every unprocessed video into Postgres, keeping the raw chat as `messages/<video>.json.gz` in the channel's bucket;
+   - if the channel finished with no errors, hands it to a background thread that prepares and archives its finished chat (steps 3 and 4 below) while the bot moves on to the next channel. The thread shows as the **Archive** slot in the monitor. Turn this off with `AUTO_ARCHIVE = False`.
 
    Shorts are marked done without downloading chat. Live and upcoming streams are left for a later run.
 2. *(Optional)* **Download auto-captions:** `Launch.bat Subtitles.py`. This can run on its own or at the same time as `Main.py`.
-3. **Prepare finished chat for archiving:** `Launch.bat compress_raw_chat.py --workers 4`. For each newly processed video it compresses any raw chat still in the old format and corrects badge flags from it. It's safe to run while the bot is running.
-4. **Archive finished chat (stop the bot first):** `Launch.bat archive_chat.py`. It moves processed videos' chat out of Postgres into Parquet files under `chat_archive/` in each channel's bucket, verifies every file, then empties the moved rows from the database.
 
-Steps 3 and 4 don't run on their own. Until you run them, chat from new videos stays in Postgres. Both scripts accept `--channel "<name>"` to limit them to one channel, and `--dry-run` to report what they'd do without changing anything.
+Steps 3 and 4 run automatically for every channel that finishes cleanly. Run them by hand for channels that had errors, to catch up after a run with `AUTO_ARCHIVE` off, or for a channel the bot isn't processing. Both scripts accept `--channel "<name>"` to limit them to one channel, and `--dry-run` to report what they'd do without changing anything.
+
+3. **Prepare finished chat for archiving:** `Launch.bat compress_raw_chat.py --workers 4`. For each processed video it compresses any raw chat still in the old format and corrects badge flags from it. Videos the bot downloaded in one go are already marked done, so this only has real work for older videos. It's safe to run while the bot is running.
+4. **Archive finished chat:** `Launch.bat archive_chat.py`. It moves processed videos' chat out of Postgres into Parquet files under `chat_archive/` in each channel's bucket, verifies every file, then empties the moved rows from the database. Don't run it for a channel the bot is processing at that moment. Other channels are fine.
 
 ### Querying chat
 
@@ -103,6 +105,8 @@ The main flags at the top of [`modules/Settings.py`](modules/Settings.py):
 | `SKIP_ROLLUPS` | Skip the end-of-run rebuild of leaderboards and `user_summary` |
 | `SKIP_SUBTITLE_DOWNLOAD` | Leave captions to `Subtitles.py` instead of the end of `Main.py` |
 | `USE_COOKIES` | Use `cookies.txt` for public runs (for age-restricted videos) |
+| `AUTO_ARCHIVE` | Compress and archive each channel that finishes with no errors, in the background while the next channel runs |
+| `PROGRESS_BARS` | Also draw progress bars in the bot's own console (`Monitor.py` shows the same progress without the line spam) |
 | `QUICK_SETTINGS` | `True` uses the folders and flags in the file. `False` prompts with dialogs at launch, including members-only mode, chat timeout and livestream skipping. |
 
 Members-only mode (`GET_MEMBERS_ONLY`) writes to the legacy `*_members` tables, which `archive_chat.py` doesn't archive.

@@ -94,6 +94,13 @@ CHAT_REPLAY_GRACE_HOURS = 24
 # as chat replay finalization timing.
 SUBTITLE_GRACE_HOURS = 24
 
+# After a channel finishes with no errors, compress (compress_raw_chat.py) and then archive
+# (archive_chat.py) its chat in a background thread while the bot moves on to the next channel.
+# Channels that had errors are left for a later clean run. Public mode only.
+AUTO_ARCHIVE = True
+ARCHIVE_COMPRESS_WORKERS = 2 # Parallel S3 conversions in the compress step (each holds one video's chat in memory)
+ARCHIVE_MAX_ROWS = 10_000_000 # Messages per Parquet file (~250MB)
+
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
 QUICK_SETTINGS_DATA = "D:/CodingProjects/_Datafiles"
@@ -107,6 +114,12 @@ DEBUG_LOG_FILE='Chat_Process_Log' # Used when CONTINUOUS_LOG is set to True
 LOG_VERBOSE = False # Any debug messages will appear
 LOG_NAME = "LOG" # Log file prefix
 CONTINUOUS_LOG = True # Create one continuous log file and not separate ones per-run
+
+# Status Display (see modules/Status.py)
+# Run "Launch.bat Monitor.py" in a second window to watch the bot -- it reads the status file below.
+PROGRESS_BARS = False # Also draw tqdm progress bars in the bot's own console (prone to spamming lines on Windows)
+STATUS_INTERVAL = 2.0 # Seconds between status file writes
+STATUS_DIRECTORY = "" # Folder for status_<script>.json files. Blank = the folder the bot was launched from
 
 # File Object Prefixes
 MEMBERS_ONLY_FLAG = "_members"
@@ -271,6 +284,15 @@ def select_channel(channel_name:str) -> None:
 
     # Leave this be, edit CUSTOM PLAYLIST and MEMBERS values above instead.
     PLAYLIST = UPLOAD_PLAYLIST if GET_MEMBERS_ONLY is False else MEMBERS_ONLY_PLAYLIST
+
+def channel_targets(channel_name:str) -> tuple[str,str,str]:
+    """
+    (channel_id, public messages partition, S3 bucket) for a channel, without touching the
+    globals select_channel() sets -- safe to call from a background thread while the main
+    thread is working on a different channel. Public mode naming only.
+    """
+    entry = CHANNEL_DIRECTORY[channel_name]
+    return entry["user_id"],f"messages_{entry['db_suffix']}",entry["db_suffix"]
 
 if os.path.exists(f"{SECRETS_DIRECTORY}/S3_Settings.json"):
     # Edit the template provided and stuff it in your secrets folder

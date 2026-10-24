@@ -12,6 +12,7 @@ import modules.logconfig as LOG
 import modules.Database as DB
 import modules.Classes as C
 import modules.Archive as A
+import modules.Status as ST
 
 """
 Moves processed videos' chat out of Postgres into zstd Parquet files on S3, in each channel's own
@@ -39,9 +40,12 @@ Per channel:
        If the transaction fails, this run's files are deleted again.
 
 Refuses a channel that still has badge_fix_pending rows (finish compress_raw_chat.py first).
-Run with the bot stopped: step 5 takes an exclusive lock on the partition, so the bot couldn't
-write that channel's chat meanwhile (and a TRUNCATE can't run while it does). Idempotent -- an
-interrupted run leaves Postgres untouched and its files are cleaned up as orphans next time.
+Don't run it on a channel the bot is currently processing: step 5 takes an exclusive lock on
+that channel's partition, so the bot couldn't write its chat meanwhile (and a TRUNCATE can't run
+while it does). Other channels are unaffected -- the bot reads and writes each channel's
+partition directly, never the parent messages table. Main.py runs this automatically for each
+channel that finishes cleanly (CFG.AUTO_ARCHIVE, see modules/ChannelArchiver.py). Idempotent --
+an interrupted run leaves Postgres untouched and its files are cleaned up as orphans next time.
 
 Usage: archive_chat.py [--channel NAME ...] [--dry-run] [--max-rows N]
 """
@@ -135,6 +139,101 @@ def _commit_channel(db:DB.PostgresClass,channel_id:str,partition:str,files:list[
     db.database.commit()
     return kept
 
+class ArchiveSkipped(Exception):
+    """A channel archive_channel() can't archive yet (pending badge fixes, bucket unreachable). Nothing was changed."""
+
+def archive_channel(db:DB.PostgresClass,client,duck,channel_name:str,max_rows:int,dry_run:bool=False,bar_position:int=0,log_prefix:str="") -> tuple[int,int]:
+    """
+    Archives one channel's processed, compressed videos. Returns (messages archived, videos
+    archived) -- or what would be, with dry_run. Raises ArchiveSkipped if the channel isn't
+    ready. Uses CFG.channel_targets rather than CFG.select_channel, so Main.py can run it in a
+    background thread (modules/ChannelArchiver.py) while the main thread works on another channel.
+    """
+    cur = db.cursor
+    channel_id,partition,bucket = CFG.channel_targets(channel_name)
+    if not DB.TableExists(cur,partition):
+        db.database.commit()
+        return 0,0
+
+    cur.execute("SELECT count(*) FROM public.badge_fix_pending WHERE channel_id = %s",(channel_id,))
+    if cur.fetchone()[0]:
+        db.database.commit()
+        raise ArchiveSkipped(f"{channel_name}: badge_fix_pending has rows -- run compress_raw_chat.py for it first.")
+
+    cur.execute("""SELECT id FROM public.videos
+                   WHERE channel_id = %s AND processed AND raw_chat_compressed AND NOT chat_archived AND NOT members
+                   ORDER BY publishedat NULLS LAST, id""",(channel_id,))
+    candidates = [r[0] for r in cur.fetchall()]
+    cur.execute("""SELECT count(*) FROM public.videos
+                   WHERE channel_id = %s AND processed AND NOT raw_chat_compressed AND NOT chat_archived AND NOT members""",(channel_id,))
+    waiting = cur.fetchone()[0]
+    db.database.commit()
+    if waiting:
+        LOG.logger.info(f"{log_prefix}{channel_name}: {waiting:,} processed video(s) still need compress_raw_chat.py before they can be archived.")
+    if not candidates:
+        return 0,0
+
+    try:
+        client.head_bucket(Bucket=bucket)
+    except ClientError as e:
+        raise ArchiveSkipped(f"{channel_name}: S3 bucket '{bucket}' isn't reachable ({e}).") from e
+    _cleanup_orphans(cur,client,bucket,channel_id,dry_run)
+
+    cur.execute(f"""SELECT video_id, count(*), min("timestamp"), max("timestamp") FROM public.{partition}
+                    WHERE video_id = ANY(%s) GROUP BY video_id""",(candidates,))
+    found = {r[0]:r for r in cur.fetchall()}
+    db.database.commit()
+    counts = [found[v] for v in candidates if v in found]
+    empty = [v for v in candidates if v not in found]
+    rows = sum(c[1] for c in counts)
+
+    if dry_run:
+        LOG.logger.info(f"{log_prefix}{channel_name}: {len(counts):,} video(s), {rows:,} message(s) -> ~{rows*_PARQUET_BYTES_PER_ROW/1024**3:,.2f} GB Parquet "
+                        f"in {len(_batches(counts,max_rows)):,} file(s); {len(empty):,} video(s) with no chat rows")
+        return rows,len(counts)
+
+    # No chat rows in Postgres (no chat, or members/Shorts edge cases): nothing to move, but
+    # mark them so they aren't re-checked every run.
+    if empty:
+        cur.execute("UPDATE public.videos SET chat_archived = true WHERE id = ANY(%s)",(empty,))
+        db.database.commit()
+    if not counts:
+        return 0,0
+
+    start = time.time()
+    cur.execute("SELECT pg_total_relation_size(%s)",(f"public.{partition}",))
+    size_before = cur.fetchone()[0]
+    db.database.commit()
+    files:list[tuple[str,list[tuple[str,int,int,int]]]] = []
+    batches = _batches(counts,max_rows)
+    with ST.Bar(desc="Archiving: exporting",total=rows,bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=bar_position,leave=False) as bar:
+        try:
+            for i,batch in enumerate(batches,1):
+                files.append((_export_batch(cur,duck,bucket,partition,batch),batch))
+                bar.update(sum(b[1] for b in batch))
+                LOG.logger.info(f"  {log_prefix}{channel_name}: file {i}/{len(batches)} -- {len(batch):,} video(s), {bar.n:,}/{rows:,} message(s) exported and verified ({time.time()-start:,.0f}s)")
+            bar.set_description_str("Archiving: committing")
+            kept = _commit_channel(db,channel_id,partition,files)
+        except BaseException:
+            db.database.rollback()
+            for key,_ in files:
+                try:
+                    client.delete_object(Bucket=bucket,Key=key)
+                except ClientError as e:
+                    LOG.logger.error(f"{log_prefix}Couldn't delete {bucket}/{key} after a failed run -- the next run's orphan cleanup will: {e}")
+            raise
+
+    db.database.autocommit = True
+    cur.execute(f"ANALYZE public.{partition}")
+    db.database.autocommit = False
+    cur.execute("SELECT pg_total_relation_size(%s)",(f"public.{partition}",))
+    size_after = cur.fetchone()[0]
+    db.database.commit()
+    LOG.logger.info(f"  {log_prefix}{channel_name}: {partition} truncated, {kept:,} row(s) of unarchived videos kept -- "
+                    f"{size_before/1024**3:,.2f} GB -> {size_after/1024**3:,.2f} GB")
+    LOG.logger.info(f"{log_prefix}{channel_name}: {rows:,} message(s) from {len(counts):,} video(s) archived in {time.time()-start:,.0f}s")
+    return rows,len(counts)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Archive processed videos' chat from Postgres to Parquet on S3.")
     parser.add_argument("--channel",action="append",help="Channel name to archive (repeatable). Default: every channel.")
@@ -146,6 +245,7 @@ def main() -> None:
         LOG.logger.error("Run this in public mode (GET_MEMBERS_ONLY = False) -- members-only chat isn't archived.")
         return
 
+    ST.start("archive",LOG.logger)
     db = DB.PostgresClass()
     cur = db.cursor
     CFG.load_channel_directory(cur)
@@ -154,86 +254,14 @@ def main() -> None:
     channels = args.channel or list(CFG.CHANNEL_DIRECTORY.keys())
 
     total_rows = total_videos = 0
-    for channel_name in channels:
-        CFG.select_channel(channel_name)
-        channel_id,partition,bucket = CFG.YT_USER_ID,CFG.DB_TABLES["messages"],CFG.CHANNEL_SUFFIX
-        if not DB.TableExists(cur,partition):
-            continue
-
-        cur.execute("SELECT count(*) FROM public.badge_fix_pending WHERE channel_id = %s",(channel_id,))
-        if cur.fetchone()[0]:
-            LOG.logger.warning(f"{channel_name}: badge_fix_pending has rows -- run compress_raw_chat.py for it first. Skipped.")
-            continue
-
-        cur.execute("""SELECT id FROM public.videos
-                       WHERE channel_id = %s AND processed AND raw_chat_compressed AND NOT chat_archived AND NOT members
-                       ORDER BY publishedat NULLS LAST, id""",(channel_id,))
-        candidates = [r[0] for r in cur.fetchall()]
-        cur.execute("""SELECT count(*) FROM public.videos
-                       WHERE channel_id = %s AND processed AND NOT raw_chat_compressed AND NOT chat_archived AND NOT members""",(channel_id,))
-        waiting = cur.fetchone()[0]
-        if waiting:
-            LOG.logger.info(f"{channel_name}: {waiting:,} processed video(s) still need compress_raw_chat.py before they can be archived.")
-        if not candidates:
-            continue
-
+    for index,channel_name in enumerate(channels,1):
+        ST.set_info(channel=channel_name,channel_progress=f"{index}/{len(channels)}",phase="Archiving chat")
         try:
-            client.head_bucket(Bucket=bucket)
-        except ClientError:
-            LOG.logger.error(f"{channel_name}: S3 bucket '{bucket}' isn't reachable -- skipped.")
+            rows,videos = archive_channel(db,client,duck,channel_name,args.max_rows,args.dry_run)
+        except ArchiveSkipped as e:
+            LOG.logger.warning(f"{e} Skipped.")
             continue
-        _cleanup_orphans(cur,client,bucket,channel_id,args.dry_run)
-
-        cur.execute(f"""SELECT video_id, count(*), min("timestamp"), max("timestamp") FROM public.{partition}
-                        WHERE video_id = ANY(%s) GROUP BY video_id""",(candidates,))
-        found = {r[0]:r for r in cur.fetchall()}
-        counts = [found[v] for v in candidates if v in found]
-        empty = [v for v in candidates if v not in found]
-        rows = sum(c[1] for c in counts)
-
-        if args.dry_run:
-            LOG.logger.info(f"{channel_name}: {len(counts):,} video(s), {rows:,} message(s) -> ~{rows*_PARQUET_BYTES_PER_ROW/1024**3:,.2f} GB Parquet "
-                            f"in {len(_batches(counts,args.max_rows)):,} file(s); {len(empty):,} video(s) with no chat rows")
-            total_rows += rows; total_videos += len(counts)
-            continue
-
-        # No chat rows in Postgres (no chat, or members/Shorts edge cases): nothing to move, but
-        # mark them so they aren't re-checked every run.
-        if empty:
-            cur.execute("UPDATE public.videos SET chat_archived = true WHERE id = ANY(%s)",(empty,))
-            db.database.commit()
-
-        start = time.time()
-        cur.execute("SELECT pg_total_relation_size(%s)",(f"public.{partition}",))
-        size_before = cur.fetchone()[0]
-        db.database.commit()
-        files:list[tuple[str,list[tuple[str,int,int,int]]]] = []
-        archived = 0
-        try:
-            for i,batch in enumerate(_batches(counts,args.max_rows),1):
-                files.append((_export_batch(cur,duck,bucket,partition,batch),batch))
-                archived += sum(b[1] for b in batch)
-                LOG.logger.info(f"  {channel_name}: file {i} -- {len(batch):,} video(s), {archived:,}/{rows:,} message(s) exported and verified ({time.time()-start:,.0f}s)")
-            kept = _commit_channel(db,channel_id,partition,files)
-        except BaseException:
-            db.database.rollback()
-            for key,_ in files:
-                try:
-                    client.delete_object(Bucket=bucket,Key=key)
-                except ClientError as e:
-                    LOG.logger.error(f"Couldn't delete {bucket}/{key} after a failed run -- the next run's orphan cleanup will: {e}")
-            raise
-        total_rows += archived; total_videos += len(counts)
-
-        db.database.autocommit = True
-        cur.execute(f"ANALYZE public.{partition}")
-        db.database.autocommit = False
-        cur.execute("SELECT pg_total_relation_size(%s)",(f"public.{partition}",))
-        size_after = cur.fetchone()[0]
-        db.database.commit()
-        LOG.logger.info(f"  {channel_name}: {partition} truncated, {kept:,} row(s) of unarchived videos kept -- "
-                        f"{size_before/1024**3:,.2f} GB -> {size_after/1024**3:,.2f} GB")
-        LOG.logger.info(f"{channel_name}: {archived:,} message(s) from {len(counts):,} video(s) archived in {time.time()-start:,.0f}s")
+        total_rows += rows; total_videos += videos
 
     db.Close()
     verb = "Would archive" if args.dry_run else "Archived"
