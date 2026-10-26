@@ -261,6 +261,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
                     # that wipe out a type an earlier run already worked out.
                     update_data = {k: v for k, v in video_entry.items() if k != "id" and not (k == "video_type" and v is None)}
                     DB.UpdateEntries(thread_db.cursor,CFG.DB_TABLES["videos"],update_data,"id",video_id)
+                DB.ReplaceVideoTags(thread_db.cursor,CFG.DB_TABLES["tags"],video_id,vid.entry["channel_id"],vid.tags)
                 thread_db.database.commit()
             except Exception:
                 # Roll back so a failed insert doesn't leave this worker's connection aborted for

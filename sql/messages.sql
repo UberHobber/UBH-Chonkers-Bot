@@ -20,6 +20,11 @@
 -- messages_<db_suffix>), never this parent table, so archiving one channel (an ACCESS
 -- EXCLUSIVE lock on its partition) can't block the bot while it works on another channel.
 -- Keep it that way: a query against the parent would lock every partition.
+--
+-- Rows take ~370 B each with indexes, so a channel's partition grows to tens of GB while it's
+-- being processed (Miko: 78M rows, 27GB) and drops to near zero once it's archived. A partition
+-- that stays large usually means its processed videos still lack raw_chat_compressed, so
+-- archive_chat.py skips them -- run compress_raw_chat.py for that channel.
 
 -- Drop table
 
@@ -169,7 +174,7 @@ CREATE TABLE public.messages_zeta PARTITION OF public.messages FOR VALUES IN ('T
 -- and index maintenance I/O was the ingestion bottleneck. pk_messages is the uniqueness/
 -- FK/join key, idx_messages_video_id backs Get_Messages' per-video lookup, and
 -- idx_messages_user_id backs the user_ids FK (and per-user queries). Everything else was
--- dropped by migrate_drop_unused_message_indexes.py -- including (user_id, timestamp)
+-- dropped by a one-time migration (since removed) -- including (user_id, timestamp)
 -- and (video_id, user_id) covering indexes that only existed for video_message_stats'
 -- one-time backfill. Recreate those temporarily if a backfill over messages is re-run.
 CREATE INDEX idx_messages_user_id ON ONLY public.messages USING btree (user_id);

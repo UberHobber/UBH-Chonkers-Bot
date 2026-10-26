@@ -14,6 +14,8 @@
 -- orphan). Only processed, public videos with raw_chat_compressed set are archived.
 -- Main.py runs archive_chat.archive_channel() automatically, in a background thread, for
 -- each channel that finishes with no errors (CFG.AUTO_ARCHIVE, modules/ChannelArchiver.py).
+-- Parquet takes ~27 B per message (a full 10M-message file is ~270MB) against ~150 B for the
+-- raw .json.gz kept alongside it in messages/ (2026-10-25: 29GB of Parquet for 1.06B messages).
 
 -- public.chat_archive definition
 

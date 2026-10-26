@@ -9,7 +9,7 @@
 -- json3 format) was chosen specifically for long-term stability -- it's a W3C
 -- standard and yt-dlp's most mature extraction path for YouTube captions.
 -- Unpartitioned (unlike messages): cue volume per video (a few thousand for a
--- long VOD) is orders of magnitude below chat's 200M+ row scale, so a single
+-- long VOD) is orders of magnitude below chat's 1B+ message scale, so a single
 -- indexed table is sufficient -- channel_id is still present so this could be
 -- partitioned later without a schema change if that assumption ever proves wrong.
 -- Members-only subtitle data mirrors the messages_<talent>_members split (own
@@ -31,8 +31,29 @@
 -- words. Both are expression/plain-column indexes rather than a stored generated tsvector
 -- column -- measured against a live sample, a stored column would have added ~2.9GB of
 -- heap bloat across the full table for no query-time benefit over just recomputing
--- to_tsvector(text) at search time. Built CONCURRENTLY against the live table (~5GB, no
--- separate migration step needed since Get_Subtitles never runs DDL).
+-- to_tsvector(text) at search time. Built CONCURRENTLY against the live table (~5GB then,
+-- no separate migration step needed since Get_Subtitles never runs DDL).
+--
+-- As of 2026-10-25: ~16GB with indexes, 54M cues over ~26k videos, EN and ID only
+-- (CFG.SUBTITLE_LANGUAGES = ["en"]; JP/Stars channels have none). About 0.23GB per 1,000
+-- subtitled stream hours (16.7GB / ~72k hours).
+--
+-- ENGLISH BY DESIGN (decided 2026-10-25): every video's subtitles are English, so they can
+-- all be searched in English. For a video YouTube transcribed in another language, the 'en'
+-- rows are YouTube's machine translation, not what was said: yt-dlp lists the real
+-- auto-caption track as '<lang>-orig' (one per video), and 'en' on a Japanese video is
+-- lang=ja&tlang=en. A 20-video sample found 9 translated (Indonesian, Japanese, Korean)
+-- across the ID and official channels; EN-talent videos were native English, apart from
+-- their Japanese-language streams. So language='en' doesn't mean the stream was spoken in
+-- English, and names/in-jokes in translated rows can come out mangled -- trigram/fuzzy
+-- search copes better than exact FTS there. videos.caption_source_language says which
+-- language each video's English came from ('en' = native); filter on it to search only
+-- native English. YouTube transcribes each video in ONE language
+-- (it doesn't follow switches mid-video); snippet.defaultAudioLanguage doesn't reliably
+-- match it, only the -orig track does. Research for a possible separate native-language
+-- section later: docs/native_subtitles_plan.md (shelved). Local Whisper transcription was
+-- costed and deferred as not viable for now (~309k stream hours, ~7 TB of audio, 3-8 months
+-- of GPU time): docs/local_transcription_plan.md.
 
 
 -- Drop table

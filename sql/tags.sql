@@ -3,9 +3,11 @@
 -- in that script instead, then re-run it, or they'll be lost on the next regeneration.
 -- See sql/README.md for the order these files must be run in on a fresh database.
 
--- YouTube's snippet.tags for each video, one row per tag. Populated from the cached
--- details/{id}.json in S3 where available, or a fresh videos().list call otherwise -- see
--- backfill_tags.py. Unified across public and members-only videos (like public.videos
+-- YouTube's snippet.tags for each video, one row per tag. Main.py rewrites a video's rows
+-- every time it saves the video (DB.ReplaceVideoTags, same transaction as the videos
+-- INSERT/UPDATE), so tags a creator removed don't linger. Only unprocessed videos are
+-- re-fetched, so a processed video's tags are as of the run that processed it. A video
+-- with no tags has no rows. Unified across public and members-only videos (like public.videos
 -- itself) rather than split into a *_members table -- tag volume per video is tiny (a
 -- few dozen at most), nowhere near the scale that motivated splitting messages/emotes/
 -- subtitles by mode.

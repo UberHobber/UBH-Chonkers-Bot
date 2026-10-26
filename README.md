@@ -43,12 +43,12 @@ Each step is safe to re-run, and each picks up where it left off if it's interru
 
 1. **Download new videos and chat:** `Launch_With_Monitor.bat` runs `Main.py` in one window and a live status view (`Monitor.py`) in another. `Launch.bat` runs `Main.py` alone. For each channel the bot:
    - lists every upload;
-   - saves metadata and thumbnails for new videos;
+   - saves metadata (including tags) and thumbnails for new videos;
    - downloads chat for every unprocessed video into Postgres, keeping the raw chat as `messages/<video>.json.gz` in the channel's bucket;
    - if the channel finished with no errors, hands it to a background thread that prepares and archives its finished chat (steps 3 and 4 below) while the bot moves on to the next channel. The thread shows as the **Archive** slot in the monitor. Turn this off with `AUTO_ARCHIVE = False`.
 
    Shorts are marked done without downloading chat. Live and upcoming streams are left for a later run.
-2. *(Optional)* **Download auto-captions:** `Launch.bat Subtitles.py`. This can run on its own or at the same time as `Main.py`.
+2. *(Optional)* **Download auto-captions:** `Launch.bat Subtitles.py`. This can run on its own or at the same time as `Main.py`. Captions are always English, so they can all be searched in English. For a video not spoken in English, they're YouTube's machine translation, and `videos.caption_source_language` records which language they were translated from (`en` means native English).
 
 Steps 3 and 4 run automatically for every channel that finishes cleanly. Run them by hand for channels that had errors, to catch up after a run with `AUTO_ARCHIVE` off, or for a channel the bot isn't processing. Both scripts accept `--channel "<name>"` to limit them to one channel, and `--dry-run` to report what they'd do without changing anything.
 
@@ -103,11 +103,33 @@ Regenerate the `sql/` bootstrap scripts and the schema reference:
 | Archived chat (zstd Parquet, ~10M messages per file) | S3: `<channel bucket>/chat_archive/`, listed in the `chat_archive` table |
 | Raw chat as downloaded (minified gzip JSON) | S3: `<channel bucket>/messages/<video>.json.gz` |
 | Video details, thumbnails and subtitles | S3: `<channel bucket>/details/`, `thumbnails/`, `subtitles/` |
-| User details and profile pictures | S3: `<user bucket>/details/`, `pfp/` |
+| User details and profile pictures | S3: `<user bucket>/details/`, `details_members/`, `pfp/` |
 
 The S3 store holds the only copy of archived chat, so it needs to be in your backups.
 
 The raw JSON keeps fields the database doesn't, such as creator hearts, membership event text, full badge titles and emotes per message, so it's worth keeping for future features.
+
+### How much space it takes
+
+Measured on 2026-10-25, with 1.13B chat messages from 110 channels and 4.6M users. Postgres was 74 GB and S3 was 633 GB.
+
+| Item | Size | Notes |
+|---|---|---|
+| Raw chat, `messages/*.json.gz` | ~150 B per message | About 85% of the chat bytes on S3 |
+| Archived chat, Parquet | ~27 B per message | A full 10M-message file is about 270 MB |
+| A user, in the user bucket | ~83 KB | The profile picture is ~80 KB of that, so pictures are about 95% of the bucket |
+| A user, in Postgres | ~1.15 KB | Spread over `user_ids`, `user_first_message`, `user_summary` and the rankings |
+| Chat in Postgres before it's archived | ~370 B per message | Freed when the channel is archived |
+| `video_user_seen` | ~12 B per message | The largest Postgres table that never shrinks (16 GB at 1.13B messages) |
+| Subtitles | ~0.23 GB per 1,000 stream hours | English captions only |
+
+How much chat a channel produces depends mostly on its branch. Finished channels averaged about 14k messages per stream hour for JP, 8.6k for EN, 3.3k for ID, 2.7k for Stars EN and 0.9k for Stars.
+
+With the current channel list, the remaining JP channels have about 120k stream hours to go. That projects to about 1.3B more messages and 1.5M new users. A finished dataset would be about **1 TB on S3** and **70 GB in Postgres** once archived. While a channel is being processed, its chat stays in Postgres until that channel is archived. A large channel can need about 40 GB extra for this.
+
+Most of the S3 space is raw chat (about 360 GB at the end) and profile pictures (about 500 GB). Without them the S3 total would be closer to 200 GB.
+
+To check current bucket sizes on Garage, use `garage bucket info <bucket>`. It's much quicker than listing objects, since the user bucket holds about 9M of them.
 
 ---
 

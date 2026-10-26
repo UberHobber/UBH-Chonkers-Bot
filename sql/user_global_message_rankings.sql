@@ -15,12 +15,12 @@
 -- A MATERIALIZED VIEW rather than a plain view or an incrementally-maintained column -- a
 -- single new message can shift every other user's rank in that channel, so there's no single
 -- row to touch incrementally, and live-querying it directly took ~20-27s on this server
--- (window-function sort spilling to disk over the ~6.5M row rollup table). Refreshed once per
--- bot run via public.refresh_user_message_rankings() (defined in
--- sql/user_global_message_rankings.sql, since it refreshes both rankings views together) -- see
--- modules/Database.py's RefreshUserMessageRankings() and its call at the end of Main.py -- using
--- REFRESH ... CONCURRENTLY so readers aren't locked out mid-refresh. See
--- sql/user_message_rankings.sql for the full DDL.
+-- (window-function sort spilling to disk over what was then a ~6.5M row rollup table; ~15M
+-- rows as of 2026-10-25). Refreshed once per bot run via public.refresh_user_message_rankings()
+-- -- see modules/Database.py's RefreshUserMessageRankings() and its call at the end of Main.py --
+-- using REFRESH ... CONCURRENTLY so readers aren't locked out mid-refresh. Its DDL and that
+-- function live in sql/user_global_message_rankings.sql, since the function refreshes both
+-- rankings views together.
 
 CREATE MATERIALIZED VIEW public.user_message_rankings AS
 SELECT channel_id,

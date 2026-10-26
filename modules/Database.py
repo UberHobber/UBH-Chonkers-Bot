@@ -284,6 +284,30 @@ def FinalizeVideoMessageRate(cursor:psycopg2.extensions.cursor,video_id:str) -> 
 
     cursor.execute(query,values)
 
+def ReplaceVideoTags(cursor:psycopg2.extensions.cursor,table:str,video_id:str,channel_id:str,tags:list[str]|None) -> None:
+    """
+    Replaces a video's rows in the tags table with the tags YouTube currently reports for it, so
+    tags a creator removed don't linger. Call it in the same transaction as the video's own
+    INSERT/UPDATE (tags FKs to videos), with tags from a fresh videos().list response -- there, a
+    missing snippet.tags means the video has no tags, so None clears them.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param table: The tags table (CFG.DB_TABLES["tags"]).
+    :type table: String
+    :param video_id: The video whose tags to replace.
+    :type video_id: String
+    :param channel_id: The video's channel.
+    :type channel_id: String
+    :param tags: snippet.tags from the API, or None if it had none.
+    :type tags: List of strings or None
+    """
+    cursor.execute(f'DELETE FROM {table} WHERE video_id = %s',(video_id,))
+    # YouTube can return the same tag twice; the primary key would reject the duplicate.
+    unique_tags = list(dict.fromkeys(tags or []))
+    if unique_tags:
+        InsertEntries(cursor,table,[{"video_id":video_id,"channel_id":channel_id,"tag_name":tag} for tag in unique_tags])
+
 def RecordSubtitleStats(cursor:psycopg2.extensions.cursor,video_id:str,channel_id:str,language:str,total_subtitles:int,total_words:int,speech_duration_ms:int) -> None:
     """
     Upserts video_subtitle_stats for one video/language from precomputed totals. Call this once

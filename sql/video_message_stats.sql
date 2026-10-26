@@ -4,12 +4,13 @@
 -- See sql/README.md for the order these files must be run in on a fresh database.
 
 -- Per-video message stats: an incrementally-maintained rollup table (NOT a materialized view --
--- messages has 200M+ rows, so recomputing a full aggregate on every refresh doesn't scale).
--- Maintained per message by public.record_message_stats(), applied in batches through
--- public.record_message_stats_batch() -- one call per commit from modules/Classes.py
--- Get_Messages via modules/Database.py's RecordMessageStatsBatch(). Archiving chat (see
--- chat_archive) doesn't touch these totals. See sql/video_message_stats.sql for full DDL,
--- the maintenance functions, and the one-time backfill.
+-- chat is 1B+ messages, most of it archived out of Postgres, so recomputing a full aggregate
+-- isn't possible in SQL at all). Maintained per message by public.record_message_stats(),
+-- applied in batches through public.record_message_stats_batch() -- one call per commit from
+-- modules/Classes.py Get_Messages via modules/Database.py's RecordMessageStatsBatch(). Archiving
+-- chat (see chat_archive) doesn't touch these totals. sql/video_message_stats.sql holds the DDL
+-- and maintenance functions; the one-time backfill that first filled these tables was run
+-- by hand and isn't kept there.
 
 -- public.video_message_stats definition
 
@@ -36,6 +37,10 @@ CREATE TABLE public.video_message_stats (
 -- public.video_user_seen definition
 
 -- Dedup helper: has this (video, user) pair already been counted into unique_users/members?
+--
+-- The largest table that never shrinks (16GB, 116M rows as of 2026-10-25): one row per user
+-- per video they chatted in, ~146 B each, ~0.08 rows per message. Archiving chat doesn't
+-- touch it.
 
 -- Drop table
 
@@ -52,11 +57,11 @@ CREATE TABLE public.video_user_seen (
 -- Maintenance functions. record_message_stats()/record_message_stats_batch() and
 -- finalize_video_message_rate() are called incrementally during chat ingestion
 -- (modules/Database.py's RecordMessageStatsBatch/FinalizeVideoMessageRate, called from
--- modules/Classes.py Get_Messages, one batched call per commit). refresh_first_message_counts()
--- and refresh_user_message_rankings() are recomputed-from-scratch refreshes called once per
--- full bot run (see the end of Main.py) rather than incrementally -- see each function's own
--- history in sql/video_message_stats.sql, sql/user_channel_activity_stats.sql, and
--- sql/user_global_message_rankings.sql for the full rationale and past incidents that shaped them.
+-- modules/Classes.py Get_Messages, one batched call per commit). refresh_first_message_counts(),
+-- refresh_user_message_rankings() and refresh_user_summary() are recomputed-from-scratch
+-- refreshes called once per full bot run (see the end of Main.py) rather than incrementally --
+-- see each function's own comment below, and the docstrings of their callers in
+-- modules/Database.py, for the rationale and past incidents that shaped them.
 
 -- public.record_message_stats definition
 

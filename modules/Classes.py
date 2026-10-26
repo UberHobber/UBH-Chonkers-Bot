@@ -1,5 +1,5 @@
 # Native Stuff
-import os,json,gzip,pickle,requests,re,xxhash,threading,queue,time,random
+import os,json,gzip,pickle,requests,re,xxhash,threading,queue,time,random,urllib.parse
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from contextlib import contextmanager
 from typing import Any
@@ -270,11 +270,8 @@ class VideoClass:
 
                 self.title = self._snippet.get("title") # Video Title
 
-                # Present only if YouTube's API returned it -- absent (not empty-list) means
-                # either this video genuinely has no tags, or this VideoClass was built from an
-                # older cached details JSON that predates tags being captured at all. Callers
-                # that need to tell those two cases apart (see backfill_tags.py) must check the
-                # raw snippet dict themselves; this attribute alone can't distinguish them.
+                # None when the API response has no snippet.tags, which YouTube omits for a
+                # video with no tags. Main.py writes these to the tags table (DB.ReplaceVideoTags).
                 self.tags:list[str]|None = self._snippet.get("tags")
 
                 self._liveBroadcastContent:str|None = self._snippet.get("liveBroadcastContent")
@@ -712,6 +709,18 @@ class SubtitleCircuitBreaker:
     @property
     def tripped(self) -> bool:
         return self._consecutive >= self._threshold
+
+def _caption_source_language(info:dict[str,Any]|None,lang:str) -> str|None:
+    """
+    The language YouTube transcribed a video in, read from the subtitle track yt-dlp just
+    downloaded for `lang`. YouTube makes one auto-caption transcript per video, and every other
+    language is a machine translation of it: the track's URL carries the transcript's language as
+    `lang` and, when translated, the target as `tlang` (e.g. lang=ja&tlang=en). So `lang` is the
+    source either way -- 'en' means native English. None if yt-dlp didn't report the track.
+    """
+    track:dict[str,Any] = ((info or {}).get("requested_subtitles") or {}).get(lang) or {}
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(track.get("url") or "").query)
+    return (query.get("lang") or [None])[0]
 
 _VTT_TIMESTAMP = re.compile(r'(\d{2,}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2})\.(\d{3})')
 _VTT_TAG = re.compile(r'<[^>]+>')
@@ -1290,8 +1299,10 @@ class YT_API:
 
         url = f"https://www.youtube.com/watch?v={video_id}"
         all_cues:list[dict[str,Any]] = []
+        source_language_saved = False
 
         for lang in CFG.SUBTITLE_LANGUAGES:
+            info:dict[str,Any]|None = None
             temp_dir = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}"
             current_delay = rate_limiter.current if rate_limiter is not None else CFG.SUBTITLE_REQUEST_DELAY
             jitter_ceiling = current_delay * (1 + CFG.SUBTITLE_REQUEST_JITTER)
@@ -1322,7 +1333,7 @@ class YT_API:
                     try:
                         sub_bar.set_description_str(f"Subtitles ({lang}): downloading (delay ~{current_delay:.1f}s)")
                         ydl = yt_dlp.YoutubeDL(ydl_opts) #type:ignore
-                        ydl.extract_info(url,download=True)
+                        info = ydl.extract_info(url,download=True)
                         if rate_limiter is not None and attempt == 1:
                             rate_limiter.report_success()
                         break
@@ -1356,6 +1367,14 @@ class YT_API:
             if vtt_path is None or not os.path.isfile(vtt_path):
                 stats.no_captions += 1
                 continue
+
+            # Every track is made from the same one-language transcript, so the first track
+            # downloaded tells us the video's language.
+            if not source_language_saved:
+                source_language = _caption_source_language(info,lang)
+                if source_language is not None:
+                    DB.UpdateEntry(_db.cursor,CFG.DB_TABLES["videos"],"caption_source_language",source_language,"id",video_id)
+                    source_language_saved = True
 
             cues = _parse_vtt_cues(vtt_path)
             os.remove(vtt_path)
@@ -1552,8 +1571,7 @@ def _check_is_short(video_id:str) -> bool|None:
 def Classify_Video(video:dict[str,Any]) -> tuple[str|None,int|None]:
     """
     Works out a video's videos.video_type and videos.content_duration from its raw videos().list
-    item (needs the contentDetails, snippet and liveStreamingDetails parts). Shared by VideoClass
-    and backfill_video_types.py so both classify identically.
+    item (needs the contentDetails, snippet and liveStreamingDetails parts). Used by VideoClass.
 
     video_type is one of:
         'stream' -- has liveStreamingDetails (a livestream, upcoming/live/archived). Premieres

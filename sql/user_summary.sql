@@ -8,9 +8,9 @@
 -- One row per user, combining identity (user_ids), global activity (user_first_message,
 -- user_global_message_rankings), and per-channel rollups (user_channel_activity,
 -- user_channel_superchats) into a single summary. A MATERIALIZED VIEW, not a plain one --
--- it started as a plain view (only the small per-channel rollups, not the 200M+ row messages
--- table, get aggregated), but a sorted top-N query still took 60-90s live: the channel_agg
--- CTE's GROUP BY user_id has no supporting index over the 6.5M-row user_channel_activity
+-- it started as a plain view (only the small per-channel rollups, not the messages table,
+-- get aggregated), but a sorted top-N query still took 60-90s live: the channel_agg
+-- CTE's GROUP BY user_id has no supporting index over the then-6.5M-row user_channel_activity
 -- table, so Postgres fell back to an external merge sort spilling ~1.7GB to disk on every
 -- query. Refreshed once per bot run via public.refresh_user_summary(), after
 -- refresh_user_message_rankings() (user_summary reads user_global_message_rankings, so it

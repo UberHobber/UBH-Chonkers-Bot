@@ -39,8 +39,8 @@ CREATE TABLE public.branches (
 -- channel_type: 'talent' (a talent's own channel) or 'official' (a branch's main channel,
 -- e.g. HoloEN, or a unit's channel, e.g. ReGLOSS). Official channels sit in the branch
 -- they belong to; branch-level ones use "group" = 'Branch', unit-level ones use their
--- unit's group. Replaces the old 'Official' pseudo-branch -- see
--- migrate_channel_branches.py.
+-- unit's group. Replaces the old 'Official' pseudo-branch (moved by a one-time
+-- migration, since removed).
 
 -- Drop table
 

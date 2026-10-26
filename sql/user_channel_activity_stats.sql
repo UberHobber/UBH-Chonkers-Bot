@@ -47,8 +47,9 @@ CREATE TABLE public.user_first_message (
 -- just first-time-per-user like the pointer above), and a join-based lookup on that path would
 -- regress the single hottest write in this schema. Maintained incrementally by
 -- public.record_message_stats() (same table update as the first-message pointer, one row per
--- chat message) -- see sql/user_channel_activity_stats.sql for the full DDL, maintenance
--- function, and one-time backfill. ever_*/last_is_* were understated for chat ingested
+-- chat message; the function itself lives in sql/video_message_stats.sql). The one-time
+-- backfill that first filled this table was run by hand and isn't kept in sql/. ~15M rows,
+-- ~316 B each, as of 2026-10-25. ever_*/last_is_* were understated for chat ingested
 -- before the badge-flag fix (see badge_fix_pending); compress_raw_chat.py recomputes them
 -- for affected users as it corrects each channel's messages.
 

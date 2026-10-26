@@ -69,7 +69,12 @@ Later files have foreign keys pointing at tables created by earlier ones:
 22. `subtitles_members.sql`
 
 Insert the `branches` rows (name + `sort_order`, the order channels get processed in) before
-any `channel_directory` rows — see `migrate_channel_branches.py` for the current set.
+any `channel_directory` rows. The current set:
+
+```sql
+INSERT INTO branches (name, sort_order) VALUES
+    ('EN', 1), ('ID', 2), ('Stars_EN', 3), ('JP', 4), ('Stars', 5);
+```
 
 After creating the `channel_directory` row(s) for whichever channels you're tracking, also
 create their `messages_<db_suffix>` partition of `public.messages` — see

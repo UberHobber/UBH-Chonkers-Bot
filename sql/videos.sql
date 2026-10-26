@@ -8,9 +8,9 @@
 -- subtitles_processed tracks the subtitle-download pipeline (Subtitles.py) independently
 -- of the chat/video 'processed' flag above -- the two used to be coupled (subtitles were
 -- only ever attempted once, inline, right after a video's chat finished), which meant a
--- throttled/failed subtitle attempt was never retried once 'processed' went true. Backfilled
--- once via backfill_subtitles_processed.py for videos that already had subtitle rows before
--- this column existed.
+-- throttled/failed subtitle attempt was never retried once 'processed' went true. Videos
+-- that already had subtitle rows before this column existed were set true by a one-time
+-- backfill (since removed).
 --
 -- subtitles_fail_count counts separate runs (not in-run retries) where this video's
 -- subtitle download exhausted every attempt throttled (see RecordSubtitleThrottle in
@@ -26,13 +26,24 @@
 -- Premieres -- they can only be told apart from streams while upcoming/live, which would
 -- need far more frequent polling of new uploads than this bot does. Shorts come from
 -- asking youtube.com/shorts/{id} directly (200 = Short, redirect to /watch = not), since
--- the Data API has no Shorts flag. NULL = not yet classified (Shorts check inconclusive)
--- -- Main.py never overwrites a known type with NULL; re-run backfill_video_types.py to
--- retry those.
+-- the Data API has no Shorts flag. NULL = not yet classified (Shorts check inconclusive).
+-- Main.py retries unprocessed videos every run and never overwrites a known type with
+-- NULL; a processed video left NULL isn't re-fetched, so classify it by hand with
+-- C.Classify_Video. As of 2026-10-25 the only processed NULLs are two videos the API no
+-- longer returns (deleted/private).
 --
 -- content_duration is contentDetails.duration in seconds -- the length of the video file
 -- itself. Unlike duration (end_time - start_time, only ever set for livestreams), it's
 -- known for uploads and Shorts too. NULL while a stream is upcoming/live (API reports P0D).
+--
+-- caption_source_language is the language YouTube auto-transcribed this video in, i.e. what
+-- its English subtitles came from: 'en' = native English, anything else ('ja', 'id', ...)
+-- = the 'en' rows are YouTube's machine translation from that language. Read from the
+-- downloaded track's URL (lang=ja&tlang=en) by Get_Subtitles, so it costs no extra
+-- request; see _caption_source_language in modules/Classes.py. NULL = not recorded: no
+-- captions, not fetched yet, or fetched before this column existed (2026-10-25 --
+-- those aren't re-fetched just for this). One language per video: YouTube doesn't
+-- follow language switches within a stream.
 --
 -- login_required is set by Main.py when chat_downloader raises LoginRequired (YouTube's
 -- LOGIN_REQUIRED playability status: age-restricted, members-only or private videos).
@@ -76,6 +87,7 @@ CREATE TABLE public.videos (
 	login_required bool DEFAULT false NOT NULL,
 	raw_chat_compressed bool DEFAULT false NOT NULL,
 	chat_archived bool DEFAULT false NOT NULL,
+	caption_source_language text NULL,
 	CONSTRAINT pk_videos_id PRIMARY KEY (id),
 	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
 	CONSTRAINT videos_video_type_check CHECK ((video_type = ANY (ARRAY['stream'::text, 'upload'::text, 'short'::text])))
