@@ -52,6 +52,16 @@ CREATE TABLE public.user_first_message (
 -- ~316 B each, as of 2026-10-25. ever_*/last_is_* were understated for chat ingested
 -- before the badge-flag fix (see badge_fix_pending); compress_raw_chat.py recomputes them
 -- for affected users as it corrects each channel's messages.
+-- Deliberately no index on total_messages: idx_user_channel_activity_channel_totals
+-- (channel_id, total_messages DESC) was dropped 2026-11-02. record_message_stats() bumps
+-- total_messages on every message, so that index made every one of those ~1,000 updates/s
+-- non-HOT (a new heap tuple plus an entry in both indexes), and the extra dirty pages were
+-- likely the largest share of Pox's disk writes. It had 196 scans in 11 months, and the user_message_rankings
+-- refresh never used it (seq scan + sort either way). A per-channel top-N still works via
+-- the pkey's channel_id prefix plus a sort. Don't re-add an index on any column
+-- record_message_stats() updates.
+-- fillfactor = 85 (set 2026-11-05) keeps 15% of each page free so those updates can stay
+-- HOT (same page); with full pages HOT had fallen from 84% to 38% within three days.
 
 -- Drop table
 
@@ -77,8 +87,10 @@ CREATE TABLE public.user_channel_activity (
 	CONSTRAINT user_channel_activity_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
 	CONSTRAINT user_channel_activity_first_video_id_fkey FOREIGN KEY (first_video_id) REFERENCES public.videos(id),
 	CONSTRAINT user_channel_activity_user_ids_fk FOREIGN KEY (user_id) REFERENCES public.user_ids(id)
+)
+WITH (
+	fillfactor=85
 );
-CREATE INDEX idx_user_channel_activity_channel_totals ON public.user_channel_activity USING btree (channel_id, total_messages DESC);
 
 
 -- public.refresh_first_message_counts definition
