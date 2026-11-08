@@ -69,6 +69,10 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
 
     for channel_name in channel_names:
         CFG.select_channel(channel_name)
+        if CFG.GET_MEMBERS_CHAT:
+            # Standalone runs don't go through Main.py's channel loop, which normally creates these.
+            DB.EnsureMembersTables(db.cursor,CFG.CHANNEL_SUFFIX)
+            db.database.commit()
         LOG.logger.info(f"Subtitle pass: {channel_name}")
         ST.set_info(channel=channel_name,channel_progress=f"{channel_names.index(channel_name) + 1}/{len(channel_names)}",phase="Subtitle pass")
         local_root = _local_root()
@@ -80,7 +84,7 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
         os.makedirs(f"{local_root}/{CFG.SUBTITLE_TAG}",exist_ok=True)
 
         breaker = C.SubtitleCircuitBreaker(CFG.SUBTITLE_CIRCUIT_BREAKER_THRESHOLD)
-        videos = DB.GetVideosNeedingSubtitles(db.cursor,CFG.DB_TABLES["videos"],CFG.YT_USER_ID,CFG.GET_MEMBERS_ONLY)
+        videos = DB.GetVideosNeedingSubtitles(db.cursor,CFG.DB_TABLES["videos"],CFG.YT_USER_ID,CFG.GET_MEMBERS_CHAT)
         tally = {"fetched":0,"no_captions":0,"deferred":0,"throttled":0,"errors":0}
 
         def process_subtitle(video:dict) -> None:
@@ -142,7 +146,7 @@ if __name__ == "__main__":
     ST.start("Subtitles",LOG.logger)
     ST.set_info(phase="Starting up")
     db = DB.PostgresClass()
-    DB.EnsureSchema(db.cursor,CFG.GET_MEMBERS_ONLY)
+    DB.EnsureSchema(db.cursor)
     db.database.commit()
     CFG.load_channel_directory(db.cursor)
     s3 = C.H3Client()

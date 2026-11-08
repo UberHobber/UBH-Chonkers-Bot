@@ -16,9 +16,8 @@ the same live introspection, so the two can never drift apart.
 `modules.Database.EnsureSchema` (called once at startup, see `Main.py`) runs these files
 automatically against whatever database it connects to — it checks each file's "anchor"
 table/matview/view and only runs a file if that's missing, so this is safe to leave in place
-permanently rather than being a one-time setup step. The `*_members` files are only run when
-`CFG.GET_MEMBERS_ONLY` is `True`, so a public-only deployment never gets members-only tables
-it doesn't need.
+permanently rather than being a one-time setup step. The `*_members` files are never run —
+they're reference copies of the existing members-only tables (see the end of this file).
 
 ## Run order
 
@@ -60,13 +59,8 @@ Later files have foreign keys pointing at tables created by earlier ones:
     `archive_chat.py`; FKs to `videos`, step 3, and `channel_directory`, step 1) and
     `badge_fix_pending` (`compress_raw_chat.py`'s work queue; no FKs).
 
-**Members-only files** (only needed/run if you're tracking members-only content — see below):
-
-19. `emotes_members.sql`
-20. `messages_members.sql` — must come before `nicknames_members.sql`: its
-    `nickname_matches_<talent>_members` tables FK to `messages_<talent>_members(message_id)`.
-21. `nicknames_members.sql`
-22. `subtitles_members.sql`
+**Members-only files** (reference only, not run — see below): `emotes_members.sql`,
+`messages_members.sql`, `nicknames_members.sql`, `subtitles_members.sql`.
 
 Insert the `branches` rows (name + `sort_order`, the order channels get processed in) before
 any `channel_directory` rows. The current set:
@@ -81,9 +75,11 @@ create their `messages_<db_suffix>` partition of `public.messages` — see
 `modules.Database.AddChannel`/`EnsureMessagesPartition`, or add it manually the same way the
 existing per-talent partitions in `messages.sql` are declared.
 
-The `*_<talent>_members` tables (`emotes`, `messages`, `nickname_matches`, `subtitles`) are
-hardcoded per-talent (one table per name, e.g. `subtitles_kiara_members`) rather than created
-dynamically per channel — see the note at the top of `channel_directory.sql` for why these
-predate the unified `channel_id` schema. Adding members-only support for a talent that isn't
-already one of the five in these files means adding its table to the relevant `_members.sql`
-file (and to `FILE_GROUPS` in `update_schema.py`) by hand.
+The `*_<db_suffix>_members` tables (`emotes`, `messages`, `nickname_matches`, `subtitles`) are
+per-channel tables (e.g. `subtitles_kiara_members`) that predate the unified `channel_id`
+schema — see the note at the top of `channel_directory.sql`. Members-only video *details* go
+in `videos` (`members = true`) on every run; only members-only *chat* uses these tables. To
+collect a channel's members-only chat, set `channel_directory.members_chat = true` and run with
+`CFG.GET_MEMBERS_CHAT = True`: `modules.Database.EnsureMembersTables` creates that channel's
+four tables if they don't exist yet. The `_members.sql` files only list the tables that were
+there when `FILE_GROUPS` in `update_schema.py` was last edited.

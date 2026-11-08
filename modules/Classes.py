@@ -249,10 +249,13 @@ class VideoClass:
 
     :param status: Whether the video is existing, needs updating, or is new. Database operations are different depending on status
     :type status: String
+
+    :param members: Whether the video came from the channel's members-only playlist (videos.members)
+    :type members: Boolean
     """
-    def __init__(self,video:dict[str,Any],status:str):
+    def __init__(self,video:dict[str,Any],status:str,members:bool=False):
         self.status = status
-        self.members = True if CFG.GET_MEMBERS_ONLY is True else False
+        self.members = members
         try:
 
             self.id:str|None = video.get("id") # Back-end ID for video
@@ -341,7 +344,8 @@ class VideoClass:
         """Will download the video thumbnail. Checks if there's an updated one and renames the old one and downloads a new one."""
 
         if self.thumbnail is not None and self.id is not None:
-            temp_thumb = f"{bucket.local_root}/{CFG.THUMBNAIL_TAG}/{self.id}_TEMP.jpg"
+            thumb_tag = CFG.video_thumbnail_tag(self.members)
+            temp_thumb = f"{bucket.local_root}/{thumb_tag}/{self.id}_TEMP.jpg"
             # Download a fresh thumbnail
             with open(temp_thumb,'wb') as handle:
                 img_response = requests.get(self.thumbnail,stream=True)
@@ -352,7 +356,7 @@ class VideoClass:
                         break
                     handle.write(block)
 
-            _check_and_upload_file(bucket,temp_thumb,self.id,"jpg",CFG.THUMBNAIL_TAG)
+            _check_and_upload_file(bucket,temp_thumb,self.id,"jpg",thumb_tag)
 
 def Raw_Chat_Keys(video_id:str) -> tuple[str,str]:
     """
@@ -460,7 +464,7 @@ class MessageClass:
                             elif _e_img_id == "24x24":
                                 break
                     e_entry:dict = {"id":e_id,"name":e_name,"url":e_url,"custom":e_custom}
-                    if CFG.GET_MEMBERS_ONLY is False:
+                    if CFG.GET_MEMBERS_CHAT is False:
                         e_entry["channel_id"] = CFG.YT_USER_ID
                     self.e_emote_entries.append(e_entry)
 
@@ -482,7 +486,7 @@ class MessageClass:
                 "symbol":self.currency_symbol,
                 "color":self.header_background_colour
             }
-            if CFG.GET_MEMBERS_ONLY is False:
+            if CFG.GET_MEMBERS_CHAT is False:
                 self.entry["channel_id"] = CFG.YT_USER_ID
         except Exception as e:
             LOG.logger.error(f"Message {self.id} not initialized:\n{e}")
@@ -847,7 +851,7 @@ class YT_API:
         LOG.logger.info("Polling channel for upload count")
         LOG.logger.info('--------------------------------')
 
-        request = self.api.playlists().list(part="contentDetails",channelId=CFG.YT_CHANNEL_ID,id=CFG.PLAYLIST)
+        request = self.api.playlists().list(part="contentDetails",channelId=CFG.YT_CHANNEL_ID,id=CFG.UPLOAD_PLAYLIST)
 
         response = _execute_with_retry(request)
 
@@ -856,7 +860,8 @@ class YT_API:
         LOG.logger.info(f"{video_count} video(s) found!")
         return video_count
 
-    def Get_Video_Info(self,id:str,bucket:H3Bucket):
+    def Get_Video_Info(self,id:str,bucket:H3Bucket,members:bool=False):
+        """:param members: Whether the video is members-only (from Get_All_Videos' result)."""
         request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=id)
 
         response = _execute_with_retry(request)
@@ -870,87 +875,101 @@ class YT_API:
             del video["kind"]
             del video["etag"]
 
-            temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{id}_TEMP.json"
+            detail_tag = CFG.video_detail_tag(members)
+            temp_path = f"{bucket.local_root}/{detail_tag}/{id}_TEMP.json"
 
             # Write Video data to file
             with open(temp_path,'w') as file:
                 file.write(json.dumps(video,indent=4))
 
-            video_detail_status = _check_and_upload_file(bucket,temp_path,id,"json",CFG.DETAIL_TAG)
+            video_detail_status = _check_and_upload_file(bucket,temp_path,id,"json",detail_tag)
 
-            vid_obj = VideoClass(video,video_detail_status)
+            vid_obj = VideoClass(video,video_detail_status,members)
 
             return vid_obj
         else:
             return None
 
-    def Get_All_Videos(self,bucket:H3Bucket):
-        """
-        Retrieves all YT videos from a playlist, and returns a list of video_ids
+    def _Get_Playlist_Items(self,playlist_id:str,dl_vidbar) -> list[dict[str,Any]]:
+        """Pages through one playlist's items. A 404 (playlist doesn't exist) returns an empty list."""
+        request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50)
+        try:
+            response = _execute_with_retry(request)
+        except HttpError as e:
+            if e.resp.status == 404:
+                # e.g. a channel with no Members-Only content yet, so YouTube hasn't generated that hidden playlist.
+                LOG.logger.info(f"Playlist {playlist_id} not found (404) - assuming no videos exist yet.")
+                return []
+            raise
+        next_page = response.get("nextPageToken")
+        video_list:list[dict[str,Any]] = response["items"]
+        dl_vidbar.update(len(video_list))
 
-        Also writes a singular JSON formatted file containing basic information of ALL videos in a single file. File is named "__Video_Playlist.json"
+        while next_page is not None:
+            next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50,pageToken=next_page)
+            next_response = _execute_with_retry(next_request)
+            next_page = next_response.get("nextPageToken")
+            response_items:list[dict] = next_response["items"]
+            dl_vidbar.update(len(response_items))
+            video_list = video_list + response_items
 
-        :return: video_ids of all videos from the playlist
-        :rtype: List of Strings
+        return video_list
+
+    def Get_All_Videos(self,bucket:H3Bucket) -> dict[str,bool]:
         """
+        Retrieves all YT videos from every playlist in CFG.PLAYLISTS (uploads + members-only on a
+        public run, members-only only on a members chat pass).
+
+        Also writes one JSON file per playlist containing basic information of all its videos
+        ("Video_Playlist.json" / "Video_Playlist_members.json").
+
+        :return: {video_id: members} for every video found. A video in both playlists counts as public.
+        :rtype: Dictionary of {String, Boolean}
+        """
+        videos:dict[str,bool] = {}
         with LOG.TQDM_Logging():
             with ST.Bar(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
+                for playlist_id,members in CFG.PLAYLISTS:
+                    video_list = self._Get_Playlist_Items(playlist_id,dl_vidbar)
+                    if not video_list:
+                        continue
 
-                request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
-                try:
-                    response = _execute_with_retry(request)
-                except HttpError as e:
-                    if e.resp.status == 404:
-                        # Channel has no Members-Only content yet, so YouTube hasn't generated this hidden playlist.
-                        LOG.logger.warning(f"Playlist {CFG.PLAYLIST} not found (404) - assuming no videos exist yet.")
-                        return []
-                    raise
-                next_page = response.get("nextPageToken")
-                video_list:list[dict[str,Any]] = response["items"]
-                dl_vidbar.update(len(video_list))
+                    playlist_name = f"Video_Playlist{CFG.MEMBERS_ONLY_FLAG}" if members else "Video_Playlist"
+                    playlist_path = f"{CFG.LOCAL_DATA_PATH}/{playlist_name}_TEMP.json"
+                    with open(playlist_path,'w') as file:
+                        file.write(json.dumps(video_list,indent=4))
+                    _check_and_upload_file(bucket,playlist_path,playlist_name,"json")
 
-                while True:
-                    if next_page == None:
-                        break
-                    else:
-                        next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50,pageToken=next_page)
-                        next_response = _execute_with_retry(next_request)
-                        next_page = next_response.get("nextPageToken")
-                        response_items:list[dict] = next_response["items"]
-                        dl_vidbar.update(len(response_items))
-                        video_list:list[dict[str,Any]] = video_list + response_items
+                    for video in video_list:
+                        vid_id:str = video["contentDetails"]["videoId"]
+                        videos[vid_id] = videos.get(vid_id,True) and members
 
-        playlist_name = "Video_Playlist" if CFG.GET_MEMBERS_ONLY is False else f"Video_Playlist{CFG.MEMBERS_ONLY_FLAG}"
-        playlist_path = f"{CFG.LOCAL_DATA_PATH}/{playlist_name}_TEMP.json"
-        with open(playlist_path,'w') as file:
-            file.write(json.dumps(video_list,indent=4))
+        return videos
 
-        _check_and_upload_file(bucket,playlist_path,playlist_name,"json")
+    def Get_Videos_Info_Batch(self,ids:list[str],bucket:H3Bucket,members_ids:set[str]|None=None) -> dict[str,'VideoClass']:
+        """
+        Fetches info for up to 50 video IDs in a single API call instead of one call per video.
 
-        ids:list[str] = []
-
-        for video in video_list:
-            vid_id:str = video["contentDetails"]["videoId"]
-            ids.append(vid_id)
-
-        return ids
-
-    def Get_Videos_Info_Batch(self,ids:list[str],bucket:H3Bucket) -> dict[str,'VideoClass']:
-        """Fetches info for up to 50 video IDs in a single API call instead of one call per video."""
+        :param members_ids: IDs of members-only videos (Get_All_Videos' result) -- sets
+            VideoClass.members and which S3 detail folder the JSON goes to.
+        """
         result:dict[str,VideoClass] = {}
         if not ids:
             return result
+        _members_ids = members_ids if members_ids is not None else set()
         request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=",".join(ids))
         response = _execute_with_retry(request)
         for video in response.get("items",[]):
             vid_id = video["id"]
             del video["kind"]
             del video["etag"]
-            temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{vid_id}_TEMP.json"
+            members = vid_id in _members_ids
+            detail_tag = CFG.video_detail_tag(members)
+            temp_path = f"{bucket.local_root}/{detail_tag}/{vid_id}_TEMP.json"
             with open(temp_path,'w') as file:
                 file.write(json.dumps(video,indent=4))
-            video_detail_status = _check_and_upload_file(bucket,temp_path,vid_id,"json",CFG.DETAIL_TAG)
-            result[vid_id] = VideoClass(video,video_detail_status)
+            video_detail_status = _check_and_upload_file(bucket,temp_path,vid_id,"json",detail_tag)
+            result[vid_id] = VideoClass(video,video_detail_status,members)
         return result
 
     def Get_Messages(self,video:VideoClass,bucket:H3Bucket,known_user_ids:set,sorted_nicknames:list[str],db=None,user_id_lock=None,known_emote_ids:set|None=None,bar_position:int=1,skip_download=False):
@@ -1010,7 +1029,7 @@ class YT_API:
         # inserted -- and counted into video_message_stats/user_channel_activity -- a second time.
         # Processed videos are already filtered out before this point; this only guards against
         # one being manually flipped back to unprocessed.
-        if CFG.GET_MEMBERS_ONLY is False:
+        if CFG.GET_MEMBERS_CHAT is False:
             archived_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["videos"],"chat_archived",{"id":v.id})
             if archived_rows and archived_rows[0]["chat_archived"]:
                 LOG.logger.warning(f"Video {v.id}'s chat is already archived to Parquet -- skipping to avoid double-counting.")
@@ -1159,7 +1178,7 @@ class YT_API:
                         # can't race to insert the same brand-new emote at once, and
                         # InsertEntriesRetryOnDeadlock is a backstop for any residual race.
                         if len(msg.e_emote_entries) > 0:
-                            emote_conflict = "channel_id,id" if CFG.GET_MEMBERS_ONLY is False else "id"
+                            emote_conflict = "channel_id,id" if CFG.GET_MEMBERS_CHAT is False else "id"
                             with _lock:
                                 new_emotes = [e for e in msg.e_emote_entries if e["id"] not in _emote_ids]
                                 for e in new_emotes:
@@ -1216,12 +1235,12 @@ class YT_API:
                                                     "index_start":start,
                                                     "index_end":end
                                                 }
-                                                if CFG.GET_MEMBERS_ONLY is False:
+                                                if CFG.GET_MEMBERS_CHAT is False:
                                                     entry["channel_id"] = CFG.YT_USER_ID
                                                 used_positions.update(range(start, end))
                                                 entries.append(entry)
 
-                                nickname_match_conflict = "channel_id,message_id,index_start,index_end" if CFG.GET_MEMBERS_ONLY is False else "message_id,index_start,index_end"
+                                nickname_match_conflict = "channel_id,message_id,index_start,index_end" if CFG.GET_MEMBERS_CHAT is False else "message_id,index_start,index_end"
                                 DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,nickname_match_conflict)
 
                             chat_stats.new_messages += 1
@@ -1382,7 +1401,7 @@ class YT_API:
             for cue in cues:
                 cue["video_id"] = video_id
                 cue["language"] = lang
-                if CFG.GET_MEMBERS_ONLY is False:
+                if CFG.GET_MEMBERS_CHAT is False:
                     cue["channel_id"] = CFG.YT_USER_ID
             all_cues.extend(cues)
 
@@ -1444,10 +1463,10 @@ class YT_API:
             #-- WRITE USER DATA TO DISK --#
             #-----------------------------#
 
-            temp_path = f"{bucket.local_root}/{CFG.DETAIL_TAG}/{u.id}_TEMP.json"
+            temp_path = f"{bucket.local_root}/{CFG.USER_DETAIL_TAG}/{u.id}_TEMP.json"
             with open(temp_path,'w') as file:
                 file.write(json.dumps(user,indent=4))
-            _check_and_upload_file(bucket,temp_path,u.id,"json",CFG.DETAIL_TAG)
+            _check_and_upload_file(bucket,temp_path,u.id,"json",CFG.USER_DETAIL_TAG)
 
             #------------------------------#
             #-- PROFILE PICTURE DOWNLOAD --#

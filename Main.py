@@ -33,18 +33,19 @@ This tool is designed to download the following from every publically available 
         - Video Premieres
         - Pre/Post-chat if the stream is currently live, waiting to start, or has just finished
 
-You can set a flag to download member's only video data as well into a separate database. (SEE SETTINGS)
+Members-only video metadata and thumbnails are collected on every run (they're publicly visible),
+but not their chat. Set GET_MEMBERS_CHAT to run a members-only chat pass instead, for channels
+flagged members_chat in channel_directory -- chat goes to per-channel *_members tables. (SEE SETTINGS)
 
 ----------------
 Steps to Operate
 ----------------
 
-1. Create PostgreSQL Database tables with the provided DDLs (Modify names as desired).
-    a. NOTE: You'll need to create a separate DB for both Public and Member's Only data.
+1. Missing database tables are created on first run from the DDLs in sql/ (see sql/README.md).
 2. Create an app from the Google Cloud Console and get Oauth 2.0 setup. Download the secrets JSON for it.
 3. Make sure all required dependancies are installed from requirements.txt.
 4. Read through Settings.py and do the following minimum requirements:
-    a. If you're going to download member's only content, get a cookies.txt file (READ THE NOTE IN SETTINGS).
+    a. If you're going to download member's only chat, get a cookies.txt file (READ THE NOTE IN SETTINGS).
     b. Edit the DB_Settings.json file as needed and place it in your secrets folder.
     c. Check the MEMBER_DIRECTORY list and be sure to pick the member you want.
 5. Start this script. It *should* work fine? If not, have fun debugging.
@@ -66,7 +67,7 @@ ST.set_info(phase="Starting up")
 
 # Initialize database connection and setup the API calls (shared across all channels)
 db = DB.PostgresClass()
-DB.EnsureSchema(db.cursor,CFG.GET_MEMBERS_ONLY)
+DB.EnsureSchema(db.cursor)
 db.database.commit()
 CFG.load_channel_directory(db.cursor)
 s3 = C.H3Client()
@@ -149,16 +150,25 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
     all_chat_stats = C.ChatStats()
 
     LOG.logger.info("\nObtaining all videos from Youtube API...")
-    video_ids = yt.Get_All_Videos(channel_bucket)
-    LOG.logger.info(f"Total of {len(video_ids):,} video(s) aquired.")
+    video_members = yt.Get_All_Videos(channel_bucket) # {video_id: members}
+    video_ids = list(video_members)
+    members_ids = {vid_id for vid_id,members in video_members.items() if members}
+    LOG.logger.info(f"Total of {len(video_ids):,} video(s) aquired ({len(members_ids):,} members-only).")
 
     LOG.logger.info("Pre-loading database state...")
-    all_video_records = DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"id,processed,login_required",{"channel_id":CFG.YT_USER_ID})
+    all_video_records = DB.GetEntries(db.cursor,CFG.DB_TABLES["videos"],"id,processed,login_required,livestream",{"channel_id":CFG.YT_USER_ID})
     video_db_status = {r["id"]: r["processed"] for r in all_video_records}
     LOG.logger.info(f"  {len(video_db_status):,} video record(s) loaded from database.")
     # Videos an earlier run found need a login (age-restricted, members-only, private) can't
     # succeed without cookies, so don't spend API quota or chat requests on them this run.
     login_required_ids = {r["id"] for r in all_video_records if r["login_required"]} if CFG.COOKIES is None else set()
+    # A public run only stores members-only videos' details (no chat), and they stay unprocessed so
+    # a members chat pass can still pick them up. Once a row exists and the video isn't an
+    # upcoming/live stream its details are final -- skip it rather than re-fetching it every run.
+    if not CFG.GET_MEMBERS_CHAT:
+        members_details_done = {r["id"] for r in all_video_records if r["id"] in members_ids and r["livestream"] is not True}
+    else:
+        members_details_done = set()
 
     # known_user_ids/known_emote_ids/sorted_nicknames are only ever consumed by Get_Messages()
     # below, which never runs when CFG.SKIP_CHAT_DOWNLOAD is set -- skip loading them in that
@@ -176,7 +186,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
 
         # Public mode's "emotes" table is shared across every channel (PK is channel_id+id), so it
         # must be filtered to this channel; members-only mode already uses a per-channel table.
-        emote_filter = {"channel_id":CFG.YT_USER_ID} if CFG.GET_MEMBERS_ONLY is False else None
+        emote_filter = {"channel_id":CFG.YT_USER_ID} if CFG.GET_MEMBERS_CHAT is False else None
         known_emote_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["emotes"],"id",emote_filter))
         LOG.logger.info(f"  {len(known_emote_ids):,} known emote(s) loaded.")
 
@@ -188,10 +198,12 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
     # "idle in transaction" (holding its table locks) for the whole worker phase below.
     db.database.commit()
 
-    unprocessed_ids = [vid_id for vid_id in video_ids if video_db_status.get(vid_id) is not True and vid_id not in login_required_ids]
+    unprocessed_ids = [vid_id for vid_id in video_ids if video_db_status.get(vid_id) is not True and vid_id not in login_required_ids and vid_id not in members_details_done]
     LOG.logger.info(f"  {len(unprocessed_ids):,} unprocessed video(s) to fetch.")
     if login_required_ids:
         LOG.logger.info(f"  {len(login_required_ids):,} login-required video(s) skipped (no cookies provided).")
+    if members_details_done:
+        LOG.logger.info(f"  {len(members_details_done):,} members-only video(s) skipped (details already stored, chat not collected this run).")
 
     LOG.logger.info("Fetching video details in batches of 50...")
     ST.set_info(phase="Fetching video details")
@@ -202,13 +214,13 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
             for i in range(0,len(unprocessed_ids),50):
                 batch = unprocessed_ids[i:i+50]
                 try:
-                    batch_result = yt.Get_Videos_Info_Batch(batch,channel_bucket)
+                    batch_result = yt.Get_Videos_Info_Batch(batch,channel_bucket,members_ids)
                     video_info_cache.update(batch_result)
                 except Exception as e:
                     LOG.logger.error(f"Batch fetch failed for {len(batch)} video(s), falling back to individual fetch: {e}")
                     for vid_id in batch:
                         try:
-                            vid = yt.Get_Video_Info(vid_id,channel_bucket)
+                            vid = yt.Get_Video_Info(vid_id,channel_bucket,vid_id in members_ids)
                             if vid:
                                 video_info_cache[vid_id] = vid
                         except Exception as e2:
@@ -276,6 +288,11 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
 
         if CFG.SKIP_CHAT_DOWNLOAD:
             local_vid_stats.success_videos = 1
+        elif vid.members and not CFG.GET_MEMBERS_CHAT:
+            # Members-only chat is only collected by a members chat pass (into the *_members
+            # tables). Left unprocessed so that pass still picks it up.
+            local_vid_stats.success_videos = 1
+            LOG.logger.debug(f"{video_id}: Members-only, details stored, chat skipped.")
         elif is_short:
             local_vid_stats.success_videos = 1
             LOG.logger.debug(f"{video_id}: Short, no chat to download.")
@@ -493,13 +510,15 @@ Invalid:        {all_chat_stats.invalid_users:,}
 
 # Compresses and archives each channel that finishes cleanly in a background thread while the
 # next channel processes -- see modules/ChannelArchiver.py. Its status slot sits after the workers'.
-archiver = CA.ChannelArchiver(CFG.WORKER_COUNT + 1) if CFG.AUTO_ARCHIVE and not CFG.GET_MEMBERS_ONLY else None
+archiver = CA.ChannelArchiver(CFG.WORKER_COUNT + 1) if CFG.AUTO_ARCHIVE and not CFG.GET_MEMBERS_CHAT else None
 
 for channel_index,channel_name in enumerate(CFG.CHANNELS_TO_PROCESS):
     CFG.select_channel(channel_name)
-    if not CFG.GET_MEMBERS_ONLY:
+    if not CFG.GET_MEMBERS_CHAT:
         DB.EnsureMessagesPartition(db.cursor,CFG.DB_TABLES["messages"],CFG.YT_USER_ID)
-        db.database.commit()
+    else:
+        DB.EnsureMembersTables(db.cursor,CFG.CHANNEL_SUFFIX)
+    db.database.commit()
     channel_errors = process_channel(channel_name,channel_index + 1,len(CFG.CHANNELS_TO_PROCESS))
     if archiver is not None:
         if channel_errors == 0:

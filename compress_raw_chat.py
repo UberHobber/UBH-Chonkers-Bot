@@ -285,8 +285,8 @@ def main() -> None:
     parser.add_argument("--workers",type=int,default=2,help="Parallel S3 conversions (memory: each holds one video's chat). Default 2.")
     args = parser.parse_args()
 
-    if CFG.GET_MEMBERS_ONLY:
-        LOG.logger.error("Run this in public mode (GET_MEMBERS_ONLY = False) -- it corrects public messages partitions.")
+    if CFG.GET_MEMBERS_CHAT:
+        LOG.logger.error("Run this in public mode (GET_MEMBERS_CHAT = False) -- it corrects public messages partitions.")
         return
 
     ST.start("compress",LOG.logger)

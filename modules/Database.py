@@ -570,6 +570,112 @@ def EnsureMessagesPartition(cursor:psycopg2.extensions.cursor,table:str,channel_
         LOG.logger.error(f'Failed to create missing partition table {table} for channel_id {channel_id}: {e}')
         raise e
 
+# Per-channel members-only chat tables, created on demand by EnsureMembersTables(). Same
+# definitions as the existing hand-made *_<talent>_members tables in sql/*_members.sql (those
+# files are now reference only). {s} is the channel's db_suffix; every name built from it is
+# passed through sql.Identifier. Order matters: nickname_matches FKs to messages.
+_MEMBERS_TABLE_DDL:list[tuple[str,str]] = [
+    ("messages_{s}_members","""
+        CREATE TABLE IF NOT EXISTS public.{t} (
+            message_id text NOT NULL,
+            message text NULL,
+            "timestamp" int8 NULL,
+            time_in_seconds float4 NULL,
+            "type" text NULL,
+            video_id text NULL,
+            user_id text NULL,
+            user_name text NULL,
+            user_member_status int8 NULL,
+            ismoderator bool DEFAULT false NOT NULL,
+            isverified bool DEFAULT false NOT NULL,
+            isowner bool DEFAULT false NOT NULL,
+            amount float4 NULL,
+            currency text NULL,
+            symbol text NULL,
+            color text NULL,
+            datetime timestamp GENERATED ALWAYS AS (
+                CASE
+                    WHEN ("timestamp" > '1000000000000000'::bigint) THEN to_timestamp((("timestamp" / 1000000))::double precision)
+                    ELSE to_timestamp(("timestamp")::double precision)
+                END) STORED NULL,
+            CONSTRAINT {pk} PRIMARY KEY (message_id),
+            CONSTRAINT {fk_user} FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+            CONSTRAINT {fk_video} FOREIGN KEY (video_id) REFERENCES public.videos(id)
+        );
+        CREATE INDEX IF NOT EXISTS {idx_user} ON public.{t} USING btree (user_id);
+        CREATE INDEX IF NOT EXISTS {idx_video} ON public.{t} USING btree (video_id);
+    """),
+    ("emotes_{s}_members","""
+        CREATE TABLE IF NOT EXISTS public.{t} (
+            id text NOT NULL,
+            "name" text NOT NULL,
+            url text NULL,
+            custom bool NOT NULL,
+            CONSTRAINT {pk} UNIQUE (id)
+        );
+    """),
+    ("nickname_matches_{s}_members","""
+        CREATE TABLE IF NOT EXISTS public.{t} (
+            matched_nickname text NULL,
+            message_id text NULL,
+            index_start int8 NULL,
+            index_end int8 NULL,
+            CONSTRAINT {pk} UNIQUE (message_id, index_start, index_end),
+            CONSTRAINT {fk_msg} FOREIGN KEY (message_id) REFERENCES public.{messages}(message_id)
+        );
+        CREATE INDEX IF NOT EXISTS {idx_msg} ON public.{t} USING btree (message_id);
+    """),
+    ("subtitles_{s}_members","""
+        CREATE TABLE IF NOT EXISTS public.{t} (
+            video_id text NOT NULL,
+            language text DEFAULT 'en'::text NOT NULL,
+            seq int4 NOT NULL,
+            start_ms int8 NOT NULL,
+            end_ms int8 NOT NULL,
+            text text NOT NULL,
+            CONSTRAINT {pk} PRIMARY KEY (video_id, language, seq),
+            CONSTRAINT {fk_video} FOREIGN KEY (video_id) REFERENCES public.videos(id)
+        );
+    """),
+]
+
+def EnsureMembersTables(cursor:psycopg2.extensions.cursor,db_suffix:str) -> None:
+    """
+    Creates a channel's members-only chat tables (messages_, emotes_, nickname_matches_ and
+    subtitles_<db_suffix>_members) if they don't already exist -- what a members chat pass
+    (CFG.GET_MEMBERS_CHAT) writes to. Called per channel before processing it, so flagging a new
+    channel members_chat in channel_directory is all that's needed. Caller is responsible for committing.
+
+    :param cursor: Database cursor object to execute commands.
+    :type cursor: Cursor
+    :param db_suffix: The channel's channel_directory.db_suffix.
+    :type db_suffix: String
+    """
+    messages_table = f"messages_{db_suffix}_members"
+    for name_template,ddl in _MEMBERS_TABLE_DDL:
+        table = name_template.format(s=db_suffix)
+        if TableExists(cursor,table):
+            continue
+        query = sql.SQL(ddl).format(
+            t=sql.Identifier(table),
+            messages=sql.Identifier(messages_table),
+            pk=sql.Identifier(f"pk_{table}"),
+            fk_user=sql.Identifier(f"fk_{table}_user"),
+            fk_video=sql.Identifier(f"fk_{table}_video"),
+            fk_msg=sql.Identifier(f"fk_{table}_msg"),
+            idx_user=sql.Identifier(f"idx_{table}_user"),
+            idx_video=sql.Identifier(f"idx_{table}_video"),
+            idx_msg=sql.Identifier(f"idx_{table}_msg"),
+        )
+        if CFG.DB_VERBOSE == True:
+            LOG.logger.info(query.as_string(cursor))
+        try:
+            cursor.execute(query)
+            LOG.logger.info(f'Created missing members-only table {table}.')
+        except Exception as e:
+            LOG.logger.error(f'Failed to create members-only table {table}: {e}')
+            raise e
+
 # sql/<name>.sql -> the table (or matview) whose presence means that file has already been
 # applied. Order matters -- see sql/README.md for the FK reasons (e.g. messages before
 # nicknames, messages_members before nicknames_members). Kept in sync by hand with
@@ -595,37 +701,25 @@ _CORE_SQL_FILES = [
     ("processed_status","processed_status"),
     ("chat_archive","chat_archive"),
 ]
-_MEMBERS_SQL_FILES = [
-    ("emotes_members","emotes_calli_members"),
-    ("messages_members","messages_calli_members"),
-    ("nicknames_members","nickname_matches_kiara_members"),
-    ("subtitles_members","subtitles_ame_members"),
-]
 
 _SQL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),"sql")
 
-def EnsureSchema(cursor:psycopg2.extensions.cursor,members_only:bool) -> None:
+def EnsureSchema(cursor:psycopg2.extensions.cursor) -> None:
     """
     Verifies the database structure this bot needs exists, and builds whatever's missing from
     the DDL scripts in sql/ -- lets a fresh, empty database bootstrap itself on first run
     instead of requiring the scripts to be applied by hand first. Safe to call on every
-    startup: each file is only applied if its anchor table/matview (see _CORE_SQL_FILES/
-    _MEMBERS_SQL_FILES) doesn't already exist, so an already-provisioned database is a no-op.
+    startup: each file is only applied if its anchor table/matview (see _CORE_SQL_FILES)
+    doesn't already exist, so an already-provisioned database is a no-op.
 
-    The `*_members` files are only applied when members_only is True, so a public-only
-    deployment never gets members-only tables it doesn't need. Caller is responsible for
+    The `*_members` files aren't applied -- members-only chat tables are created per channel
+    by EnsureMembersTables() when a members chat pass reaches it. Caller is responsible for
     committing.
 
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
-    :param members_only: Whether to also ensure the members-only tables exist (CFG.GET_MEMBERS_ONLY).
-    :type members_only: Boolean
     """
-    files = list(_CORE_SQL_FILES)
-    if members_only:
-        files += _MEMBERS_SQL_FILES
-
-    for file_name,anchor_table in files:
+    for file_name,anchor_table in _CORE_SQL_FILES:
         if TableExists(cursor,anchor_table):
             continue
         path = os.path.join(_SQL_DIR,f"{file_name}.sql")
@@ -737,7 +831,7 @@ def GetVideosNeedingSubtitles(cursor:psycopg2.extensions.cursor,videos_table:str
     :param cursor: Database cursor object to execute commands.
     :param videos_table: CFG.DB_TABLES["videos"].
     :param channel_id: CFG.YT_USER_ID for the channel being processed.
-    :param members: CFG.GET_MEMBERS_ONLY -- videos.members distinguishes public vs
+    :param members: CFG.GET_MEMBERS_CHAT -- videos.members distinguishes public vs
         members-only rows within the single unified videos table.
     :return: List of {"id":..., "end_time":...} dicts.
     """

@@ -13,6 +13,13 @@ CHANNEL_SELECTION = "Kiara"
 USE_COOKIES = False
 SKIP_ROLLUPS = False
 
+# Where cookies come from when they're needed (a members chat pass, or USE_COOKIES): read
+# straight from a browser profile at startup as (browser, profile name or path), e.g.
+# ("firefox", "ChonkersBot"). None falls back to a hand-exported cookies.txt in the secrets
+# folder. Use a Firefox profile only the bot uses -- sign into YouTube there once, then close
+# it and leave it closed. Chrome/Edge can't be read on Windows. See modules/BrowserCookies.py.
+COOKIES_FROM_BROWSER:tuple[str,str|None]|None = ("firefox", "ChonkersBot")
+
 # Seconds to wait between starting each chat download. The rate limiter enforces this
 # gap even across concurrent workers so YouTube isn't hit simultaneously. 0 to disable.
 REQUEST_DELAY = 2.0
@@ -135,9 +142,11 @@ if QUICK_SETTINGS is True:
     # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
     DATA_DIRECTORY = QUICK_SETTINGS_DATA
     SECRETS_DIRECTORY = QUICK_SETTINGS_SECRET
-    # Set this if you want to write to a member's only database.
-    GET_MEMBERS_ONLY = False
-    # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
+    # Members-only video details are always collected (they're public). Set this to run a
+    # members-only CHAT pass instead: only channels with channel_directory.members_chat = true,
+    # only their members-only videos, chat written to the *_<suffix>_members tables. Needs cookies.
+    GET_MEMBERS_CHAT = False
+    # Just process video data and not chat messages
     SKIP_CHAT_DOWNLOAD = False
     # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
     TIMEOUT = True
@@ -149,10 +158,10 @@ else:
     # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
     DATA_DIRECTORY = filedialog.askdirectory(title="Specify directory for data to be downloaded to")
     SECRETS_DIRECTORY = filedialog.askdirectory(title="Specify directory where Secrets and/or Cookies are")
-    # Set this if you want to write to a member's only database.
-    GET_MEMBERS_ONLY = messagebox.askyesno("Members-Only","Do you want to download Members-Only video data? (BE SURE COOKIES ARE UP-TO-DATE)")
-    # Just process video data and not chat messages (Good for getting just publicly available Member's Only info)
-    SKIP_CHAT_DOWNLOAD = messagebox.askyesno("Skip Chat Download","Process only video data and not the chat messages?\n(Useful for publicly available Members Only video info.)")
+    # Members-only video details are always collected. This runs a members-only CHAT pass instead (see above).
+    GET_MEMBERS_CHAT = messagebox.askyesno("Members-Only Chat","Run a Members-Only chat pass? (Only channels flagged members_chat. BE SURE COOKIES ARE UP-TO-DATE)")
+    # Just process video data and not chat messages
+    SKIP_CHAT_DOWNLOAD = messagebox.askyesno("Skip Chat Download","Process only video data and not the chat messages?")
     # Allow the scraper to timeout if no new messages arrive (False: Good for sitting on a waiting room or stream)
     TIMEOUT = messagebox.askyesno("Chat Timeout","Do you want the chat scraper to timeout?\n(Pick no if you want it to keep watching a livestream.)")
     # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
@@ -175,16 +184,34 @@ with open(f"{SECRETS_DIRECTORY}/Settings.json",'r') as file:
 
 USER_DATA_NAME = gen_settings["user_data_name"]
 
-# Needed to access chat messages from member's only videos. Use browser addins to generate, make sure name matches.
+# Needed to access chat messages from member's only videos. Either read from a browser profile
+# (COOKIES_FROM_BROWSER, above) or a cookies.txt exported by hand with a browser addin.
 # NOTE: Once you've exported the cookies, CLOSE that browser (or user agent) and do not open/use until this program finishes.
 # Keeping the browser open tends to make the YT cookies reset and break the access to member's only videos.
-COOKIES = None if GET_MEMBERS_ONLY is False and USE_COOKIES is False else f"{SECRETS_DIRECTORY}/cookies.txt"
+if GET_MEMBERS_CHAT is False and USE_COOKIES is False:
+    COOKIES = None
+elif COOKIES_FROM_BROWSER is not None:
+    from modules.BrowserCookies import export_browser_cookies
+    try:
+        COOKIES = export_browser_cookies(*COOKIES_FROM_BROWSER)
+    except RuntimeError as e:
+        exit(f"COOKIES_FROM_BROWSER: {e}")
+else:
+    COOKIES = f"{SECRETS_DIRECTORY}/cookies.txt"
 
 # These folders will be automatically created if they don't exist. It's where the JSON files and thumbnails will be saved to.
 LOCAL_USER_PATH = f"{DATA_DIRECTORY}/{USER_DATA_NAME}"
 
-DETAIL_TAG = f"{DETAIL_TAG}" if GET_MEMBERS_ONLY is False else f"{DETAIL_TAG}{MEMBERS_ONLY_FLAG}"
-THUMBNAIL_TAG= f"{THUMBNAIL_TAG}" if GET_MEMBERS_ONLY is False else f"{THUMBNAIL_TAG}{MEMBERS_ONLY_FLAG}"
+# Video details/thumbnails go to details/ + thumbnails/ for public videos and details_members/ +
+# thumbnails_members/ for members-only ones, per video (every run collects both kinds now).
+def video_detail_tag(members:bool) -> str:
+    return f"{DETAIL_TAG}{MEMBERS_ONLY_FLAG}" if members else DETAIL_TAG
+
+def video_thumbnail_tag(members:bool) -> str:
+    return f"{THUMBNAIL_TAG}{MEMBERS_ONLY_FLAG}" if members else THUMBNAIL_TAG
+
+# User details keep their old split: details_members/ in the user bucket during a members chat pass.
+USER_DETAIL_TAG = DETAIL_TAG if GET_MEMBERS_CHAT is False else f"{DETAIL_TAG}{MEMBERS_ONLY_FLAG}"
 
 # Edit the template provided and stuff it in your secrets folder
 with open(f"{SECRETS_DIRECTORY}/DB_Settings.json",'r') as file:
@@ -213,21 +240,28 @@ def load_channel_directory(cursor:cursor) -> None:
     # channels, then oldest debut first. name is a final tiebreak so same-day debuts stay stable.
     # Mirrored by the processed_status view's processing_order -- keep the two in sync.
     cursor.execute('''
-        SELECT cd.name, cd.user_id, cd.db_suffix, cd."group", cd.process
+        SELECT cd.name, cd.user_id, cd.db_suffix, cd."group", cd.process, cd.members_chat
         FROM channel_directory cd
         JOIN branches b ON b.name = cd.branch
         ORDER BY b.sort_order, (cd.channel_type = 'official'), cd.debut, cd.name
     ''')
     rows = cursor.fetchall()
-    CHANNEL_DIRECTORY = {name:{"user_id":user_id,"db_suffix":db_suffix,"group":group} for name,user_id,db_suffix,group,process in rows}
+    CHANNEL_DIRECTORY = {name:{"user_id":user_id,"db_suffix":db_suffix,"group":group,"members_chat":members_chat} for name,user_id,db_suffix,group,process,members_chat in rows}
 
     # PROCESS_ALL loops over every entry in CHANNEL_DIRECTORY flagged "process" instead of just CHANNEL_SELECTION.
-    CHANNELS_TO_PROCESS = [name for name,_,_,_,process in rows if process] if PROCESS_ALL else [CHANNEL_SELECTION]
+    # A members chat pass is further limited to channels flagged members_chat (ones you hold a
+    # membership for) -- every other channel's members-only videos would just fail with LoginRequired.
+    if PROCESS_ALL:
+        CHANNELS_TO_PROCESS = [name for name,_,_,_,process,members_chat in rows if process and (members_chat or not GET_MEMBERS_CHAT)]
+    else:
+        if GET_MEMBERS_CHAT and not CHANNEL_DIRECTORY[CHANNEL_SELECTION]["members_chat"]:
+            exit(f"{CHANNEL_SELECTION} isn't flagged members_chat in channel_directory -- nothing to do in a members chat pass.")
+        CHANNELS_TO_PROCESS = [CHANNEL_SELECTION]
 
 def select_channel(channel_name:str) -> None:
     """Recomputes all channel-specific derived settings (paths, DB tables, YT IDs) for the given channel."""
     global CHANNEL_SELECTION,CHANNEL_SELECTOR,CHANNEL_SUFFIX,LOCAL_DATA_PATH,DATA_PATHS
-    global DB_TABLES,YT_USER_ID,YT_CHANNEL_ID,UPLOAD_PLAYLIST,MEMBERS_ONLY_PLAYLIST,PLAYLIST
+    global DB_TABLES,YT_USER_ID,YT_CHANNEL_ID,UPLOAD_PLAYLIST,MEMBERS_ONLY_PLAYLIST,PLAYLISTS
 
     CHANNEL_SELECTION = channel_name
     CHANNEL_SELECTOR = CHANNEL_DIRECTORY[CHANNEL_SELECTION]
@@ -237,11 +271,13 @@ def select_channel(channel_name:str) -> None:
     LOCAL_DATA_PATH = f"{DATA_DIRECTORY}/{CHANNEL_SUFFIX}"
 
     DATA_PATHS = [
-        f"{LOCAL_DATA_PATH}/{DETAIL_TAG}",
-        f"{LOCAL_DATA_PATH}/{THUMBNAIL_TAG}",
+        f"{LOCAL_DATA_PATH}/{video_detail_tag(False)}",
+        f"{LOCAL_DATA_PATH}/{video_detail_tag(True)}",
+        f"{LOCAL_DATA_PATH}/{video_thumbnail_tag(False)}",
+        f"{LOCAL_DATA_PATH}/{video_thumbnail_tag(True)}",
         f"{LOCAL_DATA_PATH}/{MESSAGES_TAG}",
         f"{LOCAL_DATA_PATH}/{SUBTITLE_TAG}",
-        f"{LOCAL_USER_PATH}/{DETAIL_TAG}",
+        f"{LOCAL_USER_PATH}/{USER_DETAIL_TAG}",
         f"{LOCAL_USER_PATH}/{PFP_TAG}"
     ]
 
@@ -253,7 +289,7 @@ def select_channel(channel_name:str) -> None:
     # videos was already fully merged (earlier, separately) into one channel_id-keyed
     # table for BOTH public and members-only videos, distinguished by its "members"
     # column -- there's no separate videos_<suffix>_members table at all anymore.
-    if GET_MEMBERS_ONLY is False:
+    if GET_MEMBERS_CHAT is False:
         DB_TABLES = {
             "emotes":"emotes",
             "messages":f"messages_{CHANNEL_SUFFIX}",
@@ -282,8 +318,9 @@ def select_channel(channel_name:str) -> None:
     UPLOAD_PLAYLIST = "UU" + YT_USER_ID # Hidden playlist containing ALL publically accessible Youtube Videos, Livestream VODs, and Shorts.
     MEMBERS_ONLY_PLAYLIST = "UUMO" + YT_USER_ID # Hiiden playlist containing ALL non-privated member's only Youtube Videos, Livestream VODs, and Shorts.
 
-    # Leave this be, edit CUSTOM PLAYLIST and MEMBERS values above instead.
-    PLAYLIST = UPLOAD_PLAYLIST if GET_MEMBERS_ONLY is False else MEMBERS_ONLY_PLAYLIST
+    # (playlist_id, members) pairs Get_All_Videos reads. A public run reads both, since members-only
+    # video details are public; a members chat pass only needs the members-only videos.
+    PLAYLISTS = [(UPLOAD_PLAYLIST,False),(MEMBERS_ONLY_PLAYLIST,True)] if GET_MEMBERS_CHAT is False else [(MEMBERS_ONLY_PLAYLIST,True)]
 
 def channel_targets(channel_name:str) -> tuple[str,str,str]:
     """

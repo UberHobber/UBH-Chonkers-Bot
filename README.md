@@ -29,7 +29,7 @@ Downloads the metadata, thumbnails and full chat history (messages, Super Chats,
    | `Settings.json` | `user_data_name` (the name of the bucket and folder for user data, e.g. `"users"`) |
    | `DB_Settings.json` | `DB_USR`, `DB_PASS`, `DB_HOST`, `DB_PORT`, `db_name` |
    | `S3_Settings.json` | `endpoint_url`, `aws_access_key_id`, `aws_secret_access_key`, `region_name` |
-   | `cookies.txt` | *Optional.* Only needed for members-only or age-restricted chat (see the note in `modules/Settings.py`). |
+   | `cookies.txt` | *Optional.* Only needed for members-only or age-restricted chat, and only if you don't set `COOKIES_FROM_BROWSER` (see the note in `modules/Settings.py`). |
 
 6. **Edit the top of [`modules/Settings.py`](modules/Settings.py):**
    - set `QUICK_SETTINGS_DATA` (a local scratch folder) and `QUICK_SETTINGS_SECRET` (the folder from step 5);
@@ -102,7 +102,7 @@ Regenerate the `sql/` bootstrap scripts and the schema reference:
 | Chat for videos not yet archived | PostgreSQL `messages` (partitioned by channel) |
 | Archived chat (zstd Parquet, ~10M messages per file) | S3: `<channel bucket>/chat_archive/`, listed in the `chat_archive` table |
 | Raw chat as downloaded (minified gzip JSON) | S3: `<channel bucket>/messages/<video>.json.gz` |
-| Video details, thumbnails and subtitles | S3: `<channel bucket>/details/`, `thumbnails/`, `subtitles/` |
+| Video details, thumbnails and subtitles | S3: `<channel bucket>/details/`, `thumbnails/`, `subtitles/` (members-only videos: `details_members/`, `thumbnails_members/`) |
 | User details and profile pictures | S3: `<user bucket>/details/`, `details_members/`, `pfp/` |
 
 The S3 store holds the only copy of archived chat, so it needs to be in your backups.
@@ -144,14 +144,26 @@ The main flags at the top of [`modules/Settings.py`](modules/Settings.py):
 | `REQUEST_DELAY` | Minimum seconds between chat download starts |
 | `SKIP_ROLLUPS` | Skip the end-of-run rebuild of leaderboards and `user_summary` |
 | `SKIP_SUBTITLE_DOWNLOAD` | Leave captions to `Subtitles.py` instead of the end of `Main.py` |
-| `USE_COOKIES` | Use `cookies.txt` for public runs (for age-restricted videos) |
+| `USE_COOKIES` | Use cookies for public runs (for age-restricted videos) |
+| `COOKIES_FROM_BROWSER` | Read cookies straight from a browser profile at startup, e.g. `("firefox", "ChonkersBot")`, instead of a hand-exported `cookies.txt` (see below) |
 | `AUTO_ARCHIVE` | Compress and archive each channel that finishes with no errors, in the background while the next channel runs |
 | `PROGRESS_BARS` | Also draw progress bars in the bot's own console (`Monitor.py` shows the same progress without the line spam) |
 | `STATUS_INTERVAL` / `STATUS_DIRECTORY` | How often the status files for `Monitor.py` are written, and where (blank = the launch folder) |
 | `LOG_VERBOSE` | Also log debug lines, including the per-file and per-50-video archive progress |
-| `QUICK_SETTINGS` | `True` uses the folders and flags in the file. `False` prompts with dialogs at launch, including members-only mode, chat timeout and livestream skipping. |
+| `GET_MEMBERS_CHAT` | Run a members-only chat pass instead of the normal run (see below) |
+| `QUICK_SETTINGS` | `True` uses the folders and flags in the file. `False` prompts with dialogs at launch, including the members chat pass, chat timeout and livestream skipping. |
 
-Members-only mode (`GET_MEMBERS_ONLY`) writes to the legacy `*_members` tables, which `archive_chat.py` doesn't archive.
+Every normal run reads both the uploads and the members-only playlists. It stores members-only video details and thumbnails (`videos.members = true`) but not their chat. Those videos stay unprocessed, and are skipped on later normal runs once their details are final.
+
+Members-only chat comes from a separate pass with `GET_MEMBERS_CHAT = True` and signed-in YouTube cookies. It covers only channels with `channel_directory.members_chat = true` (ones your cookies hold a membership for), and only their members-only videos. Chat goes to the per-channel `*_<db_suffix>_members` tables, which are created the first time the pass reaches a channel. `archive_chat.py` doesn't archive them.
+
+To skip exporting `cookies.txt` by hand, set `COOKIES_FROM_BROWSER`. The bot then reads the YouTube cookies from that browser profile each time it starts, keeps them in a temporary file, and deletes the file when it exits. It stops with an error if the profile isn't signed in. Setup:
+
+1. Create a Firefox profile just for the bot: open `about:profiles` and choose **Create a New Profile**.
+2. Launch it, sign into YouTube with the account that holds the memberships, then close it.
+3. Set `COOKIES_FROM_BROWSER = ("firefox", "<profile name>")`.
+
+Don't browse with that profile. YouTube rotates the cookies of a browser that's actively using them, and that's what used to break exported files. If the login ever expires, sign in to that profile again. Chrome and Edge can't be used on Windows, because their cookie encryption can only be decrypted by the browser itself.
 
 ---
 

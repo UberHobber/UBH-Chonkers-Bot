@@ -240,8 +240,8 @@ def main() -> None:
     parser.add_argument("--max-rows",type=int,default=10_000_000,help="Messages per Parquet file (default 10M, ~250MB).")
     args = parser.parse_args()
 
-    if CFG.GET_MEMBERS_ONLY:
-        LOG.logger.error("Run this in public mode (GET_MEMBERS_ONLY = False) -- members-only chat isn't archived.")
+    if CFG.GET_MEMBERS_CHAT:
+        LOG.logger.error("Run this in public mode (GET_MEMBERS_CHAT = False) -- members-only chat isn't archived.")
         return
 
     ST.start("archive",LOG.logger)

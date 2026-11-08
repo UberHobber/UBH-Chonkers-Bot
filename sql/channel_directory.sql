@@ -28,7 +28,8 @@ CREATE TABLE public.branches (
 -- schema used by emotes, nicknames, nickname_matches, and the partitioned messages table.
 -- Members-only chat data still writes to these per-channel tables today. They are kept
 -- intentionally -- they hold data that cannot be deleted and are slated to be
--- re-implemented under the unified schema at a later date. Do not drop.
+-- re-implemented under the unified schema at a later date. Do not drop. New ones are
+-- created on demand by EnsureMembersTables (modules/Database.py).
 
 -- public.channel_directory definition
 
@@ -41,6 +42,10 @@ CREATE TABLE public.branches (
 -- they belong to; branch-level ones use "group" = 'Branch', unit-level ones use their
 -- unit's group. Replaces the old 'Official' pseudo-branch (moved by a one-time
 -- migration, since removed).
+--
+-- members_chat: the bot's cookies hold a membership for this channel, so a members chat
+-- pass (CFG.GET_MEMBERS_CHAT) collects its members-only chat into the *_<db_suffix>_members
+-- tables. Members-only video details are collected on every run regardless of this flag.
 
 -- Drop table
 
@@ -58,6 +63,7 @@ CREATE TABLE public.channel_directory (
 	debut date NOT NULL,
 	process bool NOT NULL,
 	channel_type text DEFAULT 'talent'::text NOT NULL,
+	members_chat bool DEFAULT false NOT NULL,
 	CONSTRAINT channel_directory_unique UNIQUE (user_id),
 	CONSTRAINT channel_directory_branches_fk FOREIGN KEY (branch) REFERENCES public.branches(name),
 	CONSTRAINT channel_directory_channel_type_check CHECK ((channel_type = ANY (ARRAY['talent'::text, 'official'::text])))
