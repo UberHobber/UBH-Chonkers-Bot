@@ -17,6 +17,7 @@ import modules.Classes as C
 import modules.Database as DB
 import modules.Status as ST
 import modules.ChannelArchiver as CA
+import modules.AudienceDeltas as AD
 
 """
 ---------------
@@ -70,6 +71,16 @@ db = DB.PostgresClass()
 DB.EnsureSchema(db.cursor)
 db.database.commit()
 CFG.load_channel_directory(db.cursor)
+
+def fold_audience(when:str) -> None:
+    """Moves staged audience deltas into the rollups (modules/Database.py FoldAudience). Only
+    called while no ingestion workers are running."""
+    ST.set_info(phase=f"Folding audience stats ({when})")
+    counts = DB.FoldAudience(db.database)
+    LOG.logger.info(f"Audience fold ({when}): " + ", ".join(f"{k} {v:,}" for k,v in counts.items()))
+
+# Whatever a killed run left staged is folded first, so this run starts from exact rollups.
+fold_audience("start of run")
 s3 = C.H3Client()
 user_bucket = C.H3Bucket(s3.client,CFG.USER_DATA_NAME,CFG.LOCAL_USER_PATH)
 yt = C.YT_API(db)
@@ -518,21 +529,16 @@ for channel_index,channel_name in enumerate(CFG.CHANNELS_TO_PROCESS):
         DB.EnsureMessagesPartition(db.cursor,CFG.DB_TABLES["messages"],CFG.YT_USER_ID)
     else:
         DB.EnsureMembersTables(db.cursor,CFG.CHANNEL_SUFFIX)
+    AD.TOP_THRESHOLDS[CFG.YT_USER_ID] = DB.GetTopThreshold(db.cursor,CFG.YT_USER_ID)
     db.database.commit()
     channel_errors = process_channel(channel_name,channel_index + 1,len(CFG.CHANNELS_TO_PROCESS))
+    # Pre-generated audience stats: this channel's workers are done, so fold what they staged.
+    fold_audience(channel_name)
     if archiver is not None:
         if channel_errors == 0:
             archiver.submit(channel_name)
         else:
             LOG.logger.warning(f"{channel_name}: {channel_errors:,} error(s) this run -- skipping compress/archive until a clean run.")
-
-# Recompute first_messages/first_channel_messages, the message-count leaderboard ranks, and the
-# per-user summary once per run (none can be maintained incrementally -- see each Refresh*
-# docstring), skipping any whose source tables haven't changed since they last ran. See
-# RefreshRollupsIfChanged for how changes are detected.
-if not CFG.SKIP_ROLLUPS:
-    ST.set_info(channel=None,channel_progress=None,phase="Refreshing rollups")
-    DB.RefreshRollupsIfChanged(db.cursor)
 
 # Subtitle downloading runs as its own pass, after every channel's chat/video processing is
 # done, rather than inline per-video -- see Subtitles.py module docstring for why (subtitle
@@ -545,3 +551,7 @@ Subtitles.run(db,s3,yt,CFG.CHANNELS_TO_PROCESS)
 if archiver is not None:
     ST.set_info(channel=None,channel_progress=None,phase="Waiting for archive")
     archiver.finish()
+
+# The archiver's badge fixes stage moderator deltas too (compress_raw_chat._recompute_pending),
+# so fold once more after it has drained.
+fold_audience("end of run")

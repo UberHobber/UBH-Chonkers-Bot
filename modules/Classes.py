@@ -49,6 +49,7 @@ import modules.logconfig as LOG
 import modules.Settings as CFG
 import modules.Database as DB
 import modules.Status as ST
+import modules.AudienceDeltas as AD
 
 @contextmanager
 def Stage_Bar(desc:str,position:int):
@@ -1106,6 +1107,10 @@ class YT_API:
         # record_message_stats() calls are buffered here instead of being executed immediately,
         # and flushed (sorted by user_id) right before every commit -- see _flush_pending_stats().
         pending_stats:list[tuple] = []
+        # The stream's week bit for user_channel_activity.active_weeks ("regulars"): the stream's start
+        # week, not each message's time, so the bot and build_audience_baseline.py's rebuild (from
+        # video_user_seen x videos) always agree. See modules/AudienceDeltas.week_index.
+        stream_week = AD.week_index(video.actual_start or video.publish_date)
 
         def _flush_pending_stats():
             # Sorting before executing means every commit's worth of record_message_stats calls
@@ -1123,7 +1128,11 @@ class YT_API:
             # committed (multiple seconds of real stall, observed directly); one call removes
             # nearly all of that round-trip latency from the wait.
             pending_stats.sort(key=lambda s: s[2])
-            DB.RecordMessageStatsBatch(_db.cursor, pending_stats)
+            results = DB.RecordMessageStatsBatch(_db.cursor, pending_stats)
+            # Pre-generated audience stats: stage what this batch changed, in the same
+            # transaction, so the rollups stay exact without rescanning user_channel_activity
+            # (see modules/AudienceDeltas.py and sql/audience_rollups.sql).
+            DB.StageAudienceDeltas(_db.cursor, AD.batch_deltas(pending_stats, results, AD.TOP_THRESHOLDS))
             pending_stats.clear()
 
         with ST.Bar(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
@@ -1212,6 +1221,7 @@ class YT_API:
                                 msg.entry["isowner"],
                                 msg.entry["amount"],
                                 msg.entry["currency"],
+                                stream_week,
                             ))
 
                             entries = []

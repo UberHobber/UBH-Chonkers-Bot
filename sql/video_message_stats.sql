@@ -57,11 +57,10 @@ CREATE TABLE public.video_user_seen (
 -- Maintenance functions. record_message_stats()/record_message_stats_batch() and
 -- finalize_video_message_rate() are called incrementally during chat ingestion
 -- (modules/Database.py's RecordMessageStatsBatch/FinalizeVideoMessageRate, called from
--- modules/Classes.py Get_Messages, one batched call per commit). refresh_first_message_counts(),
--- refresh_user_message_rankings() and refresh_user_summary() are recomputed-from-scratch
--- refreshes called once per full bot run (see the end of Main.py) rather than incrementally --
--- see each function's own comment below, and the docstrings of their callers in
--- modules/Database.py, for the rationale and past incidents that shaped them.
+-- modules/Classes.py Get_Messages, one batched call per commit). There are no per-run
+-- from-scratch refreshes any more: the old ones (first-message counts, the message-ranking
+-- and user_summary matviews) each read all of user_channel_activity every run and were
+-- removed 2026-11-08 in favour of the delta-maintained audience rollups (channel_audience).
 
 -- public.record_message_stats definition
 
@@ -73,16 +72,19 @@ CREATE TABLE public.video_user_seen (
 -- carried a paid amount) user_channel_superchats. Deliberately never touches another video's
 -- video_message_stats row -- an earlier version did, to move
 -- first_messages/first_channel_messages credit between videos inline, which could deadlock two
--- worker threads processing two different videos against each other. That accounting was moved
--- out to refresh_first_message_counts() instead.
+-- worker threads processing two different videos against each other. Instead it RETURNS
+-- each user_channel_activity row's old and new values (Postgres 18 RETURNING OLD/NEW) and the
+-- old/new global first video; modules/AudienceDeltas.py turns those into deltas (including
+-- first_messages/first_channel_messages moves) that Database.FoldAudience applies later.
 
-CREATE OR REPLACE FUNCTION public.record_message_stats(p_channel_id text, p_video_id text, p_user_id text, p_timestamp double precision, p_is_member boolean, p_member_status bigint, p_message_id text, p_emote_count integer, p_is_moderator boolean, p_is_verified boolean, p_is_owner boolean, p_amount double precision, p_currency text)
- RETURNS void
+CREATE OR REPLACE FUNCTION public.record_message_stats(p_channel_id text, p_video_id text, p_user_id text, p_timestamp double precision, p_is_member boolean, p_member_status bigint, p_message_id text, p_emote_count integer, p_is_moderator boolean, p_is_verified boolean, p_is_owner boolean, p_amount double precision, p_currency text, p_week integer, OUT inserted boolean, OUT o_total bigint, OUT n_total bigint, OUT o_status bigint, OUT n_status bigint, OUT o_first double precision, OUT n_first double precision, OUT o_last double precision, OUT n_last double precision, OUT o_mod boolean, OUT n_mod boolean, OUT o_fvid text, OUT n_fvid text, OUT g_changed boolean, OUT g_old_vid text, OUT g_new_vid text, OUT o_weeks text, OUT n_weeks text)
+ RETURNS record
  LANGUAGE plpgsql
 AS $function$
         DECLARE
             v_prev_is_member boolean;
             v_was_new_user boolean;
+            v_old_channel text;
         BEGIN
             INSERT INTO public.video_message_stats (video_id) VALUES (p_video_id)
                 ON CONFLICT (video_id) DO NOTHING;
@@ -126,15 +128,20 @@ AS $function$
                 message_id = EXCLUDED.message_id,
                 video_id = EXCLUDED.video_id,
                 "timestamp" = EXCLUDED."timestamp"
-            WHERE EXCLUDED."timestamp" < public.user_first_message."timestamp";
+            WHERE EXCLUDED."timestamp" < public.user_first_message."timestamp"
+            RETURNING old.video_id, new.video_id INTO g_old_vid, g_new_vid;
+            -- No row comes back when the WHERE above skipped the update (not an earlier message).
+            g_changed := FOUND;
 
             INSERT INTO public.user_channel_activity
                 (channel_id, user_id, first_message_id, first_video_id, "timestamp", total_messages, last_message_ts,
                  max_member_status, emote_count, ever_moderator, ever_verified, ever_owner,
-                 last_is_moderator, last_is_verified, last_is_owner)
+                 last_is_moderator, last_is_verified, last_is_owner, active_weeks)
             VALUES (p_channel_id, p_user_id, p_message_id, p_video_id, p_timestamp, 1, p_timestamp, p_member_status,
                     p_emote_count, p_is_moderator, p_is_verified, p_is_owner,
-                    p_is_moderator, p_is_verified, p_is_owner)
+                    p_is_moderator, p_is_verified, p_is_owner,
+                    -- the stream's week (modules/AudienceDeltas.week_index); NULL = unknown, no bit
+                    CASE WHEN p_week IS NULL THEN B'0'::bit(728) ELSE set_bit(B'0'::bit(728), p_week, 1) END)
             ON CONFLICT (channel_id, user_id) DO UPDATE
             SET total_messages = public.user_channel_activity.total_messages + 1,
                 last_message_ts = GREATEST(public.user_channel_activity.last_message_ts, EXCLUDED.last_message_ts),
@@ -153,7 +160,21 @@ AS $function$
                     THEN EXCLUDED.first_message_id ELSE public.user_channel_activity.first_message_id END,
                 first_video_id = CASE WHEN EXCLUDED."timestamp" < public.user_channel_activity."timestamp"
                     THEN EXCLUDED.first_video_id ELSE public.user_channel_activity.first_video_id END,
-                "timestamp" = LEAST(public.user_channel_activity."timestamp", EXCLUDED."timestamp");
+                "timestamp" = LEAST(public.user_channel_activity."timestamp", EXCLUDED."timestamp"),
+                -- fixed length, so OR-ing in a bit never changes the row size (keeps updates HOT)
+                active_weeks = COALESCE(public.user_channel_activity.active_weeks, B'0'::bit(728)) | EXCLUDED.active_weeks
+            -- Postgres 18: OLD is all-NULL for a freshly inserted row. The caller turns these
+            -- before/after values into audience rollup deltas (modules/AudienceDeltas.py), so
+            -- nothing has to rescan user_channel_activity to keep the rollups current.
+            RETURNING old.channel_id, old.total_messages, new.total_messages, old.max_member_status, new.max_member_status,
+                      old."timestamp", new."timestamp", old.last_message_ts, new.last_message_ts,
+                      old.ever_moderator, new.ever_moderator, old.first_video_id, new.first_video_id,
+                      -- the weekly-activity bitmap only when this message set a new week (regulars)
+                      CASE WHEN old.active_weeks IS DISTINCT FROM new.active_weeks THEN old.active_weeks::text END,
+                      CASE WHEN old.active_weeks IS DISTINCT FROM new.active_weeks THEN new.active_weeks::text END
+            INTO v_old_channel, o_total, n_total, o_status, n_status, o_first, n_first, o_last, n_last,
+                 o_mod, n_mod, o_fvid, n_fvid, o_weeks, n_weeks;
+            inserted := v_old_channel IS NULL;
 
             IF p_amount IS NOT NULL THEN
                 INSERT INTO public.user_channel_superchats (channel_id, user_id, currency, superchat_count, total_amount)
@@ -175,21 +196,24 @@ AS $function$
 -- reason as record_message_stats() itself), and flushes it here right before every
 -- commit. One call carrying all the rows removes N-1 round trips' worth of network
 -- latency from how long another worker can be blocked waiting on a contended user.
+-- Returns one row per message (idx = position in the arrays) with record_message_stats()'s
+-- old/new values; Get_Messages stages the resulting audience deltas in the same transaction.
 
-CREATE OR REPLACE FUNCTION public.record_message_stats_batch(p_channel_ids text[], p_video_ids text[], p_user_ids text[], p_timestamps double precision[], p_is_members boolean[], p_member_statuses bigint[], p_message_ids text[], p_emote_counts integer[], p_is_moderators boolean[], p_is_verifieds boolean[], p_is_owners boolean[], p_amounts double precision[], p_currencies text[])
- RETURNS void
+CREATE OR REPLACE FUNCTION public.record_message_stats_batch(p_channel_ids text[], p_video_ids text[], p_user_ids text[], p_timestamps double precision[], p_is_members boolean[], p_member_statuses bigint[], p_message_ids text[], p_emote_counts integer[], p_is_moderators boolean[], p_is_verifieds boolean[], p_is_owners boolean[], p_amounts double precision[], p_currencies text[], p_weeks integer[])
+ RETURNS TABLE(idx integer, inserted boolean, o_total bigint, n_total bigint, o_status bigint, n_status bigint, o_first double precision, n_first double precision, o_last double precision, n_last double precision, o_mod boolean, n_mod boolean, o_fvid text, n_fvid text, g_changed boolean, g_old_vid text, g_new_vid text, o_weeks text, n_weeks text)
  LANGUAGE plpgsql
 AS $function$
+        #variable_conflict use_column
         DECLARE
             i int;
         BEGIN
             FOR i IN 1..array_length(p_user_ids, 1) LOOP
-                PERFORM public.record_message_stats(
+                RETURN QUERY SELECT i, s.* FROM public.record_message_stats(
                     p_channel_ids[i], p_video_ids[i], p_user_ids[i],
                     p_timestamps[i], p_is_members[i], p_member_statuses[i],
                     p_message_ids[i], p_emote_counts[i], p_is_moderators[i], p_is_verifieds[i],
-                    p_is_owners[i], p_amounts[i], p_currencies[i]
-                );
+                    p_is_owners[i], p_amounts[i], p_currencies[i], p_weeks[i]
+                ) s;
             END LOOP;
         END;
         $function$;

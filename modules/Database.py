@@ -1,5 +1,6 @@
 # Native Stuff
 import os,random,time
+from collections import Counter
 from typing import Any,LiteralString
 
 # Installed Stuff
@@ -190,14 +191,14 @@ def UpdateEntries(cursor:psycopg2.extensions.cursor,table:str,data_dict:dict[str
         LOG.logger.error(f'Query: {query}\nValues: {values} ({type(values)})\n')
         raise e
 
-def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[str,str,str,float,bool,int|None,str,int,bool,bool,bool,float|None,str|None]]) -> None:
+def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[str,str,str,float,bool,int|None,str,int,bool,bool,bool,float|None,str|None,int|None]]) -> list[tuple]:
     """
     Incrementally updates video_message_stats and user_channel_activity (and their
     dedup/first-message helper tables) for a batch of newly-inserted chat messages, in one round
     trip. Call this right before committing -- see _flush_pending_stats() in
     modules/Classes.py Get_Messages, which buffers one (channel_id, video_id, user_id, timestamp,
     is_member, member_status, message_id, emote_count, is_moderator, is_verified, is_owner,
-    amount, currency) tuple per newly-inserted message and flushes the whole buffer here.
+    amount, currency, stream_week) tuple per newly-inserted message and flushes the whole buffer here.
     All of the counting logic lives server-side in public.record_message_stats_batch() /
     record_message_stats() (see sql/video_message_stats.sql and
     sql/user_channel_activity_stats.sql).
@@ -205,7 +206,7 @@ def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[s
     :param cursor: Database cursor object to execute commands.
     :type cursor: Cursor
     :param batch: List of (channel_id, video_id, user_id, timestamp, is_member, member_status,
-        message_id, emote_count, is_moderator, is_verified, is_owner, amount, currency)
+        message_id, emote_count, is_moderator, is_verified, is_owner, amount, currency, stream_week)
         tuples, one per message, SORTED BY user_id by the caller -- see below for why.
     :type batch: list[tuple]
 
@@ -234,17 +235,20 @@ def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[s
     The retry below is a defensive backstop on top of the ordering guarantee above -- e.g.
     Postgres lock queueing edge cases under extreme load -- not the primary defense. A savepoint
     scopes any rollback to just this batch instead of the whole transaction.
+
+    :return: one row per message, (idx, *AudienceDeltas.RESULT_COLUMNS): each
+        user_channel_activity row's old and new values, for modules/AudienceDeltas.batch_deltas().
     """
     if len(batch) == 0:
-        return
+        return []
 
     (channel_ids,video_ids,user_ids,timestamps,is_members,member_statuses,
-     message_ids,emote_counts,is_moderators,is_verifieds,is_owners,amounts,currencies) = zip(*batch)
-    query = 'SELECT record_message_stats_batch(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)'
+     message_ids,emote_counts,is_moderators,is_verifieds,is_owners,amounts,currencies,weeks) = zip(*batch)
+    query = 'SELECT * FROM record_message_stats_batch(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::int[])'
     values = (
         list(channel_ids),list(video_ids),list(user_ids),list(timestamps),list(is_members),
         list(member_statuses),list(message_ids),list(emote_counts),list(is_moderators),
-        list(is_verifieds),list(is_owners),list(amounts),list(currencies)
+        list(is_verifieds),list(is_owners),list(amounts),list(currencies),list(weeks)
     )
 
     if CFG.DB_VERBOSE == True:
@@ -256,14 +260,269 @@ def RecordMessageStatsBatch(cursor:psycopg2.extensions.cursor,batch:list[tuple[s
         cursor.execute("SAVEPOINT record_message_stats_sp")
         try:
             cursor.execute(query,values)
+            rows = cursor.fetchall()
             cursor.execute("RELEASE SAVEPOINT record_message_stats_sp")
-            return
+            return rows
         except psycopg2.errors.DeadlockDetected:
             cursor.execute("ROLLBACK TO SAVEPOINT record_message_stats_sp")
             if attempt == max_attempts:
                 raise
             LOG.logger.warning(f'record_message_stats_batch deadlock for {len(batch)} message(s), retrying (attempt {attempt}/{max_attempts})...')
             time.sleep(random.uniform(0.05,0.25) * attempt)
+    return []
+
+def StageAudienceDeltas(cursor:psycopg2.extensions.cursor,d) -> None:
+    """
+    Writes one batch's audience deltas (an AudienceDeltas.BatchDeltas) to the insert-only
+    staging tables. Call it in the SAME transaction as the RecordMessageStatsBatch() call they
+    came from, so a rolled-back batch takes its deltas with it -- that's what keeps the rollups
+    exact. Insert-only on purpose: no shared counter rows for the parallel workers to lock.
+    FoldAudience() moves them into the rollups later.
+    """
+    from psycopg2.extras import execute_values
+    if d.channel:
+        execute_values(cursor,'INSERT INTO audience_delta (channel_id,dim,bucket,delta) VALUES %s',
+                       [(c,dim,b,v) for (c,dim,b),v in d.channel.items()])
+    if d.month or d.reg_month:
+        cols = {"arrivals":0,"last_seen":1,"regulars":2,"active":3,"returning":4,"reg_returning":5}
+        months:dict[tuple,list[int]] = {}
+        for counter in (d.month,d.reg_month):
+            for (c,m,kind),v in counter.items():
+                months.setdefault((c,m),[0] * len(cols))[cols[kind]] += v
+        execute_values(cursor,'INSERT INTO audience_month_delta (channel_id,"month",arrivals,last_seen,regulars,active,"returning",reg_returning) VALUES %s',
+                       [(c,m,*v) for (c,m),v in months.items()])
+    if d.retention:
+        execute_values(cursor,'INSERT INTO audience_retention_delta (channel_id,kind,cohort,age,n) VALUES %s',
+                       [(c,k,co,a,v) for (c,k,co,a),v in d.retention.items()])
+    if d.activity:
+        import modules.AudienceDeltas as AD
+        execute_values(cursor,'INSERT INTO audience_activity_change (channel_id,user_id,added_active,added_regular) VALUES %s',
+                       [(c,u,sorted(AD.month_index(m) for m in a),sorted(AD.month_index(m) for m in rg))
+                        for (c,u),(a,rg) in d.activity.items()],template='(%s,%s,%s::smallint[],%s::smallint[])')
+    if d.reg_year:
+        years:dict[tuple,list[int]] = {}
+        for (c,y,kind),v in d.reg_year.items():
+            years.setdefault((c,y),[0,0])[0 if kind == "regulars" else 1] += v
+        execute_values(cursor,'INSERT INTO audience_year_delta (channel_id,"year",regulars,active) VALUES %s',
+                       [(c,y,r,a) for (c,y),(r,a) in years.items()])
+    if d.reg_changes:
+        execute_values(cursor,'INSERT INTO audience_regular_change (channel_id,user_id,old_years,new_years) VALUES %s',
+                       [(c,u,sorted(o),sorted(n)) for (c,u),(o,n) in d.reg_changes.items()])
+    if d.video:
+        vids:dict[str,list[int]] = {}
+        for (v,kind),n in d.video.items():
+            vids.setdefault(v,[0,0])[0 if kind == "first_global" else 1] += n
+        execute_values(cursor,'INSERT INTO audience_video_delta (video_id,first_global,first_channel) VALUES %s',
+                       [(v,g,c) for v,(g,c) in vids.items()])
+    if d.links:
+        execute_values(cursor,'INSERT INTO audience_new_link (channel_id,user_id,is_new,o_first) VALUES %s',
+                       [(c,u,n,o) for (c,u),(n,o) in d.links.items()])
+    if d.top:
+        execute_values(cursor,'INSERT INTO audience_top_candidate (channel_id,user_id,total_messages) VALUES %s',
+                       [(c,u,t) for (c,u),t in d.top.items()])
+
+TOP_CHATTERS = 100
+
+# Distinct-per-scope retention needs each changed user's other user_channel_activity rows in the
+# fold (about 5-6x the users the Community fold reads). False = per-channel retention only, and
+# scope_retention goes stale (rebuild it with build_audience_baseline.py before re-enabling).
+SCOPE_RETENTION = True
+
+def GetTopThreshold(cursor:psycopg2.extensions.cursor,channel_id:str) -> int:
+    """
+    A channel's current #TOP_CHATTERS message total in channel_top_chatters (0 while it has fewer
+    rows). Totals only grow, so a chatter can only enter the top list by reaching this -- the
+    ingest path stages just those as candidates. Reads at most TOP_CHATTERS rows.
+    """
+    cursor.execute('SELECT CASE WHEN count(*) >= %s THEN min(total_messages) ELSE 0 END '
+                   'FROM channel_top_chatters WHERE channel_id = %s',(TOP_CHATTERS,channel_id))
+    return int(cursor.fetchone()[0])
+
+def FoldAudience(connection) -> dict[str,int]:
+    """
+    Moves everything staged by StageAudienceDeltas() into the audience rollups, in one
+    transaction (sql/audience_rollups.sql). Main.py calls it after each channel, at the start of
+    a run (whatever a killed run left staged) and at the end.
+
+    Must run while no ingestion workers are writing -- it reads the newly-linked users' current
+    user_channel_activity rows and treats every row not in this fold's staging as already
+    counted. Small reads only: the staged rows, plus those users' rows via
+    idx_user_channel_activity_user_id.
+    """
+    import modules.AudienceDeltas as AD
+    from psycopg2.extras import execute_values
+    cur = connection.cursor()
+    connection.commit()
+    cur.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+    counts = {}
+
+    cur.execute('''
+        WITH moved AS (DELETE FROM audience_delta RETURNING *)
+        INSERT INTO channel_audience (channel_id,dim,bucket,n)
+        SELECT channel_id,dim,bucket,sum(delta) FROM moved GROUP BY 1,2,3
+        ON CONFLICT (channel_id,dim,bucket) DO UPDATE SET n = channel_audience.n + EXCLUDED.n''')
+    counts["channel_audience"] = cur.rowcount
+    cur.execute('''
+        WITH moved AS (DELETE FROM audience_month_delta RETURNING *)
+        INSERT INTO channel_audience_monthly (channel_id,"month",arrivals,last_seen,regulars,active,"returning",reg_returning)
+        SELECT channel_id,"month",sum(arrivals),sum(last_seen),sum(regulars),sum(active),sum("returning"),sum(reg_returning)
+        FROM moved GROUP BY 1,2
+        ON CONFLICT (channel_id,"month") DO UPDATE SET arrivals = channel_audience_monthly.arrivals + EXCLUDED.arrivals,
+                                                     last_seen = channel_audience_monthly.last_seen + EXCLUDED.last_seen,
+                                                     regulars = channel_audience_monthly.regulars + EXCLUDED.regulars,
+                                                     active = channel_audience_monthly.active + EXCLUDED.active,
+                                                     "returning" = channel_audience_monthly."returning" + EXCLUDED."returning",
+                                                     reg_returning = channel_audience_monthly.reg_returning + EXCLUDED.reg_returning''')
+    counts["channel_audience_monthly"] = cur.rowcount
+    cur.execute('''
+        WITH moved AS (DELETE FROM audience_retention_delta RETURNING *)
+        INSERT INTO channel_retention (channel_id,kind,cohort,age,n)
+        SELECT channel_id,kind,cohort,age,sum(n) FROM moved GROUP BY 1,2,3,4 HAVING sum(n) <> 0
+        ON CONFLICT (channel_id,kind,cohort,age) DO UPDATE SET n = channel_retention.n + EXCLUDED.n''')
+    counts["channel_retention"] = cur.rowcount
+    cur.execute('''
+        WITH moved AS (DELETE FROM audience_year_delta RETURNING *)
+        INSERT INTO channel_audience_yearly (channel_id,"year",regulars,active)
+        SELECT channel_id,"year",sum(regulars),sum(active) FROM moved GROUP BY 1,2
+        ON CONFLICT (channel_id,"year") DO UPDATE SET regulars = channel_audience_yearly.regulars + EXCLUDED.regulars,
+                                                    active = channel_audience_yearly.active + EXCLUDED.active''')
+    counts["channel_audience_yearly"] = cur.rowcount
+    cur.execute('''
+        WITH moved AS (DELETE FROM audience_video_delta RETURNING *),
+             agg AS (SELECT video_id,sum(first_global) AS g,sum(first_channel) AS c FROM moved GROUP BY 1)
+        UPDATE video_message_stats v SET first_messages = v.first_messages + agg.g,
+                                         first_channel_messages = v.first_channel_messages + agg.c
+        FROM agg WHERE v.video_id = agg.video_id AND (agg.g <> 0 OR agg.c <> 0)''')
+    counts["video_firsts"] = cur.rowcount
+    cur.execute('''
+        WITH moved AS (DELETE FROM audience_top_candidate RETURNING *)
+        INSERT INTO channel_top_chatters (channel_id,user_id,total_messages)
+        SELECT channel_id,user_id,max(total_messages) FROM moved GROUP BY 1,2
+        ON CONFLICT (channel_id,user_id) DO UPDATE
+        SET total_messages = GREATEST(channel_top_chatters.total_messages,EXCLUDED.total_messages)
+        RETURNING channel_id''')
+    touched_channels = sorted({r[0] for r in cur.fetchall()})
+    if touched_channels:
+        cur.execute('''
+            DELETE FROM channel_top_chatters t USING (
+                SELECT channel_id,user_id,row_number() OVER (PARTITION BY channel_id ORDER BY total_messages DESC,user_id) AS rn
+                FROM channel_top_chatters WHERE channel_id = ANY(%s)) r
+            WHERE t.channel_id = r.channel_id AND t.user_id = r.user_id AND r.rn > %s''',(touched_channels,TOP_CHATTERS))
+
+    # Community: users new to a channel (or whose first message there moved to an earlier month).
+    cur.execute('DELETE FROM audience_new_link RETURNING channel_id,user_id,is_new,o_first')
+    links:dict[str,dict[str,tuple[bool,float|None]]] = {}
+    for channel_id,user_id,is_new,o_first in cur.fetchall():
+        was_new,prev = links.setdefault(user_id,{}).get(channel_id,(False,None))
+        if is_new or was_new:
+            links[user_id][channel_id] = (True,None)
+        else:
+            links[user_id][channel_id] = (False,o_first if prev is None else max(prev,o_first))
+    counts["links"] = sum(len(v) for v in links.values())
+
+    # Regulars: users whose regular years on a channel grew. Bits only ever get set, so across
+    # several staged events the smallest "old" set is the true before and the largest "new" the after.
+    cur.execute('DELETE FROM audience_regular_change RETURNING channel_id,user_id,old_years,new_years')
+    reg:dict[str,dict[str,set[int]]] = {}
+    for channel_id,user_id,old_years,new_years in cur.fetchall():
+        prev = reg.setdefault(user_id,{}).get(channel_id)
+        old = set(old_years or [])
+        reg[user_id][channel_id] = old if prev is None or len(old) < len(prev) else prev
+    counts["regular_changes"] = sum(len(v) for v in reg.values())
+
+    # Retention per scope: months newly active / regular on a channel. Months only get added, so a
+    # channel's old sets = its current sets minus the union of everything staged for it.
+    cur.execute('DELETE FROM audience_activity_change RETURNING channel_id,user_id,added_active,added_regular')
+    act:dict[str,dict[str,tuple[set,set]]] = {}
+    for channel_id,user_id,added_a,added_r in cur.fetchall():
+        a,rg = act.setdefault(user_id,{}).setdefault(channel_id,(set(),set()))
+        a.update(AD.month_at(i) for i in added_a or [])
+        rg.update(AD.month_at(i) for i in added_r or [])
+    counts["activity_changes"] = sum(len(v) for v in act.values())
+    if not SCOPE_RETENTION:
+        act = {}
+
+    if links or reg or act:
+        cur.execute('SELECT user_id,channel_type,branch,"group" FROM channel_directory')
+        scopes = AD.channel_scopes(cur.fetchall())
+        pairs,scope_k,scope_month = Counter(),Counter(),Counter()
+        rpairs,rscopes = Counter(),Counter()
+        sret,smix = Counter(),Counter()
+        users = list(set(links) | set(reg) | set(act))
+        for i in range(0,len(users),5000):
+            chunk = users[i:i + 5000]
+            cur.execute('SELECT user_id,channel_id,"timestamp",active_weeks::text FROM user_channel_activity WHERE user_id = ANY(%s)',(chunk,))
+            after:dict[str,dict[str,float]] = {}
+            reg_after:dict[str,dict[str,set[int]]] = {}
+            months_after:dict[str,dict[str,tuple[set,set]]] = {}
+            for user_id,channel_id,first,weeks in cur.fetchall():
+                after.setdefault(user_id,{})[channel_id] = first
+                reg_m = AD.regular_months(weeks)
+                reg_after.setdefault(user_id,{})[channel_id] = AD.years_of(reg_m)
+                if user_id in act:
+                    months_after.setdefault(user_id,{})[channel_id] = (AD.active_months(weeks),reg_m)
+            for user_id in chunk:
+                if user_id in links:
+                    now = after.get(user_id,{})
+                    before = dict(now)
+                    for channel_id,(is_new,o_first) in links[user_id].items():
+                        if is_new:
+                            before.pop(channel_id,None)
+                        elif o_first is not None and channel_id in before:
+                            before[channel_id] = o_first
+                    p,k,m = AD.community_deltas(before,now,scopes)
+                    pairs.update(p); scope_k.update(k); scope_month.update(m)
+                if user_id in reg:
+                    r_now = reg_after.get(user_id,{})
+                    r_before = dict(r_now)
+                    r_before.update(reg[user_id])
+                    p,sc = AD.regular_community_deltas(r_before,r_now,scopes)
+                    rpairs.update(p); rscopes.update(sc)
+                if user_id in act:
+                    m_now = months_after.get(user_id,{})
+                    m_before = dict(m_now)
+                    for channel_id,(added_a,added_r) in act[user_id].items():
+                        a,rg = m_now.get(channel_id,(set(),set()))
+                        m_before[channel_id] = (a - added_a,rg - added_r)
+                    r_,m_ = AD.scope_retention_deltas(m_before,m_now,scopes)
+                    sret.update(r_); smix.update(m_)
+        if sret:
+            execute_values(cur,'''INSERT INTO scope_retention ("scope",kind,cohort,age,n) VALUES %s
+                ON CONFLICT ("scope",kind,cohort,age) DO UPDATE SET n = scope_retention.n + EXCLUDED.n''',
+                [(s_,k,c,a,n) for (s_,k,c,a),n in sret.items() if n])
+        if smix:
+            mix:dict[tuple,list[int]] = {}
+            for (s_,m,col),n in smix.items():
+                mix.setdefault((s_,m),[0,0])[0 if col == "returning" else 1] += n
+            execute_values(cur,'''INSERT INTO scope_audience_monthly ("scope","month","returning",reg_returning) VALUES %s
+                ON CONFLICT ("scope","month") DO UPDATE SET "returning" = scope_audience_monthly."returning" + EXCLUDED."returning",
+                                                          reg_returning = scope_audience_monthly.reg_returning + EXCLUDED.reg_returning''',
+                [(s_,m,a,b) for (s_,m),(a,b) in mix.items() if a or b])
+        counts["scope_retention"] = len(sret)
+        if rpairs:
+            execute_values(cur,'''INSERT INTO regular_overlap (channel_a,channel_b,"year",shared) VALUES %s
+                ON CONFLICT (channel_a,channel_b,"year") DO UPDATE SET shared = regular_overlap.shared + EXCLUDED.shared''',
+                [(a,b,y,n) for (a,b,y),n in rpairs.items() if n])
+        if rscopes:
+            execute_values(cur,'''INSERT INTO scope_regulars ("scope","year",n) VALUES %s
+                ON CONFLICT ("scope","year") DO UPDATE SET n = scope_regulars.n + EXCLUDED.n''',
+                [(s,y,n) for (s,y),n in rscopes.items() if n])
+        counts["regular_pairs"] = len(rpairs)
+        if pairs:
+            execute_values(cur,'''INSERT INTO channel_overlap (channel_a,channel_b,shared) VALUES %s
+                ON CONFLICT (channel_a,channel_b) DO UPDATE SET shared = channel_overlap.shared + EXCLUDED.shared''',
+                [(a,b,n) for (a,b),n in pairs.items() if n])
+        if scope_k:
+            execute_values(cur,'''INSERT INTO scope_audience ("scope",dim,bucket,n) VALUES %s
+                ON CONFLICT ("scope",dim,bucket) DO UPDATE SET n = scope_audience.n + EXCLUDED.n''',
+                [(s,"k",str(k),n) for (s,k),n in scope_k.items() if n])
+        if scope_month:
+            execute_values(cur,'''INSERT INTO scope_audience_monthly ("scope","month",arrivals) VALUES %s
+                ON CONFLICT ("scope","month") DO UPDATE SET arrivals = scope_audience_monthly.arrivals + EXCLUDED.arrivals''',
+                [(s,m,n) for (s,m),n in scope_month.items() if n])
+        counts["overlap_pairs"] = len(pairs)
+    connection.commit()
+    return counts
 
 def FinalizeVideoMessageRate(cursor:psycopg2.extensions.cursor,video_id:str) -> None:
     """
@@ -338,147 +597,6 @@ def RecordSubtitleStats(cursor:psycopg2.extensions.cursor,video_id:str,channel_i
         LOG.logger.info(values)
 
     cursor.execute(query,values)
-
-def RefreshFirstMessageCounts(cursor:psycopg2.extensions.cursor) -> None:
-    """
-    Recomputes video_message_stats.first_messages/first_channel_messages from
-    user_first_message/user_channel_activity. Call this once per full run -- see the bottom
-    of Main.py -- not per message: record_message_stats() no longer patches these columns
-    incrementally, since doing so required reaching into a SECOND, unrelated video's
-    video_message_stats row whenever a user's first-message pointer moved, which could deadlock
-    against another worker thread's video (see record_message_stats()'s docstring in
-    sql/user_channel_activity_stats.sql for the incident this replaced).
-
-    :param cursor: Database cursor object to execute commands.
-    :type cursor: Cursor
-    """
-    query = 'SELECT refresh_first_message_counts()'
-
-    if CFG.DB_VERBOSE == True:
-        LOG.logger.info(query)
-
-    cursor.execute(query)
-
-def RefreshUserMessageRankings(cursor:psycopg2.extensions.cursor) -> None:
-    """
-    Refreshes the user_message_rankings materialized view (per-channel and global message-count
-    leaderboard ranks). Call this once per full run -- see the bottom of Main.py -- not per
-    message or per video; a rank isn't incrementally maintainable the way totals/counts are, and
-    this is a full recomputation over the user_channel_activity rollup. Uses CONCURRENTLY so
-    readers (e.g. Grafana) keep seeing the previous ranks instead of being locked out mid-refresh.
-
-    :param cursor: Database cursor object to execute commands.
-    :type cursor: Cursor
-    """
-    query = 'SELECT refresh_user_message_rankings()'
-
-    if CFG.DB_VERBOSE == True:
-        LOG.logger.info(query)
-
-    cursor.execute(query)
-
-def RefreshUserSummary(cursor:psycopg2.extensions.cursor) -> None:
-    """
-    Refreshes the user_summary materialized view (one row per user: identity, global rank,
-    cross-channel activity, superchat totals). Call this once per full run -- see the bottom of
-    Main.py, after RefreshUserMessageRankings (user_summary reads from
-    user_global_message_rankings, so it must be refreshed after that matview is current) --
-    not per message or per video. Originally a plain view, but live-querying it took 60-90s for
-    a sorted top-N query (a GroupAggregate over the whole user_channel_activity rollup spilled
-    ~1.7GB to disk sorting by user_id) -- the same scaling problem that made
-    user_message_rankings/user_global_message_rankings materialized views instead of plain ones.
-    Uses CONCURRENTLY so readers (e.g. Grafana) keep seeing the previous snapshot instead of
-    being locked out mid-refresh.
-
-    :param cursor: Database cursor object to execute commands.
-    :type cursor: Cursor
-    """
-    query = 'SELECT refresh_user_summary()'
-
-    if CFG.DB_VERBOSE == True:
-        LOG.logger.info(query)
-
-    cursor.execute(query)
-
-# (refresh_state.refresh_name, log label, rebuild function, source tables it reads). Order
-# matters: user_summary reads user_global_message_rankings, so rankings must be rebuilt first.
-# The matview isn't listed as a source for user_summary -- it only changes when
-# user_channel_activity does, which user_summary already watches.
-_ROLLUP_REFRESHES = [
-    ("first_message_counts","First Message Counts",RefreshFirstMessageCounts,
-        ["user_first_message","user_channel_activity"]),
-    ("user_message_rankings","Message Rankings",RefreshUserMessageRankings,
-        ["user_channel_activity"]),
-    ("user_summary","User Summary",RefreshUserSummary,
-        ["user_ids","user_first_message","user_channel_activity","user_channel_superchats"]),
-]
-
-def GetTableChangeCount(cursor:psycopg2.extensions.cursor,tables:list[str]) -> int:
-    """
-    Sums Postgres' cumulative insert/update/delete counters (pg_stat_user_tables) across the
-    given public tables. Only meaningful compared against an earlier reading -- see
-    RefreshRollupsIfChanged.
-
-    :param cursor: Database cursor object to execute commands.
-    :type cursor: Cursor
-    :param tables: Table names in the public schema.
-    :type tables: list[str]
-    :return: Summed n_tup_ins + n_tup_upd + n_tup_del.
-    :rtype: Integer
-    """
-    # Stats are cached per transaction once read -- clear so this sees other connections'
-    # latest flushed counters, not a reading from earlier in the same transaction.
-    cursor.execute('SELECT pg_stat_clear_snapshot()')
-    query = 'SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del),0) FROM pg_stat_user_tables WHERE schemaname = %s AND relname = ANY(%s)'
-    values = ('public',tables)
-
-    if CFG.DB_VERBOSE == True:
-        LOG.logger.info(query)
-        LOG.logger.info(values)
-
-    cursor.execute(query,values)
-    return int(cursor.fetchone()[0])
-
-def RefreshRollupsIfChanged(cursor:psycopg2.extensions.cursor) -> None:
-    """
-    Runs the once-per-run rebuilds (RefreshFirstMessageCounts, RefreshUserMessageRankings,
-    RefreshUserSummary) only when one of their source tables has been written to since that
-    rebuild last ran, committing after each. Call once at the end of a full run (see the bottom
-    of Main.py).
-
-    Change detection compares GetTableChangeCount over each rebuild's source tables against the
-    value stored in refresh_state at its last successful rebuild. This works across runs and
-    processes -- writes from a run that died before reaching this step, or from backfill
-    scripts/manual SQL, are still caught next time -- and adds nothing to the ingestion write
-    path (no triggers on the hot rollup tables, which have a deadlock history).
-
-    The counter snapshot is taken BEFORE each rebuild, so anything written while it runs shows
-    up as a difference next run rather than being silently absorbed. Counters can over-report
-    (e.g. an UPDATE that rewrote identical values) -- that only costs an unneeded rebuild, never
-    a stale one. A stats reset (Postgres crash, pg_stat_reset()) lowers the sum, which also
-    counts as a difference. Delete a refresh_state row to force that rebuild on the next run.
-
-    :param cursor: Database cursor object to execute commands.
-    :type cursor: Cursor
-    """
-    for name,label,refresh,tables in _ROLLUP_REFRESHES:
-        current = GetTableChangeCount(cursor,tables)
-        cursor.execute('SELECT change_count,refreshed_at FROM refresh_state WHERE refresh_name = %s',(name,))
-        row = cursor.fetchone()
-
-        if row is not None and row[0] == current:
-            LOG.logger.info(f"Skipping {label} rebuild -- no changes since it last ran ({row[1]:%Y-%m-%d %H:%M:%S}).")
-            cursor.connection.commit()
-            continue
-
-        LOG.logger.info(f"Rebuilding {label}...")
-        refresh(cursor)
-        cursor.execute(
-            'INSERT INTO refresh_state (refresh_name,change_count,refreshed_at) VALUES (%s,%s,now()) '
-            'ON CONFLICT (refresh_name) DO UPDATE SET change_count = EXCLUDED.change_count, refreshed_at = EXCLUDED.refreshed_at',
-            (name,current)
-        )
-        cursor.connection.commit()
 
 def DeleteEntries(cursor:psycopg2.extensions.cursor,table:str,filter:dict[str,Any]|None=None) -> None:
     """
@@ -694,9 +812,7 @@ _CORE_SQL_FILES = [
     ("user_channel_activity_stats","user_channel_activity"),
     ("video_message_stats","video_message_stats"),
     ("user_channel_superchats","user_channel_superchats"),
-    ("user_global_message_rankings","user_message_rankings"),
-    ("user_summary","user_summary"),
-    ("refresh_state","refresh_state"),
+    ("audience_rollups","channel_audience"),
     ("channel_video_summary","channel_video_summary"),
     ("processed_status","processed_status"),
     ("chat_archive","chat_archive"),

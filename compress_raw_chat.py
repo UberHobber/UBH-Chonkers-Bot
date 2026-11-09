@@ -179,8 +179,16 @@ def _recompute_pending(db:DB.PostgresClass,channel_id:str,partition:str) -> int:
             last_is_owner = uca.last_is_owner OR latest.own
         FROM agg JOIN latest USING (user_id)
         WHERE uca.channel_id = %(c)s AND uca.user_id = agg.user_id
+        RETURNING old.ever_moderator, new.ever_moderator
     """,{"c":channel_id})
-    updated = cur.rowcount
+    rows = cur.fetchall()
+    updated = len(rows)
+    # Keep the pre-generated audience stats exact (sql/audience_rollups.sql): stage the newly
+    # discovered moderators in this same transaction; Main.py's next fold applies them.
+    new_mods = sum(1 for old,new in rows if new and not old)
+    if new_mods:
+        cur.execute("INSERT INTO public.audience_delta (channel_id,dim,bucket,delta) VALUES (%s,'mod','yes',%s)",
+                    (channel_id,new_mods))
     cur.execute("DELETE FROM public.badge_fix_pending WHERE channel_id = %s",(channel_id,))
     db.database.commit()
     return updated

@@ -75,7 +75,7 @@ Ended runs stay on screen for 5 minutes (`--keep-ended <minutes>`), then disappe
 
 ### Querying chat
 
-- **Totals, leaderboards and per-user summaries** live in Postgres. The rollup tables and views (`video_message_stats`, `user_channel_activity`, `user_summary` and so on) work in any SQL client and cover all chat, archived or not.
+- **Totals, leaderboards and per-user summaries** live in Postgres. The rollup tables (`video_message_stats`, `user_channel_activity`, and the pre-generated audience rollups such as `channel_audience` and `channel_overlap`) work in any SQL client and cover all chat, archived or not.
 - **Individual messages** are split between Parquet (archived videos) and Postgres (unprocessed videos). Read them through DuckDB with [`modules/Archive.py`](modules/Archive.py), which sees both:
   ```python
   import modules.Archive as A
@@ -84,6 +84,30 @@ Ended runs stay on screen for 5 minutes (`--keep-ended <minutes>`), then disappe
   con.sql("SELECT user_id, count(*) FROM archived_messages GROUP BY 1 ORDER BY 2 DESC LIMIT 10").show()
   ```
   Plain Postgres SQL only sees chat that hasn't been archived yet.
+
+### Audience statistics
+
+Users and Community statistics are **pre-generated while the bot runs**:
+- audience size, engagement buckets and membership badges
+- arrivals and departures per month
+- top 100 chatters per channel
+- distinct chatters per group/branch, and chatters shared between channels
+- **regulars**: chatted in each of 4 consecutive weeks, from the weekly `user_channel_activity.active_weeks` bitmap
+- **retention**: cohorts by first month, per channel and distinct per group/branch/company, plus each month's new, returning and back-after-a-break chatters
+
+Each batch of messages records what changed in staging tables. After each channel, the bot folds those changes into the rollup tables (all in `sql/audience_rollups.sql`): `channel_audience`, `channel_audience_monthly`, `channel_audience_yearly`, `channel_top_chatters`, `scope_audience`, `scope_audience_monthly`, `channel_overlap`, `regular_overlap`, `scope_regulars`, `channel_retention` and `scope_retention`. Read those tables. Don't aggregate `user_channel_activity` (~28M rows) directly: that reads the whole table.
+
+Distinct-per-scope retention makes the fold read each changed chatter's other channels, roughly 5–6× the users the Community fold reads. If that turns out too heavy, set `SCOPE_RETENTION = False` in `modules/Database.py`. Per-channel retention keeps working, `scope_retention` goes stale, and a rebuild refreshes it before you turn it back on.
+
+`build_audience_baseline.py` rebuilds them from scratch, or checks them:
+```
+Launch.bat build_audience_baseline.py --verify                  # full drift check, writes nothing
+Launch.bat build_audience_baseline.py --verify --channel Anya   # quick check of one small channel
+Launch.bat build_audience_baseline.py                           # full rebuild, with the bot stopped
+```
+DuckDB and numpy on this PC do the heavy work; the database only streams the table out once (~8 min, mostly the weekly bitmaps). A full run takes about 15 minutes and needs about 1 GB of RAM. Unit tests for the delta logic: `.venv\Scripts\python.exe -m unittest discover -s Tests`.
+
+It's crash-safe: staged changes commit together with their messages, and every run starts by folding whatever a killed run left behind. Until that next start, `--verify` reports drift, and warns that staged rows are waiting. This was tested on 2026-11-08 by hard-killing the bot partway through a stream (21,500 of 71,016 messages stored) and restarting it. The restart folded the leftovers, skipped the stored messages, and a full `--verify` showed 0 drift.
 
 ### After a schema change
 
@@ -118,7 +142,7 @@ Measured on 2026-10-25, with 1.13B chat messages from 110 channels and 4.6M user
 | Raw chat, `messages/*.json.gz` | ~150 B per message | About 85% of the chat bytes on S3 |
 | Archived chat, Parquet | ~27 B per message | A full 10M-message file is about 270 MB |
 | A user, in the user bucket | ~83 KB | The profile picture is ~80 KB of that, so pictures are about 95% of the bucket |
-| A user, in Postgres | ~1.15 KB | Spread over `user_ids`, `user_first_message`, `user_summary` and the rankings |
+| A user, in Postgres | ~1.15 KB | Spread over `user_ids`, `user_first_message` and `user_channel_activity` |
 | Chat in Postgres before it's archived | ~370 B per message | Freed when the channel is archived |
 | `video_user_seen` | ~12 B per message | The largest Postgres table that never shrinks (16 GB at 1.13B messages) |
 | Subtitles | ~0.23 GB per 1,000 stream hours | English captions only |
@@ -142,7 +166,6 @@ The main flags at the top of [`modules/Settings.py`](modules/Settings.py):
 | `PROCESS_ALL` / `CHANNEL_SELECTION` | Process every `process = true` channel, or just the named one |
 | `WORKER_COUNT` | Videos downloaded in parallel |
 | `REQUEST_DELAY` | Minimum seconds between chat download starts |
-| `SKIP_ROLLUPS` | Skip the end-of-run rebuild of leaderboards and `user_summary` |
 | `SKIP_SUBTITLE_DOWNLOAD` | Leave captions to `Subtitles.py` instead of the end of `Main.py` |
 | `USE_COOKIES` | Use cookies for public runs (for age-restricted videos) |
 | `COOKIES_FROM_BROWSER` | Read cookies straight from a browser profile at startup, e.g. `("firefox", "ChonkersBot")`, instead of a hand-exported `cookies.txt` (see below) |

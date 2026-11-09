@@ -41,21 +41,18 @@ Later files have foreign keys pointing at tables created by earlier ones:
 11. `video_message_stats.sql`
 12. `user_channel_superchats.sql` — per-user, per-channel, per-currency superchat totals,
     also written to by `record_message_stats()` (defined in step 11).
-13. `user_global_message_rankings.sql` — its materialized views select from
-    `user_channel_activity`, created in step 10.
-14. `user_summary.sql` — a materialized view combining `user_ids` (step 2), `user_first_message`
-    and `user_channel_activity` (both step 10), `user_channel_superchats` (step 12), and
-    `user_global_message_rankings` (step 13) into one row per user. Refreshed once per bot run,
-    after `user_global_message_rankings` (see `refresh_user_summary()`, defined here).
-15. `refresh_state.sql` — no FKs; bookkeeping that lets the end-of-run rebuilds in steps 10,
-    13, and 14 skip themselves when their source tables haven't changed (see
-    `modules.Database.RefreshRollupsIfChanged`).
-16. `channel_video_summary.sql` — a plain view over `channel_directory` (step 1) and `videos`
+13. `audience_rollups.sql` — the pre-generated audience (Users/Community: regulars, overlap,
+    retention cohorts) staging and rollup tables, no FKs. Maintained by deltas from `record_message_stats()` (step 11) via
+    `modules/AudienceDeltas.py` and `Database.FoldAudience`. On a database that already has
+    data, fill them with `build_audience_baseline.py` (bot stopped). They replaced the dropped
+    (2026-11-08) `user_message_rankings` / `user_global_message_rankings` / `user_summary`
+    matviews and `refresh_state`, whose per-run rebuilds each read all of `user_channel_activity`.
+14. `channel_video_summary.sql` — a plain view over `channel_directory` (step 1) and `videos`
     (step 3): per-channel video counts and hours, split public vs. members-only.
-17. `processed_status.sql` — a plain view over `branches`/`channel_directory` (step 1) and
+15. `processed_status.sql` — a plain view over `branches`/`channel_directory` (step 1) and
     `videos` (step 3): per-channel count and percentage of public videos processed (members-only
     and upcoming/live videos excluded), with each channel's processing order.
-18. `chat_archive.sql` — `chat_archive` (manifest of chat moved to Parquet on S3 by
+16. `chat_archive.sql` — `chat_archive` (manifest of chat moved to Parquet on S3 by
     `archive_chat.py`; FKs to `videos`, step 3, and `channel_directory`, step 1) and
     `badge_fix_pending` (`compress_raw_chat.py`'s work queue; no FKs).
 

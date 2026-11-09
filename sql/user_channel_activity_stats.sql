@@ -9,7 +9,7 @@
 -- channel_id/message_id/video_id identify that message. There's deliberately no FK into
 -- messages: archived chat (see chat_archive) is no longer in Postgres, and the old composite
 -- FK made every user's first message undeletable. video_id is stored (and FKs to videos) so
--- refresh_first_message_counts() never needs the message row. timestamp is kept alongside
+-- per-video first-message counts never need the message row. timestamp is kept alongside
 -- message_id so record_message_stats()'s
 -- per-message "is this earlier than what's stored" check stays a cheap in-row comparison
 -- instead of a join into messages on every single call.
@@ -48,20 +48,34 @@ CREATE TABLE public.user_first_message (
 -- regress the single hottest write in this schema. Maintained incrementally by
 -- public.record_message_stats() (same table update as the first-message pointer, one row per
 -- chat message; the function itself lives in sql/video_message_stats.sql). The one-time
--- backfill that first filled this table was run by hand and isn't kept in sql/. ~15M rows,
--- ~316 B each, as of 2026-10-25. ever_*/last_is_* were understated for chat ingested
+-- backfill that first filled this table was run by hand and isn't kept in sql/. ~28M rows
+-- (~9 GB) as of 2026-11-08. NEVER aggregate over it live (dashboards included): a channel's
+-- rows are scattered over the whole table, so a per-channel aggregate on a big channel seq-
+-- scans all of it (Pekora ~20s, ~1M pages) -- use the audience rollups instead (see
+-- channel_audience). ever_*/last_is_* were understated for chat ingested
 -- before the badge-flag fix (see badge_fix_pending); compress_raw_chat.py recomputes them
 -- for affected users as it corrects each channel's messages.
 -- Deliberately no index on total_messages: idx_user_channel_activity_channel_totals
 -- (channel_id, total_messages DESC) was dropped 2026-11-02. record_message_stats() bumps
 -- total_messages on every message, so that index made every one of those ~1,000 updates/s
 -- non-HOT (a new heap tuple plus an entry in both indexes), and the extra dirty pages were
--- likely the largest share of Pox's disk writes. It had 196 scans in 11 months, and the user_message_rankings
--- refresh never used it (seq scan + sort either way). A per-channel top-N still works via
--- the pkey's channel_id prefix plus a sort. Don't re-add an index on any column
--- record_message_stats() updates.
+-- likely the largest share of Pox's disk writes. It had 196 scans in 11 months. Per-channel
+-- top chatters now live in channel_top_chatters. Don't re-add an index on any column
+-- record_message_stats() updates. idx_user_channel_activity_user_id (2026-11-08) is fine:
+-- user_id is never updated, so HOT is unaffected, and it's only written for new rows; the
+-- audience fold uses it to find a newly-linked user's other channels.
 -- fillfactor = 85 (set 2026-11-05) keeps 15% of each page free so those updates can stay
 -- HOT (same page); with full pages HOT had fallen from 84% to 38% within three days.
+-- active_weeks (2026-11-08): fixed-length bitmap, bit i (leftmost = 0) = chatted on the channel
+-- in week i counting Mondays from 2017-01-02 UTC, where a message's week is its STREAM's start
+-- week (videos.start_time, else publishedat). record_message_stats() ORs the bit in on every
+-- message (p_week); fixed length keeps updates HOT (99% right after the rebuild). A REGULAR is
+-- anyone who chatted in each of 4 consecutive weeks (modules/AudienceDeltas.regular_months);
+-- channel_audience_monthly/_yearly, regular_overlap and scope_regulars are built from it.
+-- 728 bits last until about 2030-12: widen the column (and AudienceDeltas.WEEK_BITS) before
+-- then. The table was rebuilt 2026-11-08 to add it (bitmaps backfilled from video_user_seen);
+-- its foreign keys are NOT VALID since then (the rows came from the validated table; new rows
+-- are still checked).
 
 -- Drop table
 
@@ -83,47 +97,13 @@ CREATE TABLE public.user_channel_activity (
 	last_is_verified bool DEFAULT false NOT NULL,
 	last_is_owner bool DEFAULT false NOT NULL,
 	first_video_id text NOT NULL,
+	active_weeks bit(728) NULL,
 	CONSTRAINT user_channel_activity_pkey PRIMARY KEY (channel_id, user_id),
-	CONSTRAINT user_channel_activity_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
-	CONSTRAINT user_channel_activity_first_video_id_fkey FOREIGN KEY (first_video_id) REFERENCES public.videos(id),
-	CONSTRAINT user_channel_activity_user_ids_fk FOREIGN KEY (user_id) REFERENCES public.user_ids(id)
+	CONSTRAINT user_channel_activity_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id) NOT VALID,
+	CONSTRAINT user_channel_activity_first_video_id_fkey FOREIGN KEY (first_video_id) REFERENCES public.videos(id) NOT VALID,
+	CONSTRAINT user_channel_activity_user_ids_fk FOREIGN KEY (user_id) REFERENCES public.user_ids(id) NOT VALID
 )
 WITH (
 	fillfactor=85
 );
-
-
--- public.refresh_first_message_counts definition
-
--- Recomputes video_message_stats.first_messages/first_channel_messages from scratch by
--- grouping user_first_message.video_id/user_channel_activity.first_video_id (it used to join
--- through messages to recover the video, which stopped working once chat started being
--- archived out of messages -- see chat_archive). Call once per full bot run (see RefreshFirstMessageCounts
--- in modules/Database.py and its call at the end of Main.py) -- these columns are no longer
--- patched incrementally per-message (see record_message_stats()).
-
-CREATE OR REPLACE FUNCTION public.refresh_first_message_counts()
- RETURNS void
- LANGUAGE sql
-AS $function$
-            UPDATE public.video_message_stats SET first_messages = 0, first_channel_messages = 0
-            WHERE first_messages != 0 OR first_channel_messages != 0;
-
-            UPDATE public.video_message_stats vms
-            SET first_messages = fg.cnt
-            FROM (
-                SELECT video_id, COUNT(*) AS cnt
-                FROM public.user_first_message
-                GROUP BY video_id
-            ) fg
-            WHERE fg.video_id = vms.video_id;
-
-            UPDATE public.video_message_stats vms
-            SET first_channel_messages = fc.cnt
-            FROM (
-                SELECT first_video_id AS video_id, COUNT(*) AS cnt
-                FROM public.user_channel_activity
-                GROUP BY first_video_id
-            ) fc
-            WHERE fc.video_id = vms.video_id;
-        $function$;
+CREATE INDEX idx_user_channel_activity_user_id ON public.user_channel_activity USING btree (user_id);

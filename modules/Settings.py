@@ -11,7 +11,6 @@ from psycopg2.extensions import cursor
 PROCESS_ALL = True
 CHANNEL_SELECTION = "Kiara"
 USE_COOKIES = False
-SKIP_ROLLUPS = False
 
 # Where cookies come from when they're needed (a members chat pass, or USE_COOKIES): read
 # straight from a browser profile at startup as (browser, profile name or path), e.g.
