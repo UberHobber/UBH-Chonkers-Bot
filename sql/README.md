@@ -1,0 +1,74 @@
+# Database bootstrap scripts
+
+Each `.sql` file here is a runnable DDL script for one cluster of tables (plus any
+views/functions that belong to it). They're exported directly from the
+live database schema by the maintainer's schema export script, which isn't part of this repo —
+**do not hand-edit these files**. Schema changes are made to the database and then re-exported.
+
+`modules.Database.EnsureSchema` (called once at startup, see `Main.py`) runs these files
+automatically against whatever database it connects to — it checks each file's "anchor"
+table/matview/view and only runs a file if that's missing, so this is safe to leave in place
+permanently rather than being a one-time setup step. The `*_members` files are never run —
+they're reference copies of the existing members-only tables (see the end of this file).
+
+## Run order
+
+Later files have foreign keys pointing at tables created by earlier ones:
+
+1. `channel_directory.sql` — also creates `branches`, which `channel_directory.branch` FKs to.
+2. `user_ids.sql`
+3. `videos.sql`
+4. `tags.sql`
+5. `emotes.sql`
+6. `messages.sql` — must come before `nicknames.sql`
+7. `nicknames.sql`
+8. `subtitles.sql`
+9. `video_subtitle_stats.sql` — its `record_subtitle_stats()` FKs `video_subtitle_stats` to
+   `videos` (step 3) and `channel_directory` (step 1); doesn't touch `subtitles` itself, but
+   fits here topically since it's `subtitles`' rollup table.
+10. `user_channel_activity_stats.sql` — must come before `video_message_stats.sql`:
+    `record_message_stats()`/`record_message_stats_batch()` (defined in the latter) write to
+    `user_first_message`/`user_channel_activity` (defined in the former, renamed from
+    `user_first_channel_message` since it now holds far more than a first-message pointer).
+11. `video_message_stats.sql`
+12. `user_channel_superchats.sql` — per-user, per-channel, per-currency superchat totals,
+    also written to by `record_message_stats()` (defined in step 11).
+13. `audience_rollups.sql` — the pre-generated audience (Users/Community: regulars, overlap,
+    retention cohorts) staging and rollup tables, no FKs. Maintained by deltas from `record_message_stats()` (step 11) via
+    `modules/AudienceDeltas.py` and `Database.FoldAudience`. On a database that already has
+    data, fill them with `build_audience_baseline.py` (bot stopped). They replaced the dropped
+    (2026-11-08) `user_message_rankings` / `user_global_message_rankings` / `user_summary`
+    matviews and `refresh_state`, whose per-run rebuilds each read all of `user_channel_activity`.
+14. `channel_video_summary.sql` — a plain view over `channel_directory` (step 1) and `videos`
+    (step 3): per-channel video counts and hours, split public vs. members-only.
+15. `processed_status.sql` — a plain view over `branches`/`channel_directory` (step 1) and
+    `videos` (step 3): per-channel count and percentage of public videos processed (members-only
+    and upcoming/live videos excluded), with each channel's processing order.
+16. `chat_archive.sql` — `chat_archive` (manifest of chat moved to Parquet on S3 by
+    `archive_chat.py`; FKs to `videos`, step 3, and `channel_directory`, step 1) and
+    `badge_fix_pending` (`compress_raw_chat.py`'s work queue; no FKs).
+
+**Members-only files** (reference only, not run — see below): `emotes_members.sql`,
+`messages_members.sql`, `nicknames_members.sql`, `subtitles_members.sql`.
+
+Insert the `branches` rows (name + `sort_order`, the order channels get processed in) before
+any `channel_directory` rows. The current set:
+
+```sql
+INSERT INTO branches (name, sort_order) VALUES
+    ('EN', 1), ('ID', 2), ('Stars_EN', 3), ('JP', 4), ('Stars', 5);
+```
+
+After creating the `channel_directory` row(s) for whichever channels you're tracking, also
+create their `messages_<db_suffix>` partition of `public.messages` — see
+`modules.Database.AddChannel`/`EnsureMessagesPartition`, or add it manually the same way the
+existing per-talent partitions in `messages.sql` are declared.
+
+The `*_<db_suffix>_members` tables (`emotes`, `messages`, `nickname_matches`, `subtitles`) are
+per-channel tables (e.g. `subtitles_kiara_members`) that predate the unified `channel_id`
+schema — see the note at the top of `channel_directory.sql`. Members-only video *details* go
+in `videos` (`members = true`) on every run; only members-only *chat* uses these tables. To
+collect a channel's members-only chat, set `channel_directory.members_chat = true` and run with
+`CFG.GET_MEMBERS_CHAT = True`: `modules.Database.EnsureMembersTables` creates that channel's
+four tables if they don't exist yet. The `_members.sql` files only list the tables that were
+there when the export's file grouping was last edited.

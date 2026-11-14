@@ -1,0 +1,99 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- public.videos definition
+
+-- subtitles_processed tracks the subtitle-download pipeline (Subtitles.py) independently
+-- of the chat/video 'processed' flag above -- the two used to be coupled (subtitles were
+-- only ever attempted once, inline, right after a video's chat finished), which meant a
+-- throttled/failed subtitle attempt was never retried once 'processed' went true. Videos
+-- that already had subtitle rows before this column existed were set true by a one-time
+-- backfill (since removed).
+--
+-- subtitles_fail_count counts separate runs (not in-run retries) where this video's
+-- subtitle download exhausted every attempt throttled (see RecordSubtitleThrottle in
+-- Database.py, called from Subtitles.py). Once it reaches CFG.SUBTITLE_GIVEUP_AFTER_RUNS,
+-- subtitles_processed is forced true so the video stops being retried forever -- some
+-- videos (seen on a YouTube Short) get a real, consistent 429 from YouTube's caption
+-- endpoint no matter how the request is paced, which is not something retrying within a
+-- run can ever get past.
+--
+-- video_type is 'stream', 'upload' or 'short' -- set by Classify_Video in
+-- modules/Classes.py. Use it rather than livestream (which clears once YouTube finishes
+-- processing a stream). 'stream' = has liveStreamingDetails, which deliberately includes
+-- Premieres -- they can only be told apart from streams while upcoming/live, which would
+-- need far more frequent polling of new uploads than this bot does. Shorts come from
+-- asking youtube.com/shorts/{id} directly (200 = Short, redirect to /watch = not), since
+-- the Data API has no Shorts flag. NULL = not yet classified (Shorts check inconclusive).
+-- Main.py retries unprocessed videos every run and never overwrites a known type with
+-- NULL; a processed video left NULL isn't re-fetched, so classify it by hand with
+-- C.Classify_Video. As of 2026-10-25 the only processed NULLs are two videos the API no
+-- longer returns (deleted/private).
+--
+-- content_duration is contentDetails.duration in seconds -- the length of the video file
+-- itself. Unlike duration (end_time - start_time, only ever set for livestreams), it's
+-- known for uploads and Shorts too. NULL while a stream is upcoming/live (API reports P0D).
+--
+-- caption_source_language is the language YouTube auto-transcribed this video in, i.e. what
+-- its English subtitles came from: 'en' = native English, anything else ('ja', 'id', ...)
+-- = the 'en' rows are YouTube's machine translation from that language. Read from the
+-- downloaded track's URL (lang=ja&tlang=en) by Get_Subtitles, so it costs no extra
+-- request; see _caption_source_language in modules/Classes.py. NULL = not recorded: no
+-- captions, not fetched yet, or fetched before this column existed (2026-10-25 --
+-- those aren't re-fetched just for this). One language per video: YouTube doesn't
+-- follow language switches within a stream.
+--
+-- login_required is set by Main.py when chat_downloader raises LoginRequired (YouTube's
+-- LOGIN_REQUIRED playability status: age-restricted, members-only or private videos).
+-- The video is left unprocessed, but runs without cookies (CFG.COOKIES is None) skip it
+-- before fetching details, so it's only retried on a run that might succeed. Cleared
+-- again once the video is processed.
+--
+-- raw_chat_compressed means this video's raw chat on S3 is gzip-compressed
+-- (messages/{id}.json.gz) and its messages rows' badge flags are correct (see
+-- badge_fix_pending). Main.py sets it itself when marking a video processed if that one
+-- download wrote every row the video has (ChatStats.preexisting_rows == 0 -- current code
+-- always writes .json.gz and correct flags); otherwise compress_raw_chat.py sets it after
+-- converting/correcting. chat_archived is set by archive_chat.py once this video's chat has
+-- been moved out of messages into Parquet (see chat_archive). Both scripts run
+-- automatically, in a background thread, for each channel that finishes a Main.py run with
+-- no errors (CFG.AUTO_ARCHIVE, modules/ChannelArchiver.py), or by hand. Get_Messages
+-- refuses to re-ingest an archived video, since its messages rows (and so
+-- known_message_ids) are gone.
+
+-- Drop table
+
+-- DROP TABLE public.videos;
+
+CREATE TABLE public.videos (
+	id text NOT NULL,
+	title text NULL,
+	livestream bool NULL,
+	islive bool NULL,
+	processed bool DEFAULT false NOT NULL,
+	publishedat timestamp NULL,
+	scheduled_start timestamp NULL,
+	start_time timestamp NULL,
+	end_time timestamp NULL,
+	duration int8 GENERATED ALWAYS AS (EXTRACT(epoch FROM (end_time - start_time))) STORED NULL,
+	members bool DEFAULT false NOT NULL,
+	channel_id text NOT NULL,
+	subtitles_processed bool DEFAULT false NOT NULL,
+	subtitles_fail_count int4 DEFAULT 0 NOT NULL,
+	video_type text NULL,
+	content_duration int8 NULL,
+	login_required bool DEFAULT false NOT NULL,
+	raw_chat_compressed bool DEFAULT false NOT NULL,
+	chat_archived bool DEFAULT false NOT NULL,
+	caption_source_language text NULL,
+	CONSTRAINT pk_videos_id PRIMARY KEY (id),
+	CONSTRAINT videos_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
+	CONSTRAINT videos_video_type_check CHECK ((video_type = ANY (ARRAY['stream'::text, 'upload'::text, 'short'::text])))
+);
+CREATE INDEX idx_videos_duration ON public.videos USING btree (duration);
+CREATE INDEX idx_videos_end_time ON public.videos USING btree (end_time);
+CREATE INDEX idx_videos_published ON public.videos USING btree (publishedat);
+CREATE INDEX idx_videos_scheduled ON public.videos USING btree (scheduled_start);
+CREATE INDEX idx_videos_start_time ON public.videos USING btree (start_time);
+CREATE INDEX idx_videos_subtitles_processed ON public.videos USING btree (channel_id, members) WHERE (subtitles_processed = false);

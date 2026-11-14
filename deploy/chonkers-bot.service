@@ -1,0 +1,49 @@
+# One run of the bot (Main.py). Started once a day by chonkers-bot.timer; start it by hand with
+#   sudo systemctl start chonkers-bot
+# The paths below are examples -- see deploy/README.md.
+
+[Unit]
+Description=Chonkers Bot (YouTube chat downloader)
+Wants=network-online.target
+After=network-online.target
+# A crash, an out-of-memory kill or a stop timeout posts the last log lines to the alert webhook
+OnFailure=chonkers-bot-alert@%n.service
+
+[Service]
+Type=oneshot
+User=chonkers
+Group=chonkers
+WorkingDirectory=/opt/chonkers-bot
+ExecStart=/opt/chonkers-bot/.venv/bin/python Main.py
+
+# Folders (see modules/Settings.py). LogsDirectory= creates /var/log/chonkers-bot for the bot user.
+Environment=CHONKERS_HEADLESS=1
+Environment=CHONKERS_DATA_DIR=/srv/chonkers/data
+Environment=CHONKERS_SECRETS_DIR=/srv/chonkers/secrets
+Environment=CHONKERS_LOG_DIR=/var/log/chonkers-bot
+Environment=CHONKERS_STATUS_DIR=/srv/chonkers/status
+LogsDirectory=chonkers-bot
+# The archiver's temporary files (hundreds of MB per channel). Keep them off a small or RAM-backed /tmp.
+Environment=TMPDIR=/srv/chonkers/tmp
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+
+# A run can take many hours.
+TimeoutStartSec=infinity
+# systemctl stop sends SIGTERM, which the bot turns into a clean stop (logged, status file says
+# "stopped"). Python then ends itself with SIGINT, which isn't a failure. If videos in progress
+# don't wrap up in time, systemd kills it, and that does count as a failure (and alerts).
+TimeoutStopSec=120
+SuccessExitStatus=SIGINT 130
+
+# Optional resource caps -- size them from your own measurements.
+#MemoryMax=8G
+#CPUQuota=300%
+
+# Light hardening that doesn't get in the bot's way
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

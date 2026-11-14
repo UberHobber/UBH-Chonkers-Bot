@@ -1,0 +1,31 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- public.processed_status definition
+
+-- Per-channel chat-processing progress, for seeing where an interrupted run got to:
+-- how many public videos have videos.processed set, and what percentage of that channel's
+-- processable public videos that is. processing_order is the order Main.py works through
+-- channels in -- it must stay in sync with the ORDER BY in load_channel_directory
+-- (modules/Settings.py). Excluded from both the count and the denominator: members-only
+-- videos (videos.members -- can't be processed without membership access), login-
+-- required videos (videos.login_required -- age-restricted etc., can't be processed
+-- without cookies), and
+-- upcoming/live streams (islive, or scheduled_start set with no end_time yet -- this also
+-- catches stale waiting rooms whose scheduled time passed but never went live), since
+-- neither can be processed yet and counting them would make a channel look permanently
+-- incomplete. LEFT JOIN from channel_directory, so channels with no processable public
+-- videos still get a row, with processed_pct NULL rather than a divide-by-zero. Plain view
+-- for the same reason as channel_video_summary.
+
+CREATE OR REPLACE VIEW public.processed_status AS
+SELECT row_number() OVER (ORDER BY b.sort_order, (cd.channel_type = 'official'::text), cd.debut, cd.name) AS processing_order,
+    cd.name AS channel_name,
+    count(v.id) FILTER (WHERE v.processed) AS processed_public_videos,
+    round(((100.0 * (count(v.id) FILTER (WHERE v.processed))::numeric) / (NULLIF(count(v.id), 0))::numeric), 2) AS processed_pct
+   FROM ((channel_directory cd
+     JOIN branches b ON ((b.name = cd.branch)))
+     LEFT JOIN videos v ON (((v.channel_id = cd.user_id) AND (NOT v.members) AND (NOT v.login_required) AND (NOT COALESCE(v.islive, false)) AND (NOT ((v.scheduled_start IS NOT NULL) AND (v.end_time IS NULL))))))
+  GROUP BY cd.name, cd.user_id, cd.channel_type, cd.debut, b.sort_order
+  ORDER BY (row_number() OVER (ORDER BY b.sort_order, (cd.channel_type = 'official'::text), cd.debut, cd.name));

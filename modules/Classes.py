@@ -1,11 +1,30 @@
 # Native Stuff
-import os,json,pickle,requests,re,xxhash
+import os,json,gzip,pickle,requests,re,xxhash,threading,queue,time,random,urllib.parse
+from concurrent.futures import ThreadPoolExecutor,as_completed
+from contextlib import contextmanager
 from typing import Any
 from datetime import datetime
 
 # Installed Stuff
-from tqdm import tqdm
 from chat_downloader import ChatDownloader
+from chat_downloader.sites.youtube import YouTubeChatDownloader
+import yt_dlp
+from yt_dlp.utils import DownloadError
+from yt_dlp.networking.impersonate import ImpersonateTarget
+
+# Resolved once and reused for every subtitle request in this process, rather than calling
+# ImpersonateTarget() fresh per attempt -- a real browser's TLS/HTTP fingerprint stays
+# constant across a session, so presenting a different one on every single request (which an
+# empty ImpersonateTarget() risks, depending on yt-dlp/curl_cffi's resolution) looks exactly
+# like automated traffic to YouTube's abuse detection, independent of how well-paced the
+# requests are.
+_SUBTITLE_IMPERSONATE_TARGET = ImpersonateTarget()
+
+# Videos behind YouTube's "may be inappropriate for some users" interstitial report a
+# CONTENT_CHECK_REQUIRED playability status, which chat_downloader doesn't recognise and raises
+# as VideoUnavailable. bpctr/has_verified are the same params yt-dlp sends to say the warning was
+# already accepted -- the watch page then comes back OK with the chat intact.
+YouTubeChatDownloader._YT_VIDEO_TEMPLATE = YouTubeChatDownloader._YT_HOME + '/watch?v={}&bpctr=9999999999&has_verified=1'
 
 # Google Stuff
 import google.auth
@@ -16,11 +35,34 @@ import google
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+import httplib2,ssl
+
+# S3 API
+import boto3
+from botocore.config import Config as BotocoreConfig
+from types_boto3_s3.client import S3Client
+from botocore.exceptions import ClientError
 
 # Other Project Files
 import modules.logconfig as LOG
 import modules.Settings as CFG
 import modules.Database as DB
+import modules.Status as ST
+import modules.AudienceDeltas as AD
+
+@contextmanager
+def Stage_Bar(desc:str,position:int):
+    """
+    Per-worker status line for a video-processing sub-step that has no natural count to track
+    (thumbnail fetch, DB writes, connecting to chat, subtitle rate-limit waits) -- these used to
+    run silently between the 'Videos Processed' and 'Messages Processed' bars, making a worker
+    look stalled. Reuses that worker's existing bar slot (`position`) with leave=False, so the
+    line is overwritten by whatever comes next and never accumulates as a completed bar once the
+    stage finishes.
+    """
+    with ST.Bar(desc=desc,bar_format='{desc}',ncols=80,position=position,leave=False) as bar:
+        yield bar
 
 class VideoStats:
     """Statistics about all the videos."""
@@ -38,21 +80,169 @@ class ChatStats:
         self.total_messages:int = 0
         self.new_messages:int = 0
         self.existing_messages:int = 0
-        self.new_user_ids:int = 0
-        self.exist_user_ids = set()
+        self.new_user_ids:set = set()
+        self.exist_user_ids:set = set()
         self.invalid_users:int = 0
-    
+        # Per video only (not summed by append_all): rows this video already had in messages
+        # before this download. 0 means every row was written by the current code -- correct
+        # badge flags, raw file already .json.gz -- so Main.py can mark the video
+        # raw_chat_compressed itself instead of leaving it for compress_raw_chat.py.
+        self.preexisting_rows:int = 0
+
     def append_all(self,all_chat_stats:'ChatStats'):
         """Updates the total stats with additional numbers"""
         all_chat_stats.total_messages += self.total_messages
         all_chat_stats.new_messages += self.new_messages
         all_chat_stats.existing_messages += self.existing_messages
-        all_chat_stats.new_user_ids += self.new_user_ids
+        all_chat_stats.new_user_ids = all_chat_stats.new_user_ids.union(self.new_user_ids)
         all_chat_stats.exist_user_ids = all_chat_stats.exist_user_ids.union(self.exist_user_ids)
+
+class SubtitleStats:
+    """Statistics about subtitle downloads for a channel run."""
+    def __init__(self) -> None:
+        self.fetched:int = 0
+        self.no_captions:int = 0
+        self.throttled:int = 0
+        self.errors:int = 0
+
+class H3Client():
+    def __init__(self) -> None:
+        self.client:S3Client = boto3.client(
+        's3',
+        endpoint_url=CFG.ENDPOINT_URL,
+        aws_access_key_id=CFG.ENDPOINT_ID,
+        aws_secret_access_key=CFG.ENDPOINT_KEY,
+        region_name=CFG.ENDPOINT_REGION,
+        # response_checksum_validation: this S3 store reports a CRC32 for multipart-uploaded
+        # objects (ETag ending "-N") that never matches the bytes it serves, so boto3's default
+        # strict validation fails every full-object GET of one even though the data is intact
+        # (verified: full length, valid JSON). Callers that need integrity verify content
+        # themselves (see compress_raw_chat.py / archive_chat.py).
+        config=BotocoreConfig(max_pool_connections=max(25, CFG.WORKER_COUNT * 15),response_checksum_validation="when_required")
+    )
+    def get_all_buckets(self):
+        response = self.client.list_buckets()
+        buckets = response.get('Buckets')
+        bucket_list:list[str] = []
+        for bucket in buckets:
+            bucket_name = bucket.get("Name")
+            if bucket_name:
+                bucket_list.append(bucket_name)
+        return bucket_list
+
+class BucketUnavailableError(Exception):
+    """Raised when a bucket doesn't exist and can't be created (e.g. the name is rejected by S3)."""
+
+class H3Bucket:
+    def __init__(self,client:S3Client,bucket_name:str,local_dir:str) -> None:
+        self.name = bucket_name
+        self.client = client
+        self.local_root = local_dir
+        try:
+            self.client.head_bucket(Bucket=self.name)
+        except ClientError as e:
+            error_code = e.response['Error']['Code'] #type:ignore
+            if error_code == '404':
+                LOG.logger.info(f"Bucket {self.name} does not exist, creating it...")
+                try:
+                    self.client.create_bucket(Bucket=self.name)
+                    LOG.logger.info(f"Bucket {self.name} created.")
+                except ClientError as create_error:
+                    LOG.logger.error(f"Error creating bucket {self.name}:\n{create_error}")
+                    raise BucketUnavailableError(self.name) from create_error
+            elif error_code == '403':
+                LOG.logger.error(f"No permission to access bucket {self.name}!")
+            else:
+                LOG.logger.error(f"Error accessing bucket {self.name}:\n{e}")
+        except Exception as e:
+            LOG.logger.error(f"Error accessing bucket {self.name}:\n{e}")
+
+    def get_object_count(self):
+        paginator = self.client.get_paginator('list_objects_v2')
+        count_iterator = paginator.paginate(Bucket=self.name).search('KeyCount')
+        total_keys = sum(count for count in count_iterator)
+        return total_keys
+
+    def iterate_all_objects(self,filter:str|None=None):
+        paginator = self.client.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=self.name,Prefix=filter) if filter else paginator.paginate(Bucket=self.name)
+        for page in pages:
+            page_packet = []
+            if 'Contents' in page:
+                for obj in page['Contents']:
+                    page_packet.append({'Key': obj['Key']}) #type:ignore
+            yield page_packet
+
+    def delete_objects(self,filter:str|None=None):
+        deleted_count:int = 0
+        try:
+            for obj_packet in self.iterate_all_objects(filter):
+                response = self.client.delete_objects(
+                    Bucket=self.name,
+                    Delete={"Objects":obj_packet}
+                )
+                deleted = len(response.get('Deleted', []))
+                deleted_count += deleted
+                if 'Errors' in response:
+                    for error in response['Errors']:
+                        LOG.logger.warning(f"Error deleting {error['Key']}: {error['Message']}") #type:ignore
+                LOG.logger.info(f"Deleted {deleted} object(s)")
+            return deleted_count
+        except ClientError as e:
+            LOG.logger.error(f"Error deleting object(s): {e}")
+            return -1
+
+    def delete_object(self,object_name:str):
+        try:
+            self.client.delete_object(Bucket=self.name,Key=object_name)
+            return True
+        except ClientError as e:
+            LOG.logger.error(f"Client Error while deleting {object_name}: {e}")
+            return e
+
+    def check_object_exists(self,object_name:str):
+        try:
+            self.client.head_object(Bucket=self.name,Key=object_name)
+            return True # File DOES Exist
+        except ClientError as e:
+            if e.response['Error']['Code'] == '404': #type:ignore
+                return False # File does NOT exist
+            else:
+                LOG.logger.error(f"Error checking object {object_name}: {e}")
+                return e
+
+    def upload_object(self,path:str,object_name:str):
+        try:
+            object_status = self.check_object_exists(object_name)
+            if isinstance(object_status,ClientError):
+                raise object_status
+            if object_status is True:
+                self.client.upload_file(path,self.name,object_name)
+                return True # File Overwritten
+            else:
+                self.client.upload_file(path,self.name,object_name)
+                return False # File Uploaded
+        except ClientError as e:
+            LOG.logger.error(f"Client Error while uploading {object_name}: {e}")
+            return e # Error Uploading
+
+    def download_object(self,object_name:str,file_path:str):
+        try:
+            object_status = self.check_object_exists(object_name)
+            if isinstance(object_status,ClientError):
+                raise object_status
+            elif object_status is False:
+                return False # No file to download
+            else:
+                self.client.download_file(self.name,object_name,file_path)
+                return True # File downloaded
+        except ClientError as e:
+            LOG.logger.error(f"Client Error while downloading {object_name}: {e}")
+            return e # Error Uploading
 
 class VideoClass:
     """
-    A Class that will nab all the data currently implemented into the database structure. 
+    A Class that will nab all the data currently implemented into the database structure.
     Creates a useful self.entry variable for piping into the database method(s) as needed.
 
     :param video: The JSON file (preferably loaded from json.load), ideally provided from the Get_All_Videos method in the YT_API class
@@ -60,16 +250,19 @@ class VideoClass:
 
     :param status: Whether the video is existing, needs updating, or is new. Database operations are different depending on status
     :type status: String
+
+    :param members: Whether the video came from the channel's members-only playlist (videos.members)
+    :type members: Boolean
     """
-    def __init__(self,video:dict[str,Any],status:str):
+    def __init__(self,video:dict[str,Any],status:str,members:bool=False):
         self.status = status
+        self.members = members
         try:
 
             self.id:str|None = video.get("id") # Back-end ID for video
-            self.file = f"{CFG.DATA_PATH}/{self.id}.json" # Filename for JSON dump
             self._snippet:dict[str,Any]|None = video.get("snippet")
             self._liveStreamingDetails:dict[str,Any]|None = video.get("liveStreamingDetails")
-            
+
             if self._snippet is not None:
 
                 # Date video was released / VOD was generated
@@ -80,6 +273,10 @@ class VideoClass:
                     self.publish_date = None
 
                 self.title = self._snippet.get("title") # Video Title
+
+                # None when the API response has no snippet.tags, which YouTube omits for a
+                # video with no tags. Main.py writes these to the tags table (DB.ReplaceVideoTags).
+                self.tags:list[str]|None = self._snippet.get("tags")
 
                 self._liveBroadcastContent:str|None = self._snippet.get("liveBroadcastContent")
                 if self._liveBroadcastContent is not None:
@@ -124,6 +321,8 @@ class VideoClass:
 
                     self.thumbnail:str|None = self._thumbnail.get("url") if self._thumbnail is not None else None
 
+            self.video_type,self.content_duration = Classify_Video(video)
+
             self.entry:dict[str,Any] = {
                 "id":self.id,
                 "title":self.title,
@@ -132,17 +331,22 @@ class VideoClass:
                 "islive":self.islive,
                 "scheduled_start":self.scheduled_start,
                 "start_time":self.actual_start,
-                "end_time":self.actual_end
+                "end_time":self.actual_end,
+                "members":self.members,
+                "channel_id":CFG.YT_USER_ID,
+                "video_type":self.video_type,
+                "content_duration":self.content_duration
             }
         except Exception as e:
             LOG.logger.error(f"Video file {self.id} not initialized:\n{e}")
             raise e
-    
-    def Get_Thumbnail(self):
-        """Will download the video thumbnail. Checks if there's an updated one and renames the old one and downloads a new one."""
-        if self.thumbnail is not None:
-            temp_thumb = f"{CFG.DATA_PATH}/{self.id}_Thumbnail_TEMP.jpg"
 
+    def Get_Thumbnail(self,bucket:H3Bucket):
+        """Will download the video thumbnail. Checks if there's an updated one and renames the old one and downloads a new one."""
+
+        if self.thumbnail is not None and self.id is not None:
+            thumb_tag = CFG.video_thumbnail_tag(self.members)
+            temp_thumb = f"{bucket.local_root}/{thumb_tag}/{self.id}_TEMP.jpg"
             # Download a fresh thumbnail
             with open(temp_thumb,'wb') as handle:
                 img_response = requests.get(self.thumbnail,stream=True)
@@ -152,46 +356,43 @@ class VideoClass:
                     if not block:
                         break
                     handle.write(block)
-            # Hash the fresh thumbnail
-            with open(temp_thumb,"rb") as image:
-                new_hash = xxhash.xxh128_hexdigest(image.read())
 
-            # Check for previously downloaded thumbnails
-            thumbnail_hashes = set()
-            thumb_path = f"{CFG.DATA_PATH}/{self.id}_Thumbnail.jpg"
+            _check_and_upload_file(bucket,temp_thumb,self.id,"jpg",thumb_tag)
 
-            # Check if a thumbnail already exists
-            if os.path.isfile(thumb_path):
+def Raw_Chat_Keys(video_id:str) -> tuple[str,str]:
+    """
+    Returns (current_key, legacy_key) for a video's raw chat_downloader JSON in its channel
+    bucket. Current objects are minified JSON, gzip-compressed (~17x smaller than the legacy
+    indented .json objects, measured); compress_raw_chat.py converts legacy objects in place.
+    """
+    base = f"{CFG.MESSAGES_TAG}/{video_id}.json"
+    return f"{base}.gz", base
 
-                # Hash the file and store it for cross referencing
-                with open(thumb_path,"rb") as image:
-                    thumbnail_hashes.add(xxhash.xxh128_hexdigest(image.read()))
+def Write_Raw_Chat(path:str,messages:list[dict[str,Any]]) -> None:
+    """Writes raw chat messages to `path` in the current storage format (minified JSON, gzip)."""
+    with gzip.open(path,'wt',encoding='utf-8',compresslevel=6) as file:
+        json.dump(messages,file,separators=(',',':'),ensure_ascii=False)
 
-                # Create a new filename
-                number = 1
-                new_path = f"{CFG.DATA_PATH}/{self.id}_Thumbnail_{number}.jpg"
+def Read_Raw_Chat(path:str,legacy:bool=False) -> list[dict[str,Any]]:
+    """Reads raw chat messages written by Write_Raw_Chat, or a legacy uncompressed .json file."""
+    opener = open if legacy else gzip.open
+    with opener(path,'rt',encoding='utf-8') as file:
+        return json.load(file)
 
-                # Increment until no overlapping name
-                while os.path.isfile(new_path):
-                    # Hash the file and store it for cross referencing
-                    with open(new_path,"rb") as image:
-                        thumbnail_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                    number += 1
-                    new_path = f"{CFG.DATA_PATH}/{self.id}_Thumbnail_{number}.jpg"
-
-                # Delete it if it already matches another one
-                if new_hash in thumbnail_hashes:
-                    os.remove(temp_thumb)
-                else:
-                    os.rename(thumb_path,new_path)
-                    os.rename(temp_thumb,thumb_path)
-            else:
-                os.rename(temp_thumb,thumb_path)
+def Badge_Flags(badges:list[dict[str,Any]]|None) -> tuple[bool,bool,bool]:
+    """
+    Returns (is_moderator, is_verified, is_owner) from a chat_downloader author's badge list.
+    Each flag is set if ANY badge carries that title -- a user can hold several badges at once
+    (e.g. Moderator + Member). The old per-badge loop overwrote all three flags on every badge,
+    so only the last badge counted; compress_raw_chat.py uses this same function to correct
+    the rows that bug wrote.
+    """
+    titles = {badge.get("title") for badge in badges or []}
+    return "Moderator" in titles, "Verified" in titles, "Owner" in titles
 
 class MessageClass:
     """
-    A Class that will nab all the data currently implemented into the database structure. 
+    A Class that will nab all the data currently implemented into the database structure.
     Creates a useful self.entry variable for piping into the database method(s) as needed.
 
     :param message: The JSON file (preferably loaded from json.load), ideally provided from the get_chat method from the ChatDownloader tool developed by xenova
@@ -202,7 +403,7 @@ class MessageClass:
     def __init__(self,message:dict[str,Any],video:VideoClass):
         try:
             self.id = message.get("message_id") # Back-end ID for message
-            self.message:str|None = message.get("message") # Message contents
+            self.message:str|None = _strip_nul(message.get("message")) # Message contents
             self._time_absolute = message.get("timestamp")
             if self._time_absolute is not None:
                 self.time_absolute = self._time_absolute/1000000 # Exact time the message was sent (Timestamp is in microseconds so need to convert it)
@@ -216,26 +417,13 @@ class MessageClass:
 
             if self._author is not None:
                 self.usr_id = self._author.get("id")
-                self.usr_name = self._author.get("name")
+                self.usr_name = _strip_nul(self._author.get("name"))
 
                 self._badges:list[dict[str,Any]]|None = self._author.get("badges")
 
                 if self._badges is not None:
                     self.member_months = self._Membership_Level(self._badges)
-                    for badge in self._badges:
-                        _title = badge.get("title")
-                        if _title == "Verified":
-                            self.is_verified = True
-                        else:
-                            self.is_verified = False
-                        if _title == "Moderator":
-                            self.is_moderator = True
-                        else:
-                            self.is_moderator = False
-                        if _title == "Owner":
-                            self.is_owner = True
-                        else:
-                            self.is_owner = False
+                    self.is_moderator,self.is_verified,self.is_owner = Badge_Flags(self._badges)
                 else:
                     self.member_months = -1
                     self.is_moderator = False
@@ -262,7 +450,7 @@ class MessageClass:
             if self._emotes is not None:
                 for emote in self._emotes:
                     e_id = emote.get("id")
-                    e_name = emote.get("name")
+                    e_name = _strip_nul(emote.get("name"))
                     e_custom = emote.get("is_custom_emoji")
                     e_images:list[dict[str,Any]]|None = emote.get("images")
                     e_url = None
@@ -277,6 +465,8 @@ class MessageClass:
                             elif _e_img_id == "24x24":
                                 break
                     e_entry:dict = {"id":e_id,"name":e_name,"url":e_url,"custom":e_custom}
+                    if CFG.GET_MEMBERS_CHAT is False:
+                        e_entry["channel_id"] = CFG.YT_USER_ID
                     self.e_emote_entries.append(e_entry)
 
             self.entry = {
@@ -297,6 +487,8 @@ class MessageClass:
                 "symbol":self.currency_symbol,
                 "color":self.header_background_colour
             }
+            if CFG.GET_MEMBERS_CHAT is False:
+                self.entry["channel_id"] = CFG.YT_USER_ID
         except Exception as e:
             LOG.logger.error(f"Message {self.id} not initialized:\n{e}")
             raise e
@@ -322,7 +514,7 @@ class MessageClass:
 
 class UserClass:
     """
-    A Class that will nab all the data currently implemented into the database structure. 
+    A Class that will nab all the data currently implemented into the database structure.
     Creates a useful self.entry variable for piping into the database method(s) as needed.
 
     :param user: The JSON file (preferably loaded from json.load), containing the API response from a channel request from Youtube
@@ -333,8 +525,8 @@ class UserClass:
             self.id = user.get("id") # Back-end ID for user
             self._snippet:dict[str,Any]|None = user.get("snippet")
             if self._snippet is not None:
-                self.name = self._snippet.get("title") # Most current username
-                self.custom_url = self._snippet.get("customUrl") # Custom URL if one was set
+                self.name = _strip_nul(self._snippet.get("title")) # Most current username
+                self.custom_url = _strip_nul(self._snippet.get("customUrl")) # Custom URL if one was set
                 self._created = self._snippet.get("publishedAt") # Date channel was created
                 self.created = _get_date_time(self._created) if self._created is not None else None
                 self.region = self._snippet.get("country")
@@ -377,48 +569,283 @@ class UserClass:
             LOG.logger.error(f"Video file {self.id} not initialized:\n{e}")
             raise e
 
+_RETRYABLE_HTTP_STATUSES = {429,500,503}
+# Network-level failures that never produce an HTTP status at all -- the socket gets reset/aborted
+# mid-request (WinError 10053/10054), a TLS hiccup, a DNS blip, or the OAuth token refresh that
+# runs inside request.execute() losing its connection. All transient. Deliberately NOT
+# google.auth.exceptions.RefreshError (revoked/expired refresh token) -- retrying that is pointless.
+_RETRYABLE_NETWORK_ERRORS = (ConnectionError,TimeoutError,ssl.SSLError,httplib2.HttpLib2Error,google.auth.exceptions.TransportError)
+
+def _execute_with_retry(request,max_attempts:int=5):
+    """
+    Executes a googleapiclient request, retrying with exponential backoff on transient errors
+    (429 rate limit, 500/503 backend errors) -- YouTube's API intermittently returns these under
+    normal load, not just when something's actually broken (e.g. a bare "503 The service is
+    currently unavailable" mid-pagination once killed a whole channel's run). Dropped connections
+    (_RETRYABLE_NETWORK_ERRORS) are retried the same way. Any other status
+    (404, 400, etc.) is raised immediately, same as calling request.execute() directly.
+
+    :param request: A googleapiclient request object (not yet executed).
+    :param max_attempts: Number of attempts before giving up and raising.
+    :type max_attempts: Integer
+    """
+    for attempt in range(max_attempts):
+        try:
+            return request.execute()
+        except HttpError as e:
+            if e.resp.status not in _RETRYABLE_HTTP_STATUSES or attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt
+            LOG.logger.warning(f"YouTube API returned {e.resp.status}, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+            time.sleep(wait)
+        except _RETRYABLE_NETWORK_ERRORS as e:
+            if attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt
+            LOG.logger.warning(f"YouTube API connection error ({type(e).__name__}: {e}), retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+            time.sleep(wait)
+
+class SubtitleThrottled(Exception):
+    """Raised when yt-dlp subtitle downloads keep failing in a way that looks like YouTube
+    throttling/blocking this IP, after exhausting CFG.SUBTITLE_MAX_ATTEMPTS retries."""
+    pass
+
+_THROTTLE_SIGNATURES = (r"\b429\b","too many requests","sign in to confirm you're not a bot")
+
+def _is_throttled(exc:Exception) -> bool:
+    """Best-effort classification of a yt-dlp DownloadError as YouTube throttling/bot-detection
+    rather than an unrelated failure (no captions, video unavailable, etc.) -- yt-dlp doesn't
+    expose a distinct exception type for this, so this matches on known message signatures.
+    Deliberately the full "sign in to confirm you're not a bot" phrase, not just "sign in to
+    confirm" -- that shorter form also matches yt-dlp's age-restriction error ("Sign in to
+    confirm your age"), which is a permanent, never-retryable failure for this video (see
+    _is_age_restricted), not a transient throttle worth backing off and retrying. "429" is
+    matched as a whole number (\\b429\\b), not a bare substring -- yt-dlp's error text can embed
+    unrelated numbers (URLs, itags, byte offsets) that happen to contain "429"."""
+    msg = str(exc).lower()
+    return any(re.search(sig,msg) if sig.startswith(r"\b") else sig in msg for sig in _THROTTLE_SIGNATURES)
+
+_AGE_RESTRICTED_SIGNATURES = ("confirm your age","age-restricted","age restricted")
+
+def _is_age_restricted(exc:Exception) -> bool:
+    """Detects yt-dlp's age-restriction error (no authenticated cookies available to bypass
+    it). Permanent for this video -- never worth retrying or waiting on, unlike a throttle."""
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _AGE_RESTRICTED_SIGNATURES)
+
+class _YtdlpSilentLogger:
+    """Swallows all of yt-dlp's own log output. Get_Subtitles already logs the outcomes it
+    cares about (throttled/age-restricted/no captions/etc.) through modules.logconfig, which
+    coordinates properly with an in-progress tqdm bar -- yt-dlp's own error/warning messages
+    print straight to stdout/stderr regardless of the quiet/no_warnings options (those only
+    suppress its info-level noise), colliding mid-line with the bar's carriage-return updates
+    and mangling the console. The exception raised on failure still carries the full message
+    text for _is_throttled/_is_age_restricted to classify -- only the raw printing is muted."""
+    def debug(self,msg): pass
+    def info(self,msg): pass
+    def warning(self,msg): pass
+    def error(self,msg): pass
+
+class AdaptiveRateLimiter:
+    """
+    Enforces a minimum gap between subtitle download attempts that grows automatically
+    whenever YouTube throttles a request, instead of relying on a fixed guessed delay -- a
+    flat few-second gap was still drawing HTTP 429s on a large fraction of videos during a
+    real backfill run, even with per-video retry/backoff, and most of those never recovered
+    within CFG.SUBTITLE_MAX_ATTEMPTS. Thread-safe and meant to be a single instance shared
+    across every video/worker thread for the whole run (see Subtitles.py),
+    passed into Get_Subtitles's rate_limiter parameter, so it learns whatever pace YouTube is
+    actually enforcing right now rather than guessing a constant up front.
+
+    Starts at `floor` seconds. Every reported throttle multiplies the current delay by 1.5x
+    (capped at `ceiling`). After enough consecutive clean fetches, the delay decays back down
+    slightly toward the floor, so a temporarily-strict period doesn't permanently slow down
+    the rest of a multi-hour run.
+    """
+    def __init__(self,floor:float,ceiling:float):
+        self._lock = threading.Lock()
+        self._floor = floor
+        self._ceiling = ceiling
+        self._delay = floor
+        self._last = 0.0
+        self._consecutive_clean = 0
+
+    @property
+    def current(self) -> float:
+        with self._lock:
+            return self._delay
+
+    def wait(self):
+        with self._lock:
+            delay = self._delay
+            elapsed = time.monotonic() - self._last
+            if elapsed < delay:
+                time.sleep(delay - elapsed)
+            self._last = time.monotonic()
+
+    def report_throttled(self):
+        with self._lock:
+            self._consecutive_clean = 0
+            new_delay = min(self._delay * 1.5,self._ceiling)
+            if new_delay > self._delay:
+                LOG.logger.info(f"Subtitle request delay increased to {new_delay:.1f}s after a throttle.")
+            self._delay = new_delay
+
+    def report_success(self):
+        with self._lock:
+            self._consecutive_clean += 1
+            if self._consecutive_clean >= 50 and self._delay > self._floor:
+                self._delay = max(self._delay * 0.95,self._floor)
+                self._consecutive_clean = 0
+
+class SubtitleCircuitBreaker:
+    """Trips after N consecutive throttle-exhausted videos (within one run), so a blocked
+    IP doesn't get hammered by every remaining video once yt-dlp starts failing."""
+    def __init__(self,threshold:int):
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._threshold = threshold
+    def record_throttle(self):
+        with self._lock:
+            self._consecutive += 1
+    def record_success(self):
+        with self._lock:
+            self._consecutive = 0
+    @property
+    def tripped(self) -> bool:
+        return self._consecutive >= self._threshold
+
+def _caption_source_language(info:dict[str,Any]|None,lang:str) -> str|None:
+    """
+    The language YouTube transcribed a video in, read from the subtitle track yt-dlp just
+    downloaded for `lang`. YouTube makes one auto-caption transcript per video, and every other
+    language is a machine translation of it: the track's URL carries the transcript's language as
+    `lang` and, when translated, the target as `tlang` (e.g. lang=ja&tlang=en). So `lang` is the
+    source either way -- 'en' means native English. None if yt-dlp didn't report the track.
+    """
+    track:dict[str,Any] = ((info or {}).get("requested_subtitles") or {}).get(lang) or {}
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(track.get("url") or "").query)
+    return (query.get("lang") or [None])[0]
+
+_VTT_TIMESTAMP = re.compile(r'(\d{2,}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2,}):(\d{2}):(\d{2})\.(\d{3})')
+_VTT_TAG = re.compile(r'<[^>]+>')
+
+def _vtt_timestamp_to_ms(hours:str,minutes:str,seconds:str,millis:str) -> int:
+    return ((int(hours) * 3600 + int(minutes) * 60 + int(seconds)) * 1000) + int(millis)
+
+def _parse_vtt_cues(vtt_path:str) -> list[dict[str,Any]]:
+    """
+    Parses a WebVTT file into a list of {seq, start_ms, end_ms, text} cues, in file order.
+    Skips the WEBVTT header and any NOTE/STYLE blocks -- only cue timing lines and the text
+    that follows them (until the next blank line) are collected.
+
+    YouTube's auto-generated VTT is heavily duplicated by construction, in two different ways:
+
+    1. It renders as a "rolling" 2-line caption window: each cue typically repeats most of
+       the previous cue's text plus a little new content (e.g. "[Music]" then "[Music]\ndo"
+       then "do" then "do\n[Music]" ...).
+    2. Each spoken phrase appears twice: once as a "growing" cue with inline per-word
+       karaoke-style timing tags (`<00:12:47.680><c> word</c>...`), then again immediately
+       after as a plain "settled" cue containing the exact same words with the tags stripped.
+
+    Both are collapsed here: tags are stripped from each cue's text first (so the tagged
+    "growing" and plain "settled" versions of the same phrase become identical strings), then
+    each cue is deduped against the immediately preceding one -- any line it repeats verbatim
+    from the previous cue is dropped, and a cue contributing nothing new is skipped entirely.
+    What's left is the genuinely new text at each cue's own timestamp. Repeats of the same
+    word/phrase further apart (i.e. not in adjacent cues) are left alone -- those are real
+    recurrences in the video, not parsing artifacts.
+
+    :param vtt_path: Path to a .vtt file written by yt-dlp.
+    :type vtt_path: String
+    :return: Deduped cues in file order.
+    :rtype: list[dict]
+    """
+    raw_cues:list[tuple[int,int,str]] = []
+    with open(vtt_path,'r',encoding='utf-8') as file:
+        lines = file.read().splitlines()
+
+    i = 0
+    while i < len(lines):
+        match = _VTT_TIMESTAMP.search(lines[i])
+        if match:
+            start_ms = _vtt_timestamp_to_ms(*match.groups()[0:4])
+            end_ms = _vtt_timestamp_to_ms(*match.groups()[4:8])
+            i += 1
+            text_lines:list[str] = []
+            while i < len(lines) and lines[i].strip() != "":
+                text_lines.append(lines[i])
+                i += 1
+            text = "\n".join(text_lines).strip()
+            if text:
+                raw_cues.append((start_ms,end_ms,text))
+        else:
+            i += 1
+
+    cues:list[dict[str,Any]] = []
+    prev_lines:list[str] = []
+    seq = 0
+    for start_ms,end_ms,raw_text in raw_cues:
+        text = _VTT_TAG.sub("",raw_text).strip()
+        if not text:
+            continue
+        cue_lines = text.split("\n")
+        new_lines = [line for line in cue_lines if line not in prev_lines]
+        prev_lines = cue_lines
+        if not new_lines:
+            continue
+        cues.append({"seq":seq,"start_ms":start_ms,"end_ms":end_ms,"text":" ".join(new_lines)})
+        seq += 1
+    return cues
+
 class YT_API:
     """
-    Creates a usable API endpoint for making calls. Was initially going to handle ALL calls using your own provided credentials, 
+    Creates a usable API endpoint for making calls. Was initially going to handle ALL calls using your own provided credentials,
     but xenova's ChatDownloader tool worked so well I pivoted to utilizing that for getting chat messages.
 
     :param database: Initialized Database Object the methods can use to make queries on.
     :type database: Database Object
     """
     def __init__(self,database:DB.PostgresClass):
-        
+
         def get_authenticated_service():
             """
             Authenticates credientials onto the Youtube API.
-            
+
             :return: Youtube API object for making calls with.
             :rtype: API Object
             """
             credentials:Any | google.auth.external_account_authorized_user.Credentials | google.oauth2.credentials.Credentials = None
-            
+
             # Check if we have saved credentials
             if os.path.exists(CFG.TOKEN_PICKLE_FILE):
                 with open(CFG.TOKEN_PICKLE_FILE, 'rb') as token:
                     credentials = pickle.load(token)
-            
+
+            def sign_in(reason:str):
+                """Browser sign-in. A headless run can't do one, so it stops with an error instead of waiting forever."""
+                if CFG.HEADLESS:
+                    raise RuntimeError(f"YouTube sign-in needed ({reason}), but this is a headless run and can't open a browser. "
+                                       f"Run the bot once on a machine with a browser, then copy its token.pickle to {CFG.TOKEN_PICKLE_FILE}.")
+                flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
+                return flow.run_local_server(port=0)
+
             # If credentials don't exist or are invalid, run the flow
             if not credentials or not credentials.valid:
                 if credentials and credentials.expired and credentials.refresh_token:
                     try:
                         credentials.refresh(Request())
-                    except google.auth.exceptions.RefreshError:
-                        flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
-                        credentials = flow.run_local_server(port=0)
+                    except google.auth.exceptions.RefreshError as e:
+                        credentials = sign_in(f"the saved token's refresh was rejected: {e}")
                 else:
-                    flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
-                    credentials = flow.run_local_server(port=0)
-                
+                    credentials = sign_in("no saved token" if not credentials else "the saved token can't be refreshed")
+
                 # Save credentials for future use
                 with open(CFG.TOKEN_PICKLE_FILE, 'wb') as token:
                     pickle.dump(credentials, token)
-            
+
             api_resource = build('youtube', 'v3', credentials=credentials)
-            
+
             return api_resource
 
         self.api = get_authenticated_service()
@@ -431,19 +858,20 @@ class YT_API:
         LOG.logger.info("Polling channel for upload count")
         LOG.logger.info('--------------------------------')
 
-        request = self.api.playlists().list(part="contentDetails",channelId=CFG.YT_CHANNEL_ID,id=CFG.PLAYLIST)
+        request = self.api.playlists().list(part="contentDetails",channelId=CFG.YT_CHANNEL_ID,id=CFG.UPLOAD_PLAYLIST)
 
-        response = request.execute()
+        response = _execute_with_retry(request)
 
         video_count = response["contentDetails"]["itemCount"]
 
         LOG.logger.info(f"{video_count} video(s) found!")
         return video_count
-    
-    def Get_Video_Info(self,id:str):
+
+    def Get_Video_Info(self,id:str,bucket:H3Bucket,members:bool=False):
+        """:param members: Whether the video is members-only (from Get_All_Videos' result)."""
         request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=id)
 
-        response = request.execute()
+        response = _execute_with_retry(request)
 
         videos:list[dict] = response["items"]
 
@@ -454,113 +882,107 @@ class YT_API:
             del video["kind"]
             del video["etag"]
 
-            temp_path = f"{CFG.DATA_PATH}/{id}_TEMP.json"
+            detail_tag = CFG.video_detail_tag(members)
+            temp_path = f"{bucket.local_root}/{detail_tag}/{id}_TEMP.json"
 
             # Write Video data to file
             with open(temp_path,'w') as file:
                 file.write(json.dumps(video,indent=4))
 
-            # Hash the video data
-            with open(temp_path,"rb") as image:
-                new_hash = xxhash.xxh128_hexdigest(image.read())
+            video_detail_status = _check_and_upload_file(bucket,temp_path,id,"json",detail_tag)
 
-            data_hashes = set()
-            filepath = f"{CFG.DATA_PATH}/{id}.json"
-
-            # Check if video data already exists
-            if os.path.isfile(filepath):
-
-                # Hash the file and store it for cross referencing
-                with open(filepath,"rb") as data:
-                    data_hashes.add(xxhash.xxh128_hexdigest(data.read()))
-
-                # Create a new filename
-                number = 1
-                new_path = f"{CFG.DATA_PATH}/{id}_{number}.json"
-
-                # Increment until no overlapping name
-                while os.path.isfile(new_path):
-                    # Hash the file and store it for cross referencing
-                    with open(new_path,"rb") as image:
-                        data_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                    number += 1
-                    new_path = f"{CFG.DATA_PATH}/{id}_{number}.json"
-
-                # Delete it if it already matches another one
-                if new_hash in data_hashes:
-                    os.remove(temp_path)
-                    status = "Existing"
-                else:
-                    os.rename(filepath,new_path)
-                    os.rename(temp_path,filepath)
-                    status = "Update"
-            else:
-                os.rename(temp_path,filepath)
-                status = "New"
-
-            vid_obj = VideoClass(video,status)
+            vid_obj = VideoClass(video,video_detail_status,members)
 
             return vid_obj
         else:
             return None
 
-    def Get_All_Videos(self):
-        """
-        Retrieves all YT videos from a playlist, and returns a list of video_ids
+    def _Get_Playlist_Items(self,playlist_id:str,dl_vidbar) -> list[dict[str,Any]]:
+        """Pages through one playlist's items. A 404 (playlist doesn't exist) returns an empty list."""
+        request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50)
+        try:
+            response = _execute_with_retry(request)
+        except HttpError as e:
+            if e.resp.status == 404:
+                # e.g. a channel with no Members-Only content yet, so YouTube hasn't generated that hidden playlist.
+                LOG.logger.info(f"Playlist {playlist_id} not found (404) - assuming no videos exist yet.")
+                return []
+            raise
+        next_page = response.get("nextPageToken")
+        video_list:list[dict[str,Any]] = response["items"]
+        dl_vidbar.update(len(video_list))
 
-        Also writes a singular JSON formatted file containing basic information of ALL videos in a single file. File is named "__Video_Playlist.json"
+        while next_page is not None:
+            next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50,pageToken=next_page)
+            next_response = _execute_with_retry(next_request)
+            next_page = next_response.get("nextPageToken")
+            response_items:list[dict] = next_response["items"]
+            dl_vidbar.update(len(response_items))
+            video_list = video_list + response_items
 
-        :return: video_ids of all videos from the playlist
-        :rtype: List of Strings
+        return video_list
+
+    def Get_All_Videos(self,bucket:H3Bucket) -> dict[str,bool]:
         """
-        
+        Retrieves all YT videos from every playlist in CFG.PLAYLISTS (uploads + members-only on a
+        public run, members-only only on a members chat pass).
+
+        Also writes one JSON file per playlist containing basic information of all its videos
+        ("Video_Playlist.json" / "Video_Playlist_members.json").
+
+        :return: {video_id: members} for every video found. A video in both playlists counts as public.
+        :rtype: Dictionary of {String, Boolean}
+        """
+        videos:dict[str,bool] = {}
         with LOG.TQDM_Logging():
-            with tqdm(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
+            with ST.Bar(desc='Video Data Downloaded',bar_format='{desc}: {n_fmt}',ncols=80,position=0,leave=False) as dl_vidbar:
+                for playlist_id,members in CFG.PLAYLISTS:
+                    video_list = self._Get_Playlist_Items(playlist_id,dl_vidbar)
+                    if not video_list:
+                        continue
 
-                request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50)
+                    playlist_name = f"Video_Playlist{CFG.MEMBERS_ONLY_FLAG}" if members else "Video_Playlist"
+                    playlist_path = f"{CFG.LOCAL_DATA_PATH}/{playlist_name}_TEMP.json"
+                    with open(playlist_path,'w') as file:
+                        file.write(json.dumps(video_list,indent=4))
+                    _check_and_upload_file(bucket,playlist_path,playlist_name,"json")
 
-                response = request.execute()
+                    for video in video_list:
+                        vid_id:str = video["contentDetails"]["videoId"]
+                        videos[vid_id] = videos.get(vid_id,True) and members
 
-                next_page = response["nextPageToken"]
+        return videos
 
-                video_list:list[dict[str,Any]] = response["items"]
+    def Get_Videos_Info_Batch(self,ids:list[str],bucket:H3Bucket,members_ids:set[str]|None=None) -> dict[str,'VideoClass']:
+        """
+        Fetches info for up to 50 video IDs in a single API call instead of one call per video.
 
-                dl_vidbar.update(len(video_list))
+        :param members_ids: IDs of members-only videos (Get_All_Videos' result) -- sets
+            VideoClass.members and which S3 detail folder the JSON goes to.
+        """
+        result:dict[str,VideoClass] = {}
+        if not ids:
+            return result
+        _members_ids = members_ids if members_ids is not None else set()
+        request = self.api.videos().list(part="contentDetails,id,snippet,status,liveStreamingDetails",id=",".join(ids))
+        response = _execute_with_retry(request)
+        for video in response.get("items",[]):
+            vid_id = video["id"]
+            del video["kind"]
+            del video["etag"]
+            members = vid_id in _members_ids
+            detail_tag = CFG.video_detail_tag(members)
+            temp_path = f"{bucket.local_root}/{detail_tag}/{vid_id}_TEMP.json"
+            with open(temp_path,'w') as file:
+                file.write(json.dumps(video,indent=4))
+            video_detail_status = _check_and_upload_file(bucket,temp_path,vid_id,"json",detail_tag)
+            result[vid_id] = VideoClass(video,video_detail_status,members)
+        return result
 
-                while True:
-                    if next_page == None:
-                        break
-                    else:
-                        next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=CFG.PLAYLIST,maxResults=50,pageToken=next_page)
-                        next_response = next_request.execute()
-
-                        try:
-                            next_page = next_response["nextPageToken"]
-                        except:
-                            next_page = None
-
-                        response_items:list[dict] = next_response["items"]
-
-                        dl_vidbar.update(len(response_items))
-
-                        video_list:list[dict[str,Any]] = video_list + response_items
-
-        with open(f"{CFG.DATA_PATH}/__Video_Playlist.json",'w') as file:
-            file.write(json.dumps(video_list,indent=4))
-
-        ids:list[str] = []
-
-        for video in video_list:
-            vid_id:str = video["contentDetails"]["videoId"]
-            ids.append(vid_id)
-        
-        return ids
-
-    def Get_Messages(self,video:VideoClass,skip_download=False):
+    def Get_Messages(self,video:VideoClass,bucket:H3Bucket,known_user_ids:set,sorted_nicknames:list[str],db=None,user_id_lock=None,known_emote_ids:set|None=None,bar_position:int=1,skip_download=False):
         """
         Retrieves all chat messages from a given video, saves them to JSON files, and enters them into the database.
-        
+
         Writes a JSON formatted file for each video. File is named "[YT URL]_Messages.json"
 
         :param video: The video that is used to get the chats from
@@ -568,171 +990,459 @@ class YT_API:
         :return: Stats about the messages that were parsed, and the users who sent them
         :rtype: ChatStats object
         """
-
-        def _WriteFile():
+        def _WriteFile(object_name:str,object_path:str,existing_messages:list[dict[str,Any]],collected_messages:list[dict[str,Any]]):
             """
             Writes the downloaded chat data to a file with the name of the video ID.
             If the file already exists, load up all existsing chat meessages and
             add any new ones to the file.
             """
-            
-            message_path = f'{CFG.DATA_PATH}/{v.id}_Messages.json'
 
-            if os.path.isfile(message_path):
-                e_ids = set()
-                
-                with open(message_path,'r') as file:
-                    all_messages = json.load(file) #type: list[dict]
-                
-                for ex_message in all_messages:
+            e_ids = set()
+            messages_to_save:list[dict[str,Any]] = []
+
+            if existing_messages:
+                for ex_message in existing_messages:
                     em_id = ex_message["message_id"]
                     e_ids.add(em_id)
+                    messages_to_save.append(ex_message)
 
-                for n_message in message_list:
-                    nm_id = n_message["message_id"]
-                    if nm_id in e_ids:
-                        continue
-                    else:
-                        all_messages.append(n_message)
+            for message in collected_messages:
+                nm_id = message["message_id"]
+                if nm_id in e_ids:
+                    continue
+                else:
+                    messages_to_save.append(message)
 
-                with open(message_path,'w') as file:
-                    file.write(json.dumps(all_messages,indent=4))
-            else:
-                with open(message_path,'w') as file:
-                    file.write(json.dumps(message_list,indent=4))
-        
+            Write_Raw_Chat(object_path,messages_to_save)
+
+            upload_status = bucket.upload_object(object_path,object_name)
+            if isinstance(upload_status,ClientError):
+                raise upload_status
+
+            # Merged into the compressed object above, so the legacy uncompressed copy is now
+            # redundant -- see Raw_Chat_Keys.
+            if legacy_on_file:
+                delete_status = bucket.delete_object(legacy_object)
+                if isinstance(delete_status,ClientError):
+                    raise delete_status
+
         v = video
+        _db = db if db is not None else self.db
+        _lock = user_id_lock if user_id_lock is not None else threading.Lock()
+        _emote_ids = known_emote_ids if known_emote_ids is not None else set()
+
+        # A video whose chat was moved to the Parquet archive (archive_chat.py) has no rows left
+        # in messages, so known_message_ids below would come back empty and every message would be
+        # inserted -- and counted into video_message_stats/user_channel_activity -- a second time.
+        # Processed videos are already filtered out before this point; this only guards against
+        # one being manually flipped back to unprocessed.
+        if CFG.GET_MEMBERS_CHAT is False:
+            archived_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["videos"],"chat_archived",{"id":v.id})
+            if archived_rows and archived_rows[0]["chat_archived"]:
+                LOG.logger.warning(f"Video {v.id}'s chat is already archived to Parquet -- skipping to avoid double-counting.")
+                return ChatStats()
+
+        with Stage_Bar("Checking existing messages",bar_position):
+            message_object,legacy_object = Raw_Chat_Keys(v.id)
+            existing_messages_local = f'{bucket.local_root}/{message_object}'
+            legacy_on_file = False
+            messages_on_file:list[dict[str,Any]] = []
+            for key,is_legacy in ((message_object,False),(legacy_object,True)):
+                local_path = f'{bucket.local_root}/{key}'
+                downloaded_object = bucket.download_object(key,local_path)
+                if isinstance(downloaded_object,ClientError):
+                    raise downloaded_object
+                if downloaded_object is True and os.path.isfile(local_path):
+                    messages_on_file = Read_Raw_Chat(local_path,legacy=is_legacy)
+                    legacy_on_file = is_legacy
+                    break
+
+            # Pre-load existing message IDs for this video to avoid per-message DB lookups
+            existing_msg_rows = DB.GetEntries(_db.cursor,CFG.DB_TABLES["messages"],"message_id",{"video_id":v.id})
+            known_message_ids:set = set(row["message_id"] for row in existing_msg_rows)
 
         #-----------------------#
         #-- GET ALL CHAT DATA --#
         #-----------------------#
 
-        if skip_download == True:
-            message_path = f'{CFG.DATA_PATH}/{v.id}_Messages.json'
-            if os.path.isfile(message_path):
-                with open(message_path,'r') as file:
-                    messages_on_file = json.load(file) #type: list[dict]
-        else:
-            # Timeout will prevent sitting endlessly on a waiting room or livestream
-            if CFG.TIMEOUT == True:
-                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'],inactivity_timeout=5)
-            else:
-                chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
-
-        message_list = []
+        message_list:list[dict[str,Any]] = []
         chat_stats = ChatStats()
+        chat_stats.preexisting_rows = len(known_message_ids)
 
-        chat_list = chat if skip_download == False else messages_on_file
+        if skip_download == False:
+            # chat_downloader's built-in inactivity_timeout calls _thread.interrupt_main(),
+            # which only raises KeyboardInterrupt in the main thread. In a worker thread the
+            # timer fires but the interrupt lands in the wrong thread and the worker stays
+            # blocked on the network call forever. We implement the timeout ourselves via a
+            # queue so it works correctly from any thread.
+            with Stage_Bar("Connecting to chat",bar_position):
+                _raw_chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
+            if CFG.TIMEOUT:
+                _msg_queue:queue.Queue = queue.Queue()
+                def _feed_queue():
+                    try:
+                        for _msg in _raw_chat:
+                            _msg_queue.put(_msg)
+                    except Exception as _e:
+                        _msg_queue.put(_e)
+                    _msg_queue.put(None)
+                threading.Thread(target=_feed_queue, daemon=True).start()
+                def _timed_chat_iter():
+                    while True:
+                        try:
+                            _item = _msg_queue.get(timeout=20)
+                        except queue.Empty:
+                            return
+                        if _item is None:
+                            return
+                        if isinstance(_item, Exception):
+                            raise _item
+                        yield _item
+                chat_list = _timed_chat_iter()
+            else:
+                chat_list = _raw_chat
+        else:
+            chat_list = messages_on_file
 
         if chat_list is None:
             return chat_stats
 
         def Update_Postfix_Messages():
-            return f"New Messages: {chat_stats.new_messages} | Existing Messages: {chat_stats.existing_messages} | New Users: {chat_stats.new_user_ids} | Existing Users: {len(chat_stats.exist_user_ids)}"
+            return f"New Messages: {chat_stats.new_messages:,} | Existing Messages: {chat_stats.existing_messages:,} | New Users: {len(chat_stats.new_user_ids):,} | Existing Users: {len(chat_stats.exist_user_ids - chat_stats.new_user_ids):,}"
 
-        with LOG.TQDM_Logging():
-            with tqdm(desc='Messages Processed',bar_format='{desc}: {n_fmt} || {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=1, leave=False) as messbar:
-                try:
-                    unique_user_ids = set()
-                    # Process all chats collected by Chat_Downloader
-                    for message in chat_list:
-                        chat_stats.total_messages += 1
-                        try:
-                            msg = MessageClass(message,v)
+        # record_message_stats() calls are buffered here instead of being executed immediately,
+        # and flushed (sorted by user_id) right before every commit -- see _flush_pending_stats().
+        pending_stats:list[tuple] = []
+        # The stream's week bit for user_channel_activity.active_weeks ("regulars"): the stream's start
+        # week, not each message's time, so the bot and build_audience_baseline.py's rebuild (from
+        # video_user_seen x videos) always agree. See modules/AudienceDeltas.week_index.
+        stream_week = AD.week_index(video.actual_start or video.publish_date)
 
-                            #----------------------#
-                            #-- USER ID DATABASE --#
-                            #----------------------#
+        def _flush_pending_stats():
+            # Sorting before executing means every commit's worth of record_message_stats calls
+            # locks user_first_message/user_channel_activity rows in the same ascending
+            # user_id order, no matter which video or worker thread is running them. Two
+            # transactions can then never hold those row locks in opposite relative order, which
+            # is what a deadlock cycle requires -- see the "deadlock detected ...
+            # user_first_message" incidents this replaced (processing messages in chronological
+            # arrival order let two videos that share chatters lock overlapping users in
+            # whatever order each happened to encounter them, which could cross).
+            #
+            # Sent as one batched call, not one call per row -- see RecordMessageStatsBatch's
+            # docstring. A worker blocked on a contended user was waiting through up to 500
+            # sequential round trips to a remote DB host before the lock-holder's batch
+            # committed (multiple seconds of real stall, observed directly); one call removes
+            # nearly all of that round-trip latency from the wait.
+            pending_stats.sort(key=lambda s: s[2])
+            results = DB.RecordMessageStatsBatch(_db.cursor, pending_stats)
+            # Pre-generated audience stats: stage what this batch changed, in the same
+            # transaction, so the rollups stay exact without rescanning user_channel_activity
+            # (see modules/AudienceDeltas.py and sql/audience_rollups.sql).
+            DB.StageAudienceDeltas(_db.cursor, AD.batch_deltas(pending_stats, results, AD.TOP_THRESHOLDS))
+            pending_stats.clear()
 
-                            # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
-                            if len(DB.GetEntries(self.db.cursor,"user_ids",filter={"id":msg.usr_id})) == 0:
-                                DB.InsertEntries(self.db.cursor,"user_ids",[{"id":msg.usr_id}])
-                                self.db.database.commit()
-                                chat_stats.new_user_ids += 1
-                                unique_user_ids.add(msg.usr_id)
-                            else:
-                                unique_user_ids.add(msg.usr_id)
-                                chat_stats.exist_user_ids.add(msg.usr_id)
+        with ST.Bar(desc='Messages Processed',bar_format='{desc}: {n_fmt} {postfix}',ncols=80, postfix=Update_Postfix_Messages() ,position=bar_position, leave=False) as messbar:
+            try:
+                unique_user_ids = set()
+                uncommitted = 0
+                # Process all chats collected by Chat_Downloader
+                for message in chat_list:
+                    chat_stats.total_messages += 1
+                    try:
+                        msg = MessageClass(message,v)
 
-                            #--------------------#
-                            #-- EMOTE DATABASE --#
-                            #--------------------#
+                        #----------------------#
+                        #-- USER ID DATABASE --#
+                        #----------------------#
 
-                            # Add Unique Emotes if they don't already exist in DB
-                            if len(msg.e_emote_entries) > 0:
-                                DB.InsertEntries(self.db.cursor,"emotes",msg.e_emote_entries,"id")
+                        # Add Unique UserIDs if they don't already exist in DB (User's names may change over time, but not the UniqueID)
+                        # The user row must be committed before it goes into known_user_ids: another thread that sees
+                        # the user in the set inserts messages referencing it straight away, and would fail the FK
+                        # check if the row weren't visible yet. It's inserted on _db's autocommit side connection so
+                        # that doesn't mean committing this thread's in-progress 500-message batch (which used to cost
+                        # a disk flush per new chatter, inside the lock every worker shares). ON CONFLICT covers two
+                        # threads racing to insert the same user; the lock only decides which one counts it as new.
+                        # If this batch later rolls back, the user row stays -- harmless, it's a real user that user
+                        # processing picks up like any other.
+                        _is_new_user = False
+                        if msg.usr_id not in known_user_ids:
+                            DB.InsertEntries(_db.side_cursor,CFG.DB_TABLES["user_ids"],[{"id":msg.usr_id}],"id")
+                            with _lock:
+                                _is_new_user = msg.usr_id not in known_user_ids
+                                known_user_ids.add(msg.usr_id)
+                        if _is_new_user:
+                            chat_stats.new_user_ids.add(msg.usr_id)
+                            unique_user_ids.add(msg.usr_id)
+                        else:
+                            unique_user_ids.add(msg.usr_id)
+                            chat_stats.exist_user_ids.add(msg.usr_id)
 
-                            #----------------------#
-                            #-- MESSAGE DATABASE --#
-                            #----------------------#
+                        #--------------------#
+                        #-- EMOTE DATABASE --#
+                        #--------------------#
 
-                            # Add message to DB if it doesn't already exist
-                            if len(DB.GetEntries(self.db.cursor,"messages",filter={"message_id":msg.id})) == 0:
-                                DB.InsertEntries(self.db.cursor,"messages",[msg.entry])
-                                self.db.database.commit()
+                        # Add Unique Emotes if they don't already exist in DB. Checked against a
+                        # shared known_emote_ids cache (loaded once per channel -- see Main.py)
+                        # instead of relying solely on ON CONFLICT DO NOTHING, since every video's
+                        # worker thread otherwise re-inserts the channel's whole recurring emote
+                        # set on every message: two threads' uncommitted transactions doing that
+                        # concurrently can lock overlapping emote rows in a different relative
+                        # order and deadlock (see the "deadlock detected ... emotes" incident).
+                        # Skipping already-known emotes here removes nearly all of that traffic;
+                        # the lock serializes the rare genuinely-new-emote case so two threads
+                        # can't race to insert the same brand-new emote at once, and
+                        # InsertEntriesRetryOnDeadlock is a backstop for any residual race.
+                        if len(msg.e_emote_entries) > 0:
+                            emote_conflict = "channel_id,id" if CFG.GET_MEMBERS_CHAT is False else "id"
+                            with _lock:
+                                new_emotes = [e for e in msg.e_emote_entries if e["id"] not in _emote_ids]
+                                for e in new_emotes:
+                                    _emote_ids.add(e["id"])
+                                if new_emotes:
+                                    DB.InsertEntriesRetryOnDeadlock(_db.cursor,CFG.DB_TABLES["emotes"],new_emotes,emote_conflict)
 
-                                #-----------------------#
-                                #-- NICKNAME DATABASE --#
-                                #-----------------------#
+                        #----------------------#
+                        #-- MESSAGE DATABASE --#
+                        #----------------------#
 
-                                # Get all the nicknames to search for
-                                nickname_entries = DB.GetEntries(self.db.cursor,"nicknames","nickname")
-                                nicknames:list[str] = []
-                                for nick_entry in nickname_entries:
-                                    for key in nick_entry.keys():
-                                        nicknames.append(key)
-                                sorted_nicknames = sorted(nicknames, key=len, reverse=True)
+                        # Add message to DB if it doesn't already exist
+                        if msg.id not in known_message_ids:
+                            DB.InsertEntries(cursor=_db.cursor,table=CFG.DB_TABLES["messages"],data_list=[msg.entry])
+                            known_message_ids.add(msg.id)
 
-                                entries = []
-                                used_positions = set()
+                            # Keep video_message_stats and user_channel_activity up to date incrementally
+                            # rather than recomputing them later over the whole (200M+ row) messages table.
+                            # Buffered, not called immediately -- see _flush_pending_stats().
+                            pending_stats.append((
+                                CFG.YT_USER_ID,
+                                msg.video_id,
+                                msg.usr_id,
+                                msg.entry["timestamp"],
+                                msg.entry["user_member_status"] is not None and msg.entry["user_member_status"] > -1,
+                                msg.entry["user_member_status"],
+                                msg.id,
+                                len(msg.e_emote_entries),
+                                msg.entry["ismoderator"],
+                                msg.entry["isverified"],
+                                msg.entry["isowner"],
+                                msg.entry["amount"],
+                                msg.entry["currency"],
+                                stream_week,
+                            ))
 
-                                #-------------------------------#
-                                #-- NICKNAME MATCHES DATABASE --#
-                                #-------------------------------#
+                            entries = []
+                            used_positions = set()
 
-                                # Only look for nicknames if there are any to look for in the database
-                                if len(sorted_nicknames) > 0:
-                                    for nick in sorted_nicknames:
-                                        search_pattern = r'\b' + re.escape(nick) + r'\b'
-                                        if msg.message is not None:
-                                            for match in re.finditer(pattern=search_pattern, string=msg.message, flags=re.IGNORECASE):
-                                                start, end = match.span()
-                                                if not any(pos in used_positions for pos in range(start, end)):
-                                                    entry = {
-                                                        "message_id":msg.id,
-                                                        "matched_nickname":nick,
-                                                        "index_start":start,
-                                                        "index_end":end
-                                                    }
-                                                    used_positions.update(range(start, end))
-                                                    entries.append(entry)
-                                    
-                                    DB.InsertEntries(self.db.cursor,"nickname_matches",entries,"message_id,index_start,index_end")
-                                    self.db.database.commit()
+                            #-------------------------------#
+                            #-- NICKNAME MATCHES DATABASE --#
+                            #-------------------------------#
 
-                                chat_stats.new_messages += 1
-                                messbar.set_postfix_str(Update_Postfix_Messages())
-                                messbar.update(1)
-                            else:
-                                chat_stats.existing_messages += 1
-                                messbar.set_postfix_str(Update_Postfix_Messages())
-                                messbar.update(1)
+                            # Only look for nicknames if there are any to look for in the database
+                            if len(sorted_nicknames) > 0:
+                                for nick in sorted_nicknames:
+                                    search_pattern = r'\b' + re.escape(nick) + r'\b'
+                                    if msg.message is not None:
+                                        for match in re.finditer(pattern=search_pattern, string=msg.message, flags=re.IGNORECASE):
+                                            start, end = match.span()
+                                            if not any(pos in used_positions for pos in range(start, end)):
+                                                entry = {
+                                                    "message_id":msg.id,
+                                                    "matched_nickname":nick,
+                                                    "index_start":start,
+                                                    "index_end":end
+                                                }
+                                                if CFG.GET_MEMBERS_CHAT is False:
+                                                    entry["channel_id"] = CFG.YT_USER_ID
+                                                used_positions.update(range(start, end))
+                                                entries.append(entry)
 
-                            message_list.append(message)
-                        except Exception as e:
+                                nickname_match_conflict = "channel_id,message_id,index_start,index_end" if CFG.GET_MEMBERS_CHAT is False else "message_id,index_start,index_end"
+                                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["nickname_matches"],entries,nickname_match_conflict)
+
+                            chat_stats.new_messages += 1
+                            messbar.set_postfix_str(Update_Postfix_Messages())
                             messbar.update(1)
-                            raise e
-                except Exception as r:
-                    _WriteFile() # If it crashes, at least we get some of the messages to file so we can debug.
-                    raise r
+                        else:
+                            chat_stats.existing_messages += 1
+                            messbar.set_postfix_str(Update_Postfix_Messages())
+                            messbar.update(1)
 
-                _WriteFile()
+                        message_list.append(message)
+
+                        uncommitted += 1
+                        if uncommitted >= 500:
+                            _flush_pending_stats()
+                            _db.database.commit()
+                            uncommitted = 0
+
+                    except Exception as e:
+                        messbar.update(1)
+                        raise e
+
+            except Exception as r:
+                # The failing statement aborts the whole transaction, including any earlier
+                # uncommitted inserts in this batch -- they can't be salvaged by committing,
+                # only rolled back. Must roll back (not commit) so the connection -- reused
+                # for the next video on this worker thread -- isn't left in an aborted state.
+                # pending_stats is discarded, not flushed -- those calls were never sent to the
+                # DB, and the batch they belong to is being rolled back anyway.
+                pending_stats.clear()
+                _db.database.rollback()
+                _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
+                raise r
+
+            if uncommitted > 0:
+                _flush_pending_stats()
+                _db.database.commit()
+            _WriteFile(message_object,existing_messages_local,messages_on_file,message_list)
 
         return chat_stats
 
-    def Get_User_Batch(self,users:list[str]):
+    def Get_Subtitles(self,video_id:str,bucket:H3Bucket,db=None,rate_limiter:'AdaptiveRateLimiter|None'=None,bar_position:int=1) -> SubtitleStats:
+        """
+        Downloads YouTube's auto-generated (ASR) subtitles for a video via yt-dlp, parses them
+        into cues, uploads the parsed cue list to S3 as subtitles/{id}.json (same
+        whole-file-replace/versioning behavior as details/{id}.json via _check_and_upload_file),
+        and writes one row per cue into CFG.DB_TABLES["subtitles"].
+
+        Retries on failures that look like YouTube throttling (see _is_throttled), with
+        exponential backoff (CFG.SUBTITLE_BACKOFF_BASE ** attempt). Any other failure (no
+        captions available, video unavailable, etc.) is not retried -- it just means this
+        video/language has no subtitles to store.
+
+        :param video_id: ID of the video to fetch subtitles for.
+        :param bucket: The channel's S3 bucket.
+        :type bucket: H3Bucket
+        :param db: Database connection to use for the insert. Falls back to self.db.
+        :param rate_limiter: Shared AdaptiveRateLimiter to pace requests against and report
+            throttles/successes to. If omitted, no inter-request pacing happens here -- the
+            caller is responsible for spacing calls out itself.
+        :param bar_position: This worker's tqdm bar slot, used to show what stage (rate-limit
+            wait vs. active download) is currently blocking this thread.
+        :return: Stats about what happened for this video.
+        :rtype: SubtitleStats
+        """
+        stats = SubtitleStats()
+        _db = db if db is not None else self.db
+
+        subtitle_object = f"{CFG.SUBTITLE_TAG}/{video_id}.json"
+        object_exists = bucket.check_object_exists(subtitle_object)
+        if isinstance(object_exists,ClientError):
+            raise object_exists
+        if object_exists is True:
+            return stats
+
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        all_cues:list[dict[str,Any]] = []
+        source_language_saved = False
+
+        for lang in CFG.SUBTITLE_LANGUAGES:
+            info:dict[str,Any]|None = None
+            temp_dir = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}"
+            current_delay = rate_limiter.current if rate_limiter is not None else CFG.SUBTITLE_REQUEST_DELAY
+            jitter_ceiling = current_delay * (1 + CFG.SUBTITLE_REQUEST_JITTER)
+            ydl_opts:dict[str,Any] = {
+                "writeautomaticsub": True,
+                "subtitleslangs": [lang],
+                "subtitlesformat": "vtt",
+                "skip_download": True,
+                "quiet": True,
+                "no_warnings": True,
+                "noprogress": True,
+                "logger": _YtdlpSilentLogger(),
+                "outtmpl": f"{temp_dir}/%(id)s_TEMP.%(ext)s",
+                "sleep_interval_subtitles": random.uniform(current_delay,jitter_ceiling),
+                "sleep_interval_requests": random.uniform(current_delay,jitter_ceiling),
+                "extractor_retries": CFG.SUBTITLE_MAX_ATTEMPTS,
+                "cookiefile": CFG.COOKIES,
+                "impersonate": _SUBTITLE_IMPERSONATE_TARGET,
+            }
+
+            vtt_path = f"{temp_dir}/{video_id}_TEMP.{lang}.vtt"
+
+            with Stage_Bar(f"Subtitles ({lang}): starting",bar_position) as sub_bar:
+                for attempt in range(1,CFG.SUBTITLE_MAX_ATTEMPTS + 1):
+                    if rate_limiter is not None:
+                        sub_bar.set_description_str(f"Subtitles ({lang}): rate-limit wait (~{rate_limiter.current:.1f}s)")
+                        rate_limiter.wait()
+                    try:
+                        sub_bar.set_description_str(f"Subtitles ({lang}): downloading (delay ~{current_delay:.1f}s)")
+                        ydl = yt_dlp.YoutubeDL(ydl_opts) #type:ignore
+                        info = ydl.extract_info(url,download=True)
+                        if rate_limiter is not None and attempt == 1:
+                            rate_limiter.report_success()
+                        break
+                    except DownloadError as e:
+                        if _is_age_restricted(e):
+                            # Permanent for this video -- skip immediately rather than burning
+                            # through the throttle retry/backoff loop for something that will
+                            # never succeed no matter how many times it's attempted.
+                            LOG.logger.info(f"{video_id}: Age-restricted, skipping.")
+                            stats.no_captions += 1
+                            vtt_path = None
+                            break
+                        elif _is_throttled(e):
+                            if rate_limiter is not None:
+                                rate_limiter.report_throttled()
+                            if attempt == CFG.SUBTITLE_MAX_ATTEMPTS:
+                                stats.throttled += 1
+                                raise SubtitleThrottled(f"{video_id}: Subtitle download throttled after {attempt} attempt(s): {e}")
+                            wait = CFG.SUBTITLE_BACKOFF_BASE ** attempt
+                            LOG.logger.warning(f"{video_id}: Subtitle download throttled, retrying in {wait}s (attempt {attempt}/{CFG.SUBTITLE_MAX_ATTEMPTS}): {e}")
+                            sub_bar.set_description_str(f"Subtitles ({lang}): throttled, retrying in {wait:.0f}s")
+                            time.sleep(wait)
+                            continue
+                        else:
+                            # Not a throttle signature -- treat as "no captions available" for this
+                            # video/language rather than retrying.
+                            stats.no_captions += 1
+                            vtt_path = None
+                            break
+
+            if vtt_path is None or not os.path.isfile(vtt_path):
+                stats.no_captions += 1
+                continue
+
+            # Every track is made from the same one-language transcript, so the first track
+            # downloaded tells us the video's language.
+            if not source_language_saved:
+                source_language = _caption_source_language(info,lang)
+                if source_language is not None:
+                    DB.UpdateEntry(_db.cursor,CFG.DB_TABLES["videos"],"caption_source_language",source_language,"id",video_id)
+                    source_language_saved = True
+
+            cues = _parse_vtt_cues(vtt_path)
+            os.remove(vtt_path)
+
+            for cue in cues:
+                cue["video_id"] = video_id
+                cue["language"] = lang
+                if CFG.GET_MEMBERS_CHAT is False:
+                    cue["channel_id"] = CFG.YT_USER_ID
+            all_cues.extend(cues)
+
+            DB.DeleteEntries(_db.cursor,CFG.DB_TABLES["subtitles"],{"video_id":video_id,"language":lang})
+            if cues:
+                DB.InsertEntries(_db.cursor,CFG.DB_TABLES["subtitles"],cues)
+                total_words = sum(len(cue["text"].split()) for cue in cues)
+                speech_duration_ms = sum(cue["end_ms"] - cue["start_ms"] for cue in cues)
+                DB.RecordSubtitleStats(_db.cursor,video_id,CFG.YT_USER_ID,lang,len(cues),total_words,speech_duration_ms)
+
+        if not all_cues:
+            return stats
+
+        temp_path = f"{bucket.local_root}/{CFG.SUBTITLE_TAG}/{video_id}_TEMP.json"
+        with open(temp_path,'w') as file:
+            file.write(json.dumps(all_cues,indent=4))
+
+        _check_and_upload_file(bucket,temp_path,video_id,"json",CFG.SUBTITLE_TAG)
+
+        stats.fetched += 1
+        return stats
+
+    def Get_User_Batch(self,users:list[str],bucket:H3Bucket):
         """Gets data about all users in the list of users. Will keep track of invalid users.
-        
+
         NOTE: the Youtube API call will only return 50 at most, break lists up into chunks of 50.
 
         :param users: List of 50 or less users
@@ -746,145 +1456,98 @@ class YT_API:
         #-- GET USER DATA --#
         #-------------------#
 
+        # One API call per batch of 50 — rate unchanged vs. the original sequential loop.
         request = self.api.channels().list(part="id,snippet,statistics,status,brandingSettings",id=users)
-        response = request.execute()
-        if "items" in response:
-            user_list = response["items"]
-        else:
-            user_list = []
-        valid_ids = set()
+        response = _execute_with_retry(request)
+        user_list:list[dict] = response.get("items",[])
 
-        try:
-            for user in user_list:
-                
-                del user["kind"]
-                del user["etag"]
+        # IDs returned by the API (present but perhaps file-processing failed)
+        # vs. IDs the API didn't return at all (banned / deleted accounts).
+        api_returned_ids:set = {u.get("id") for u in user_list if u.get("id")}
+        valid_ids:set = set()  # successfully processed
 
-                u = UserClass(user)
+        def _process_user_files(user:dict) -> 'UserClass|None':
+            """Handles all file I/O for one user: JSON write, S3 upload, PFP download + upload.
+            Returns the UserClass on success, None if the user has no id."""
+            del user["kind"]
+            del user["etag"]
+            u = UserClass(user)
+            if u.id is None:
+                return None
 
-                #-----------------------------#
-                #-- WRITE USER DATA TO DISK --#
-                #-----------------------------#
+            #-----------------------------#
+            #-- WRITE USER DATA TO DISK --#
+            #-----------------------------#
 
-                temp_path = f"{CFG.DATA_PATH}/users/{u.id}_TEMP.json"
+            temp_path = f"{bucket.local_root}/{CFG.USER_DETAIL_TAG}/{u.id}_TEMP.json"
+            with open(temp_path,'w') as file:
+                file.write(json.dumps(user,indent=4))
+            _check_and_upload_file(bucket,temp_path,u.id,"json",CFG.USER_DETAIL_TAG)
 
-                # Write user data to file
-                with open(temp_path,'w') as file:
-                    file.write(json.dumps(user,indent=4))
+            #------------------------------#
+            #-- PROFILE PICTURE DOWNLOAD --#
+            #------------------------------#
 
-                # Hash the user data
-                with open(temp_path,"rb") as image:
-                    new_hash = xxhash.xxh128_hexdigest(image.read())
+            if u.pfp is not None:
+                temp_pfp = f"{bucket.local_root}/{CFG.PFP_TAG}/{u.id}_TEMP.jpg"
+                with open(temp_pfp,'wb') as handle:
+                    img_response = requests.get(u.pfp,stream=True)
+                    if not img_response.ok:
+                        LOG.logger.warning(f"PFP download failed for {u.id}: HTTP {img_response.status_code}")
+                    for block in img_response.iter_content(1024):
+                        if not block:
+                            break
+                        handle.write(block)
+                _check_and_upload_file(bucket,temp_pfp,u.id,"jpg",CFG.PFP_TAG)
 
-                data_hashes = set()
-                user_path = f"{CFG.DATA_PATH}/users/{u.id}.json"
+            return u
 
-                # Check if user data already exists
-                if os.path.isfile(user_path):
-                    # Hash the file and store it for cross referencing
-                    with open(user_path,"rb") as data:
-                        data_hashes.add(xxhash.xxh128_hexdigest(data.read()))
-                    # Create a new filename
-                    number = 1
-                    new_path = f"{CFG.DATA_PATH}/users/{u.id}_{number}.json"
+        # Parallelize per-user file I/O within the batch (PFP downloads + S3 uploads).
+        # The API call above is already complete — no extra API concurrency is added.
+        completed_users:list = []
+        with ThreadPoolExecutor(max_workers=CFG.USER_WORKER_COUNT) as pool:
+            futures = {pool.submit(_process_user_files,user): user.get("id") for user in user_list}
+            for future in as_completed(futures):
+                uid = futures[future]
+                try:
+                    u = future.result()
+                    if u is not None:
+                        completed_users.append(u)
+                        valid_ids.add(u.id)
+                except Exception as e:
+                    LOG.logger.error(f"Error processing user {uid}: {e}")
+                    invalid += 1
 
-                    # Increment until no overlapping name
-                    while os.path.isfile(new_path):
-                        # Hash the file and store it for cross referencing
-                        with open(new_path,"rb") as image:
-                            data_hashes.add(xxhash.xxh128_hexdigest(image.read()))
+        #------------------------------#
+        #-- USER DATABASE OPERATIONS --#
+        #------------------------------#
 
-                        number += 1
-                        new_path = f"{CFG.DATA_PATH}/users/{u.id}_{number}.json"
-                    # Delete it if it already matches another one
-                    if new_hash in data_hashes:
-                        os.remove(temp_path)
-                    else:
-                        os.rename(user_path,new_path)
-                        os.rename(temp_path,user_path)
-                else:
-                    os.rename(temp_path,user_path)
+        # Write all successful users, then all invalid users, with a single commit per batch.
+        for u in completed_users:
+            DB.UpdateEntries(self.db.cursor,CFG.DB_TABLES["user_ids"],{**u.entry,"processed":True},"id",u.id)
 
-                #------------------------------#
-                #-- PROFILE PICTURE DOWNLOAD --#
-                #------------------------------#
-
-                if u.pfp is not None:
-                    temp_pfp = f"{CFG.DATA_PATH}/users/{u.id}_pfp_TEMP.jpg"
-
-                    # Download a fresh pfp
-                    with open(temp_pfp,'wb') as handle:
-                        img_response = requests.get(u.pfp,stream=True)
-                        if not img_response.ok:
-                            LOG.logger.info(img_response)
-                        for block in img_response.iter_content(1024):
-                            if not block:
-                                break
-                            handle.write(block)
-                    # Hash the fresh profile picture
-                    with open(temp_pfp,"rb") as image:
-                        new_hash = xxhash.xxh128_hexdigest(image.read())
-
-                    # Check for previously downloaded profile picture
-                    pfp_hashes = set()
-                    pfp_path = f"{CFG.DATA_PATH}/users/{u.id}_pfp.jpg"
-
-                    # Check if a profile picture already exists
-                    if os.path.isfile(pfp_path):
-
-                        # Hash the file and store it for cross referencing
-                        with open(pfp_path,"rb") as image:
-                            pfp_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                        # Create a new filename
-                        number = 1
-                        new_path = f"{CFG.DATA_PATH}/users/{u.id}_pfp_{number}.jpg"
-
-                        # Increment until no overlapping name
-                        while os.path.isfile(new_path):
-                            # Hash the file and store it for cross referencing
-                            with open(new_path,"rb") as image:
-                                pfp_hashes.add(xxhash.xxh128_hexdigest(image.read()))
-
-                            number += 1
-                            new_path = f"{CFG.DATA_PATH}/users/{u.id}_pfp_{number}.jpg"
-
-                        # Delete it if it already matches another one
-                        if new_hash in pfp_hashes:
-                            os.remove(temp_pfp)
-                        else:
-                            os.rename(pfp_path,new_path)
-                            os.rename(temp_pfp,pfp_path)
-                    else:
-                        os.rename(temp_pfp,pfp_path)
-
-                #------------------------------#
-                #-- USER DATABASE OPERATIONS --#
-                #------------------------------#
-
-                # Update the unprocessed User_ID with additional information
-                for column, value in u.entry.items():
-                    DB.UpdateEntry(self.db.cursor,"user_ids",column,value,"id",u.id)
-                    self.db.database.commit()
-
-                DB.UpdateEntry(self.db.cursor,"user_ids","processed",True,"id",u.id)
-                self.db.database.commit()
-
-                valid_ids.add(u.id)
-        except:
-            invalid += 1
-        
-        all_users = users
-
-        for user in all_users:
-            if user not in valid_ids:
-                DB.UpdateEntry(self.db.cursor,"user_ids","exists",False,"id",user)
-                DB.UpdateEntry(self.db.cursor,"user_ids","processed",True,"id",user)
-                self.db.database.commit()
+        for user in users:
+            if user not in api_returned_ids:
+                # Not in the API response at all — banned or deleted account.
+                DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"exists",False,"id",user)
+                DB.UpdateEntry(self.db.cursor,CFG.DB_TABLES["user_ids"],"processed",True,"id",user)
                 invalid += 1
-        
+
+        self.db.database.commit()
+
         return invalid
 
+########################
+### HELPER FUNCTIONS ###
+########################
+
+def _strip_nul(value:str|None) -> str|None:
+    """Postgres text columns can't store NUL (0x00) bytes -- psycopg2 raises ValueError on them.
+    Some YouTube channel names/custom URLs and chat messages contain literal NULs (seen in troll/spam
+    accounts and the odd superchat), so strip them before the value ever reaches a query."""
+    if value is None:
+        return None
+    return value.replace("\x00","")
 
 def _get_date_time(timestamp:str):
     """Some timestamp strings in the API include fractions of a second."""
@@ -892,7 +1555,7 @@ def _get_date_time(timestamp:str):
     match = re.match(pattern, timestamp)
     if not match:
         raise ValueError(f"Invalid datetime format: {timestamp}")
-    
+
     base = match.group(1)
     microseconds = match.group(2)
 
@@ -902,3 +1565,183 @@ def _get_date_time(timestamp:str):
     else:
         formatted_string = f"{base}.000000"
     return datetime.strptime(formatted_string, "%Y-%m-%dT%H:%M:%S.%f")
+
+_ISO_DURATION_PATTERN = re.compile(r'^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$')
+
+def _parse_iso_duration(value:str|None) -> int|None:
+    """
+    contentDetails.duration (ISO 8601, e.g. "PT1H2M3S", "P1DT2H") -> whole seconds. YouTube reports
+    "P0D" for a livestream that's upcoming or still live, which is returned as None rather than 0 --
+    the real length isn't known yet, and 0 would silently drag down any averages/sums over it.
+    """
+    if not value:
+        return None
+    match = _ISO_DURATION_PATTERN.match(value)
+    if not match:
+        LOG.logger.warning(f"Unrecognized ISO 8601 duration: {value}")
+        return None
+    days,hours,minutes,seconds = (int(g) if g else 0 for g in match.groups())
+    total = days * 86400 + hours * 3600 + minutes * 60 + seconds
+    return total if total > 0 else None
+
+def _check_is_short(video_id:str) -> bool|None:
+    """
+    The Data API has no "is this a Short" flag, so this asks youtube.com directly:
+    /shorts/{id} answers 200 for a Short, and redirects (303) to /watch?v={id} for anything else.
+    Returns None when the answer is inconclusive (network error, consent-page redirect, removed
+    video, etc.) so callers can leave video_type unset and retry later instead of guessing.
+    """
+    try:
+        response = requests.head(f"https://www.youtube.com/shorts/{video_id}",allow_redirects=False,timeout=10)
+    except requests.RequestException as e:
+        LOG.logger.warning(f"{video_id}: Shorts check failed: {e}")
+        return None
+    if response.status_code == 200:
+        return True
+    if response.is_redirect and "/watch" in response.headers.get("Location",""):
+        return False
+    LOG.logger.warning(f"{video_id}: Shorts check inconclusive (HTTP {response.status_code}, Location: {response.headers.get('Location')})")
+    return None
+
+def Classify_Video(video:dict[str,Any]) -> tuple[str|None,int|None]:
+    """
+    Works out a video's videos.video_type and videos.content_duration from its raw videos().list
+    item (needs the contentDetails, snippet and liveStreamingDetails parts). Used by VideoClass.
+
+    video_type is one of:
+        'stream' -- has liveStreamingDetails (a livestream, upcoming/live/archived). Premieres
+                    also carry liveStreamingDetails and are deliberately counted as streams --
+                    they can only be told apart while upcoming/live, which would need much
+                    more frequent polling of new uploads than this bot does.
+        'short'/'upload' -- no liveStreamingDetails, split by _check_is_short()
+        None     -- not a stream, and the Shorts check was inconclusive
+
+    :return: (video_type, content_duration in seconds or None)
+    """
+    content_details:dict[str,Any] = video.get("contentDetails") or {}
+    content_duration = _parse_iso_duration(content_details.get("duration"))
+
+    if video.get("liveStreamingDetails") is not None:
+        return "stream",content_duration
+
+    is_short = _check_is_short(video["id"])
+    if is_short is None:
+        return None,content_duration
+    return ("short" if is_short else "upload"),content_duration
+
+def _check_and_upload_file(bucket:H3Bucket,temp_path:str,file_name:str,file_extension:str,file_tag:str|None=None):
+
+    def _build_paths(basepath:str|None=None,counter:str|int|None=None):
+        if counter:
+            full_name = f"{file_name}_{counter}.{file_extension}"
+        else:
+            full_name = f"{file_name}.{file_extension}"
+
+        if file_tag:
+            key_name = f"{file_tag}/{full_name}"
+        else:
+            key_name = f"{full_name}"
+
+        if basepath:
+            local_path = f"{basepath}/{key_name}"
+        else:
+            local_path = f"{key_name}"
+        return key_name,local_path
+
+    # Hash the fresh file
+    with open(temp_path,"rb") as image:
+        new_hash = xxhash.xxh128_hexdigest(image.read())
+
+    #------------------------------#
+    #-- CHECK FOR EXISTING FILES --#
+    #------------------------------#
+
+    hash_set:set[str] = set()
+    file_list:list[str] = []
+    file_key,file_path = _build_paths(bucket.local_root)
+
+    try:
+        # See if file already exists
+        object_exists = bucket.check_object_exists(file_key)
+        if isinstance(object_exists,ClientError):
+            raise object_exists
+
+            #-----------------------------------------------#
+            #-- UPLOAD NEWEST FILE: WHEN FILE DON'T EXIST --#
+            #-----------------------------------------------#
+
+        elif object_exists is False:
+            os.replace(temp_path,file_path)
+            file_list.append(file_path)
+            file_uploaded = bucket.upload_object(file_path,file_key)
+            if isinstance(file_uploaded,ClientError):
+                raise file_uploaded
+            status = "New"
+
+            #----------------------------#
+            #-- GET ALL EXISTING FILES --#
+            #----------------------------#
+
+        else:
+            # Attempt to download existing file
+            file_downloaded = bucket.download_object(file_key,file_path)
+            if isinstance(file_downloaded,ClientError):
+                raise file_downloaded
+            # Hash the file and store it for cross referencing
+            with open(file_path,"rb") as image:
+                hash_set.add(xxhash.xxh128_hexdigest(image.read()))
+            # Add path to list for deletion later
+            file_list.append(file_path)
+
+            counter = 1
+            next_name,next_path = _build_paths(bucket.local_root,counter)
+
+            # Loop and download files until the next_path doesn't exist
+            next_file_exists = bucket.check_object_exists(next_path)
+            if isinstance(next_file_exists,ClientError):
+                raise next_file_exists
+            while next_file_exists is True:
+                file_downloaded = bucket.download_object(next_name,next_path)
+                if isinstance(file_downloaded,ClientError):
+                    raise file_downloaded
+                # Hash the file and store it for cross referencing
+                with open(next_path,"rb") as image:
+                    hash_set.add(xxhash.xxh128_hexdigest(image.read()))
+                # Add path to list for deletion later
+                file_list.append(next_path)
+
+                counter += 1
+                next_name,next_path = _build_paths(bucket.local_root,counter)
+                next_file_exists = bucket.check_object_exists(next_path)
+                if isinstance(next_file_exists,ClientError):
+                    raise next_file_exists
+
+            #-------------------------------------------------#
+            #-- UPLOAD NEWEST FILE: WHEN FILE ALREADY EXIST --#
+            #-------------------------------------------------#
+
+            # If the new file doesn't match any existing ones:
+            # Rename the last exiting file, upload it, replace it with the new one
+            if new_hash not in hash_set:
+                os.replace(file_path,next_path)
+                file_list.append(next_path)
+                file_uploaded = bucket.upload_object(next_path,next_name)
+                if isinstance(file_uploaded,ClientError):
+                    raise file_uploaded
+                os.replace(temp_path,file_path)
+                file_uploaded = bucket.upload_object(file_path,file_key)
+                if isinstance(file_uploaded,ClientError):
+                    raise file_uploaded
+                status = "Update"
+            else:
+                status = "Existing"
+
+            # Cleanup local files
+            if len(file_list) > 0:
+                for file in file_list:
+                    if os.path.isfile(file):
+                        os.remove(file)
+    except ClientError as e:
+        LOG.logger.error(f"Error processing file for {file_name}:\n{e}")
+        status = "ERROR"
+    return status

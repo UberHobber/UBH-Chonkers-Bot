@@ -1,0 +1,76 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- Auto-generated (ASR) caption cues for public videos, one row per cue. Parsed
+-- from the WebVTT file yt-dlp writes for a video's automatic_captions -- see
+-- YT_API.Get_Subtitles in modules/Classes.py. WebVTT (not YouTube's undocumented
+-- json3 format) was chosen specifically for long-term stability -- it's a W3C
+-- standard and yt-dlp's most mature extraction path for YouTube captions.
+-- Unpartitioned (unlike messages): cue volume per video (a few thousand for a
+-- long VOD) is orders of magnitude below chat's 1B+ message scale, so a single
+-- indexed table is sufficient -- channel_id is still present so this could be
+-- partitioned later without a schema change if that assumption ever proves wrong.
+-- Members-only subtitle data mirrors the messages_<talent>_members split (own
+-- flat per-talent tables, no channel_id) rather than a channel_directory-style
+-- unified table + boolean column, to stay consistent with how messages/emotes
+-- already separate members-only data.
+
+-- public.subtitles definition
+
+-- idx_subtitles_text_fts and idx_subtitles_text_trgm exist for this table's primary
+-- use case: searching cue text for words a specific talent said (filtered by channel_id,
+-- which is already indexed for free as the PK's leading column). fts is a GIN index over
+-- to_tsvector('simple', text) for exact whole-word/phrase search (query with
+-- to_tsvector('simple', text) @@ plainto_tsquery('simple', 'word') -- the query must match
+-- the indexed expression exactly to use the index); 'simple' rather than 'english' is
+-- deliberate, since stemming would match word forms that weren't actually said. trgm is a
+-- GIN pg_trgm index over the raw text for fuzzy/partial search (ILIKE '%word%', or
+-- similarity via text % 'word') -- useful since YouTube's ASR frequently mishears names/
+-- words. Both are expression/plain-column indexes rather than a stored generated tsvector
+-- column -- measured against a live sample, a stored column would have added ~2.9GB of
+-- heap bloat across the full table for no query-time benefit over just recomputing
+-- to_tsvector(text) at search time. Built CONCURRENTLY against the live table (~5GB then,
+-- no separate migration step needed since Get_Subtitles never runs DDL).
+--
+-- As of 2026-10-25: ~16GB with indexes, 54M cues over ~26k videos, EN and ID only
+-- (CFG.SUBTITLE_LANGUAGES = ["en"]; JP/Stars channels have none). About 0.23GB per 1,000
+-- subtitled stream hours (16.7GB / ~72k hours).
+--
+-- ENGLISH BY DESIGN (decided 2026-10-25): every video's subtitles are English, so they can
+-- all be searched in English. For a video YouTube transcribed in another language, the 'en'
+-- rows are YouTube's machine translation, not what was said: yt-dlp lists the real
+-- auto-caption track as '<lang>-orig' (one per video), and 'en' on a Japanese video is
+-- lang=ja&tlang=en. A 20-video sample found 9 translated (Indonesian, Japanese, Korean)
+-- across the ID and official channels; EN-talent videos were native English, apart from
+-- their Japanese-language streams. So language='en' doesn't mean the stream was spoken in
+-- English, and names/in-jokes in translated rows can come out mangled -- trigram/fuzzy
+-- search copes better than exact FTS there. videos.caption_source_language says which
+-- language each video's English came from ('en' = native); filter on it to search only
+-- native English. YouTube transcribes each video in ONE language
+-- (it doesn't follow switches mid-video); snippet.defaultAudioLanguage doesn't reliably
+-- match it, only the -orig track does. Research for a possible separate native-language
+-- section later: docs/native_subtitles_plan.md (shelved). Local Whisper transcription was
+-- costed and deferred as not viable for now (~309k stream hours, ~7 TB of audio, 3-8 months
+-- of GPU time): docs/local_transcription_plan.md.
+
+
+-- Drop table
+
+-- DROP TABLE public.subtitles;
+
+CREATE TABLE public.subtitles (
+	channel_id text NOT NULL,
+	video_id text NOT NULL,
+	language text DEFAULT 'en'::text NOT NULL,
+	seq int4 NOT NULL,
+	start_ms int8 NOT NULL,
+	end_ms int8 NOT NULL,
+	text text NOT NULL,
+	CONSTRAINT pk_subtitles PRIMARY KEY (channel_id, video_id, language, seq),
+	CONSTRAINT subtitles_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
+	CONSTRAINT subtitles_video_id_fk FOREIGN KEY (video_id) REFERENCES public.videos(id)
+);
+CREATE INDEX idx_subtitles_text_fts ON public.subtitles USING gin (to_tsvector('simple'::regconfig, text));
+CREATE INDEX idx_subtitles_text_trgm ON public.subtitles USING gin (text gin_trgm_ops);
+CREATE INDEX idx_subtitles_video_id ON public.subtitles USING btree (video_id);

@@ -1,0 +1,146 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- public.messages_calli_members definition
+
+-- Drop table
+
+-- DROP TABLE public.messages_calli_members;
+
+CREATE TABLE public.messages_calli_members (
+	message_id text NOT NULL,
+	message text NULL,
+	"timestamp" int8 NULL,
+	time_in_seconds float4 NULL,
+	"type" text NULL,
+	video_id text NULL,
+	user_id text NULL,
+	user_name text NULL,
+	user_member_status int8 NULL,
+	ismoderator bool DEFAULT false NOT NULL,
+	isverified bool DEFAULT false NOT NULL,
+	isowner bool DEFAULT false NOT NULL,
+	amount float4 NULL,
+	currency text NULL,
+	symbol text NULL,
+	color text NULL,
+	datetime timestamp GENERATED ALWAYS AS (
+CASE
+    WHEN ("timestamp" > '1000000000000000'::bigint) THEN to_timestamp((("timestamp" / 1000000))::double precision)
+    ELSE to_timestamp(("timestamp")::double precision)
+END) STORED NULL,
+	CONSTRAINT pk_messages_message_id_calli_members PRIMARY KEY (message_id),
+	CONSTRAINT fk_messages_user_id_user_ids_id_calli_members FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+	CONSTRAINT fk_messages_video_id_videos_id_calli_members FOREIGN KEY (video_id) REFERENCES public.videos(id)
+);
+CREATE INDEX idx_mesages_user_id_calli_members ON public.messages_calli_members USING btree (user_id);
+CREATE INDEX idx_mesages_video_id_calli_members ON public.messages_calli_members USING btree (video_id);
+
+
+-- public.messages_gura_members definition
+
+-- Drop table
+
+-- DROP TABLE public.messages_gura_members;
+
+CREATE TABLE public.messages_gura_members (
+	message_id text NOT NULL,
+	message text NULL,
+	"timestamp" int8 NULL,
+	time_in_seconds float4 NULL,
+	"type" text NULL,
+	video_id text NULL,
+	user_id text NULL,
+	user_name text NULL,
+	user_member_status int8 NULL,
+	ismoderator bool DEFAULT false NOT NULL,
+	isverified bool DEFAULT false NOT NULL,
+	isowner bool DEFAULT false NOT NULL,
+	amount float4 NULL,
+	currency text NULL,
+	symbol text NULL,
+	color text NULL,
+	datetime timestamp GENERATED ALWAYS AS (
+CASE
+    WHEN ("timestamp" > '1000000000000000'::bigint) THEN to_timestamp((("timestamp" / 1000000))::double precision)
+    ELSE to_timestamp(("timestamp")::double precision)
+END) STORED NULL,
+	CONSTRAINT pk_messages_message_id_gura_members PRIMARY KEY (message_id),
+	CONSTRAINT fk_messages_user_id_user_ids_id_gura_members FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+	CONSTRAINT fk_messages_video_id_videos_id_gura_members FOREIGN KEY (video_id) REFERENCES public.videos(id)
+);
+CREATE INDEX idx_mesages_user_id_gura_members ON public.messages_gura_members USING btree (user_id);
+CREATE INDEX idx_mesages_video_id_gura_members ON public.messages_gura_members USING btree (video_id);
+
+
+-- public.messages_ina_members definition
+
+-- Drop table
+
+-- DROP TABLE public.messages_ina_members;
+
+CREATE TABLE public.messages_ina_members (
+	message_id text NOT NULL,
+	message text NULL,
+	"timestamp" int8 NULL,
+	time_in_seconds float4 NULL,
+	"type" text NULL,
+	video_id text NULL,
+	user_id text NULL,
+	user_name text NULL,
+	user_member_status int8 NULL,
+	ismoderator bool DEFAULT false NOT NULL,
+	isverified bool DEFAULT false NOT NULL,
+	isowner bool DEFAULT false NOT NULL,
+	amount float4 NULL,
+	currency text NULL,
+	symbol text NULL,
+	color text NULL,
+	datetime timestamp GENERATED ALWAYS AS (
+CASE
+    WHEN ("timestamp" > '1000000000000000'::bigint) THEN to_timestamp((("timestamp" / 1000000))::double precision)
+    ELSE to_timestamp(("timestamp")::double precision)
+END) STORED NULL,
+	CONSTRAINT pk_messages_message_id_ina_members PRIMARY KEY (message_id),
+	CONSTRAINT fk_messages_user_id_user_ids_id_ina_members FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+	CONSTRAINT fk_messages_video_id_videos_id_ina_members FOREIGN KEY (video_id) REFERENCES public.videos(id)
+);
+CREATE INDEX idx_mesages_user_id_ina_members ON public.messages_ina_members USING btree (user_id);
+CREATE INDEX idx_mesages_video_id_ina_members ON public.messages_ina_members USING btree (video_id);
+
+
+-- public.messages_kiara_members definition
+
+-- Drop table
+
+-- DROP TABLE public.messages_kiara_members;
+
+CREATE TABLE public.messages_kiara_members (
+	message_id text NOT NULL,
+	message text NULL,
+	"timestamp" int8 NULL,
+	time_in_seconds float4 NULL,
+	"type" text NULL,
+	video_id text NULL,
+	user_id text NULL,
+	user_name text NULL,
+	user_member_status int8 NULL,
+	ismoderator bool DEFAULT false NOT NULL,
+	isverified bool DEFAULT false NOT NULL,
+	isowner bool DEFAULT false NOT NULL,
+	amount float4 NULL,
+	currency text NULL,
+	symbol text NULL,
+	color text NULL,
+	datetime timestamp GENERATED ALWAYS AS (
+CASE
+    WHEN ("timestamp" > '1000000000000000'::bigint) THEN to_timestamp((("timestamp" / 1000000))::double precision)
+    ELSE to_timestamp(("timestamp")::double precision)
+END) STORED NULL,
+	CONSTRAINT pk_messages_message_id_kiara_members PRIMARY KEY (message_id),
+	CONSTRAINT fk_messages_user_id_user_ids_id_kiara_members FOREIGN KEY (user_id) REFERENCES public.user_ids(id),
+	CONSTRAINT fk_messages_video_id_videos_id_kiara_members FOREIGN KEY (video_id) REFERENCES public.videos(id)
+);
+CREATE INDEX idx_mesages_user_id_kiara_members ON public.messages_kiara_members USING btree (user_id);
+CREATE INDEX idx_mesages_video_id_kiara_members ON public.messages_kiara_members USING btree (video_id);

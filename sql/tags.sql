@@ -1,0 +1,29 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- YouTube's snippet.tags for each video, one row per tag. Main.py rewrites a video's rows
+-- every time it saves the video (DB.ReplaceVideoTags, same transaction as the videos
+-- INSERT/UPDATE), so tags a creator removed don't linger. Only unprocessed videos are
+-- re-fetched, so a processed video's tags are as of the run that processed it. A video
+-- with no tags has no rows. Unified across public and members-only videos (like public.videos
+-- itself) rather than split into a *_members table -- tag volume per video is tiny (a
+-- few dozen at most), nowhere near the scale that motivated splitting messages/emotes/
+-- subtitles by mode.
+
+-- public.tags definition
+
+-- Drop table
+
+-- DROP TABLE public.tags;
+
+CREATE TABLE public.tags (
+	video_id text NOT NULL,
+	channel_id text NOT NULL,
+	tag_name text NOT NULL,
+	CONSTRAINT pk_tags PRIMARY KEY (channel_id, video_id, tag_name),
+	CONSTRAINT tags_channel_directory_fk FOREIGN KEY (channel_id) REFERENCES public.channel_directory(user_id),
+	CONSTRAINT tags_video_id_fk FOREIGN KEY (video_id) REFERENCES public.videos(id)
+);
+CREATE INDEX idx_tags_tag_name ON public.tags USING btree (tag_name);
+CREATE INDEX idx_tags_video_id ON public.tags USING btree (video_id);

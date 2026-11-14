@@ -1,0 +1,69 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- public.branches definition
+
+-- Lookup table for channel_directory.branch. sort_order is the order Main.py processes
+-- branches in (see load_channel_directory in modules/Settings.py): each branch's talents
+-- oldest debut first, then that branch's official channels. Add a branch by inserting a
+-- row -- no code change needed. A fresh database needs these rows before any
+-- channel_directory rows can be inserted.
+
+-- Drop table
+
+-- DROP TABLE public.branches;
+
+CREATE TABLE public.branches (
+	"name" text NOT NULL,
+	sort_order int4 NOT NULL,
+	CONSTRAINT pk_branches PRIMARY KEY (name),
+	CONSTRAINT branches_sort_order_unique UNIQUE (sort_order)
+);
+
+
+-- NOTE: The *_members tables (emotes_<talent>_members, messages_<talent>_members,
+-- nickname_matches_<talent>_members) predate the unified channel_id / channel_directory
+-- schema used by emotes, nicknames, nickname_matches, and the partitioned messages table.
+-- Members-only chat data still writes to these per-channel tables today. They are kept
+-- intentionally -- they hold data that cannot be deleted and are slated to be
+-- re-implemented under the unified schema at a later date. Do not drop. New ones are
+-- created on demand by EnsureMembersTables (modules/Database.py).
+
+-- public.channel_directory definition
+
+-- color_1/color_2: the channel's two brand colors, used to keep chart series colors
+-- consistent for a given channel across every panel/dashboard (see "Config from query
+-- results" transform usage in dashboards built against this schema).
+--
+-- channel_type: 'talent' (a talent's own channel) or 'official' (a branch's main channel,
+-- e.g. HoloEN, or a unit's channel, e.g. ReGLOSS). Official channels sit in the branch
+-- they belong to; branch-level ones use "group" = 'Branch', unit-level ones use their
+-- unit's group. Replaces the old 'Official' pseudo-branch (moved by a one-time
+-- migration, since removed).
+--
+-- members_chat: the bot's cookies hold a membership for this channel, so a members chat
+-- pass (CFG.GET_MEMBERS_CHAT) collects its members-only chat into the *_<db_suffix>_members
+-- tables. Members-only video details are collected on every run regardless of this flag.
+
+-- Drop table
+
+-- DROP TABLE public.channel_directory;
+
+CREATE TABLE public.channel_directory (
+	"name" text NOT NULL,
+	user_id text NOT NULL,
+	db_suffix text NOT NULL,
+	"group" text NOT NULL,
+	color_1 text DEFAULT '#ffffff'::text NOT NULL,
+	color_2 text DEFAULT '#ffffff'::text NOT NULL,
+	branch text NOT NULL,
+	active bool NOT NULL,
+	debut date NOT NULL,
+	process bool NOT NULL,
+	channel_type text DEFAULT 'talent'::text NOT NULL,
+	members_chat bool DEFAULT false NOT NULL,
+	CONSTRAINT channel_directory_unique UNIQUE (user_id),
+	CONSTRAINT channel_directory_branches_fk FOREIGN KEY (branch) REFERENCES public.branches(name),
+	CONSTRAINT channel_directory_channel_type_check CHECK ((channel_type = ANY (ARRAY['talent'::text, 'official'::text])))
+);

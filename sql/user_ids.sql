@@ -1,0 +1,31 @@
+-- Generated from the live database schema by the maintainer's schema export script --
+-- do not hand-edit. Change the database, then re-export, or edits are lost on the next export.
+-- See sql/README.md for the order these files must be run in on a fresh database.
+
+-- public.user_ids definition
+
+-- idx_user_ids_unprocessed (partial, WHERE NOT processed) backs Main.py's per-channel
+-- "unprocessed users" query, which was otherwise a full scan of the table once per channel.
+-- It only holds the backlog Get_User_Batch hasn't processed yet, so it stays tiny. The known-
+-- user-ID preload (also a full read) runs once per run, not per channel -- added 2026-11-13.
+
+-- Drop table
+
+-- DROP TABLE public.user_ids;
+
+CREATE TABLE public.user_ids (
+	id text NOT NULL,
+	latest_name text NULL,
+	custom_url text NULL,
+	viewcount int8 NULL,
+	subscribers int8 NULL,
+	region text NULL,
+	processed bool DEFAULT false NOT NULL,
+	"exists" bool DEFAULT true NOT NULL,
+	created timestamp NULL,
+	CONSTRAINT pk_user_ids_id PRIMARY KEY (id)
+);
+CREATE INDEX idx_user_ids_created ON public.user_ids USING btree (created);
+CREATE INDEX idx_user_ids_subscribers ON public.user_ids USING btree (subscribers);
+CREATE INDEX idx_user_ids_unprocessed ON public.user_ids USING btree (id) WHERE (NOT processed);
+CREATE INDEX idx_user_ids_viewcount ON public.user_ids USING btree (viewcount);
