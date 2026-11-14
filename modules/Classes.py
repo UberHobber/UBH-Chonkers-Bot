@@ -41,7 +41,9 @@ import httplib2,ssl
 # S3 API
 import boto3
 from botocore.config import Config as BotocoreConfig
-from types_boto3_s3.client import S3Client
+from typing import TYPE_CHECKING
+if TYPE_CHECKING: # Type stubs only (types-boto3-s3, a dev install); not needed to run
+    from types_boto3_s3.client import S3Client
 from botocore.exceptions import ClientError
 
 # Other Project Files
@@ -107,7 +109,7 @@ class SubtitleStats:
 
 class H3Client():
     def __init__(self) -> None:
-        self.client:S3Client = boto3.client(
+        self.client:'S3Client' = boto3.client(
         's3',
         endpoint_url=CFG.ENDPOINT_URL,
         aws_access_key_id=CFG.ENDPOINT_ID,
@@ -134,7 +136,7 @@ class BucketUnavailableError(Exception):
     """Raised when a bucket doesn't exist and can't be created (e.g. the name is rejected by S3)."""
 
 class H3Bucket:
-    def __init__(self,client:S3Client,bucket_name:str,local_dir:str) -> None:
+    def __init__(self,client:'S3Client',bucket_name:str,local_dir:str) -> None:
         self.name = bucket_name
         self.client = client
         self.local_root = local_dir
@@ -1076,7 +1078,11 @@ class YT_API:
             # blocked on the network call forever. We implement the timeout ourselves via a
             # queue so it works correctly from any thread.
             with Stage_Bar("Connecting to chat",bar_position):
-                _raw_chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'])
+                # interruptible_retry=False: by default chat_downloader waits out a retry with a "press
+                # Enter to retry now" prompt on stdin. With no terminal (systemd: stdin is /dev/null)
+                # that prompt raises "[Errno 1] Operation not permitted" and kills the download
+                # mid-chat; without it, a retry is a plain sleep.
+                _raw_chat = ChatDownloader(cookies=CFG.COOKIES).get_chat(url=v.id, message_types=['text_message', 'membership_item', 'paid_message', 'paid_sticker'], interruptible_retry=False)
             if CFG.TIMEOUT:
                 _msg_queue:queue.Queue = queue.Queue()
                 def _feed_queue():

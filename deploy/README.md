@@ -41,7 +41,9 @@ The paths below match the examples in the unit files. Change both together if yo
    cd /opt/chonkers-bot
    sudo -u chonkers python3 -m venv .venv
    sudo -u chonkers .venv/bin/pip install -r requirements.txt
+   sudo -u chonkers .venv/bin/python -m modules.Patches
    ```
+   The last line applies the chat-downloader fix in [`patches/`](../patches/chat_downloader-0.2.8/README.md). `Main.py` also applies it by itself at startup, so it's only there to check the install straight away. Repeat it after any `pip install` that reinstalls chat-downloader.
 4. **Secrets.** Copy the whole secrets folder from the machine the bot ran on before, **including `token.pickle`**. A headless run can't open a browser for the YouTube sign-in. Without a working token it stops straight away with an error (and an alert) instead of waiting.
    - If the saved token ever stops refreshing, the run stops with a "YouTube sign-in needed" error (and alert). Run the bot once on a machine with a browser, sign in, and copy the new `token.pickle` over. Google documents a 7-day refresh-token lifetime for OAuth apps whose publishing status is **Testing**. Switching the app to **In production** (free, no Workspace account needed) avoids that if it turns out to apply.
    - Members-only chat (`GET_MEMBERS_CHAT`) needs cookies. `COOKIES_FROM_BROWSER` needs a desktop browser, so on a server use an exported `cookies.txt` with `COOKIES_FROM_BROWSER = None`.

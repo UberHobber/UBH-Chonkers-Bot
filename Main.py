@@ -7,12 +7,15 @@ sys.path.append(os.getcwd())
 
 # Installed Stuff
 from tqdm import tqdm
-import chat_downloader
-import chat_downloader.errors
 
 # Other Project Files
 import modules.Settings as CFG
 import modules.logconfig as LOG
+# chat-downloader's last release needs a fix from patches/ -- applied here, before anything imports it
+import modules.Patches as PATCH
+_patch_results = PATCH.ensure_chat_downloader()
+import chat_downloader
+import chat_downloader.errors
 import modules.Classes as C
 import modules.Database as DB
 import modules.Status as ST
@@ -70,6 +73,8 @@ https://github.com/xenova/chat-downloader
 ST.start("Main",LOG.logger)
 # Optional Discord alerts for unattended runs (see modules/Alerts.py)
 AL.start("Main",LOG.logger)
+for _level,_message in _patch_results:
+    LOG.logger.log(_level,_message)
 ST.set_info(phase="Starting up")
 
 # Initialize database connection and setup the API calls (shared across all channels)
@@ -227,7 +232,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
                     batch_result = yt.Get_Videos_Info_Batch(batch,channel_bucket,members_ids)
                     video_info_cache.update(batch_result)
                 except Exception as e:
-                    LOG.logger.error(f"Batch fetch failed for {len(batch)} video(s), falling back to individual fetch: {e}")
+                    LOG.logger.error(f"Batch fetch failed for {len(batch)} video(s), falling back to individual fetch: {e}",exc_info=True)
                     for vid_id in batch:
                         try:
                             vid = yt.Get_Video_Info(vid_id,channel_bucket,vid_id in members_ids)
@@ -235,7 +240,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
                                 video_info_cache[vid_id] = vid
                         except Exception as e2:
                             fetch_errors += 1
-                            LOG.logger.error(f"Individual fetch failed for {vid_id}: {e2}")
+                            LOG.logger.error(f"Individual fetch failed for {vid_id}: {e2}",exc_info=True)
                 fetchbar.update(len(batch))
     LOG.logger.info(f"{len(video_info_cache):,} video(s) ready for processing.")
 
@@ -380,7 +385,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
                         thread_db.database.commit()
                     except Exception as db_err:
                         thread_db.database.rollback()
-                        LOG.logger.error(f"{video_id}: Failed to flag video as login-required: {db_err}")
+                        LOG.logger.error(f"{video_id}: Failed to flag video as login-required: {db_err}",exc_info=True)
                     local_vid_stats.unavailable_videos = 1
                     LOG.logger.warning(f"{video_id}: Login required, skipping. ({e})")
                     rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
@@ -395,7 +400,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
                     # aborted -- roll back so this worker's connection is usable for the next video.
                     thread_db.database.rollback()
                     local_vid_stats.error_videos = 1
-                    LOG.logger.error(f"{video_id}: Unknown error: {u}")
+                    LOG.logger.error(f"{video_id}: Unknown error: {u}",exc_info=True)
                     rate_limiter.wait()  # Stagger download starts by REQUEST_DELAY across all workers
 
         return local_vid_stats,local_chat_stats
@@ -445,7 +450,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
                         local_chat_stats.append_all(all_chat_stats)
                     except Exception as e:
                         vid_stats.error_videos += 1
-                        LOG.logger.error(f"Uncaught error for video {video_id}: {e}")
+                        LOG.logger.error(f"Uncaught error for video {video_id}: {e}",exc_info=True)
                     vidbar.set_postfix_str(Update_Postfix_Videos())
                     vidbar.update(1)
 

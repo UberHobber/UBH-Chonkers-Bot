@@ -163,7 +163,9 @@ def FileLog(single_filename='log',log_filename='log'):
 def TQDM_Logging():
     original_handlers = logger.handlers.copy()
 
-    stream_handlers = [h for h in logger.handlers if isinstance(h, logging.StreamHandler)]
+    # Only the console handlers: FileHandler (and so the log file) is a StreamHandler subclass too,
+    # and detaching it here used to drop every line logged inside these blocks from the log file.
+    stream_handlers = [h for h in logger.handlers if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)]
     for handler in stream_handlers:
         logger.removeHandler(handler)
 
