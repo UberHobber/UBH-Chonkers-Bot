@@ -20,7 +20,7 @@ them for drift (--verify).
 The heavy work runs HERE, in DuckDB on this machine: Postgres only streams user_channel_activity
 (and user_first_message) out once, sequentially. Grouping, ranking and the channel-pair counting
 for Community happen in this machine's RAM (spilling to its local disk if needed), never as sorts
-or temp files on the database host -- whose worn QLC NVMe overheated under heavy query load.
+or temp files on the database host, whose disk is better spared heavy query load.
 
 Bucketing comes from modules/AudienceDeltas.py (bucket_case_sql), the same definitions the bot
 uses when it maintains these tables incrementally, so a rebuild and the incremental path agree.

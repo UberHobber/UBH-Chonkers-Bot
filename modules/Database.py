@@ -794,10 +794,10 @@ def EnsureMembersTables(cursor:psycopg2.extensions.cursor,db_suffix:str) -> None
             LOG.logger.error(f'Failed to create members-only table {table}: {e}')
             raise e
 
-# sql/<name>.sql -> the table (or matview) whose presence means that file has already been
+# sql/<name>.sql -> the table (or view) whose presence means that file has already been
 # applied. Order matters -- see sql/README.md for the FK reasons (e.g. messages before
-# nicknames, messages_members before nicknames_members). Kept in sync by hand with
-# sql/README.md and .claude/skills/chat-database/update_schema.py's FILE_GROUPS -- these are
+# nicknames). Kept in sync by hand with
+# sql/README.md and the schema export script's FILE_GROUPS -- these are
 # small, stable clusters that don't change often.
 _CORE_SQL_FILES = [
     ("channel_directory","channel_directory"),

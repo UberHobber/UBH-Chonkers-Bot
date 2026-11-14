@@ -34,6 +34,7 @@ This tool is designed to download the following from every publically available 
         - Livestream VODs (If they haven't been edited and the chat thrown out as concequence)
         - Video Premieres
         - Pre/Post-chat if the stream is currently live, waiting to start, or has just finished
+          (only with SKIP_LIVESTREAMS off -- by default those are left for a later run)
 
 Members-only video metadata and thumbnails are collected on every run (they're publicly visible),
 but not their chat. Set GET_MEMBERS_CHAT to run a members-only chat pass instead, for channels
@@ -47,10 +48,12 @@ Steps to Operate
 2. Create an app from the Google Cloud Console and get Oauth 2.0 setup. Download the secrets JSON for it.
 3. Make sure all required dependancies are installed from requirements.txt.
 4. Read through Settings.py and do the following minimum requirements:
-    a. If you're going to download member's only chat, get a cookies.txt file (READ THE NOTE IN SETTINGS).
-    b. Edit the DB_Settings.json file as needed and place it in your secrets folder.
-    c. Check the MEMBER_DIRECTORY list and be sure to pick the member you want.
-5. Start this script. It *should* work fine? If not, have fun debugging.
+    a. Set the data and secrets folders (QUICK_SETTINGS_DATA / QUICK_SETTINGS_SECRET, or the
+       CHONKERS_DATA_DIR / CHONKERS_SECRETS_DIR environment variables).
+    b. Fill in DB_Settings.json, S3_Settings.json and Settings.json and place them in your secrets folder.
+    c. Pick PROCESS_ALL (every channel_directory row with process = true) or CHANNEL_SELECTION (one channel).
+    d. For members-only chat, set up cookies: COOKIES_FROM_BROWSER, or a cookies.txt (READ THE NOTE IN SETTINGS).
+5. Start this script (Launch.bat on Windows; see deploy/README.md for an unattended Linux setup).
 
 -------
 Credits
@@ -186,10 +189,7 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
 
     # known_emote_ids/sorted_nicknames (and the run-wide known_user_ids) are only ever consumed by
     # Get_Messages() below, which never runs when CFG.SKIP_CHAT_DOWNLOAD is set -- skip loading
-    # them in that mode. This matters because members-only mode's emotes/nicknames tables are
-    # per-channel and only get created by hand once a channel's chat has actually been downloaded
-    # (see sql/README.md); a members-only channel being processed purely for video metadata (chat
-    # download skipped) may never have had that table created at all.
+    # them in that mode.
     if CFG.SKIP_CHAT_DOWNLOAD:
         known_emote_ids:set = set()
         sorted_nicknames:list[str] = []

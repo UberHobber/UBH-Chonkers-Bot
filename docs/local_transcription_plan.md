@@ -2,7 +2,7 @@
 
 Status: **deferred**. Not viable at this time because of the time and hardware it needs. Written 2026-10-25 as a record of the estimate, in case it's worth revisiting (for example with a dedicated GPU machine, or for a small set of channels).
 
-The current subtitle approach is YouTube's own native-language captions; see [native_subtitles_plan.md](native_subtitles_plan.md).
+The current subtitle approach is YouTube's English auto-captions, machine-translated for non-English videos (see the README and [native_subtitles_plan.md](native_subtitles_plan.md)).
 
 ## Idea
 
@@ -33,7 +33,7 @@ As of 2026-10-25, the public streams of every channel in `channel_directory` com
 
 ### Time
 
-The only suitable GPU available is the RTX PRO 5000 Blackwell laptop GPU (24 GB) in the development laptop. The homelab servers only have Intel integrated graphics.
+The estimates assume one workstation-class GPU with 24 GB of VRAM. Machines with only integrated graphics aren't practical for this.
 
 | Bottleneck | Estimate |
 |---|---|
@@ -41,7 +41,7 @@ The only suitable GPU available is the RTX PRO 5000 Blackwell laptop GPU (24 GB)
 | GPU, `large-v3` (most accurate) | ~30–50× real time, so **~5–8 months** |
 | Downloads | Bandwidth isn't the limit (7 TB at 100 Mbps is about a week). YouTube's anti-bot measures are: 106k downloads at about one a minute is **~2.5 months**, from the same IP as the chat bot, which risks getting the chat downloads throttled too. |
 
-Downloading and transcribing can overlap, so in total it's **roughly 3–8 months**, with a laptop GPU at full load around the clock. The speeds are estimates for this class of GPU, not measurements.
+Downloading and transcribing can overlap, so in total it's **roughly 3–8 months**, with that GPU at full load around the clock. The speeds are estimates for this class of GPU, not measurements.
 
 ## Would it beat YouTube's captions?
 

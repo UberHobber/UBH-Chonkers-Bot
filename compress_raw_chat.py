@@ -250,7 +250,7 @@ def compress_channel(db:DB.PostgresClass,client,channel_name:str,tmp_dir:str,wor
     with ST.Bar(desc="Compressing raw chat",total=len(videos),bar_format='{desc}: {n_fmt}/{total_fmt}',ncols=80,position=bar_position,leave=False) as bar, \
          ThreadPoolExecutor(max_workers=workers) as pool:
         # S3 work (download/compress/upload/verify) and each video's read-only flag lookup
-        # run in the pool, so the NAS downloads keep going while a lookup waits on the DB's
+        # run in the pool, so the S3 downloads keep going while a lookup waits on the DB's
         # disks; only the (rare) fix UPDATEs and the progress marker run on this thread's
         # connection, in video order. Up to 2x `workers` videos are in flight -- results
         # are small (the parsed chat is dropped in the worker), so this costs little memory.

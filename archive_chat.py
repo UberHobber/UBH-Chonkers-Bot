@@ -28,7 +28,7 @@ Per channel:
        them into batches of about --max-rows messages (one file each, ~250MB at 10M rows).
     3. Per batch: DuckDB streams the rows out of Postgres (postgres_query, so Postgres plans the
        lookup), sorts by (video_id, timestamp) and writes the Parquet straight to S3 -- 500K-row
-       row groups, which keeps reads large and sequential on the HDD NAS.
+       row groups, which keeps reads large and sequential on hard-drive-backed S3 storage.
     4. Reads the file back and checks every video's row count and distinct message_id count
        against Postgres. Any mismatch deletes this run's files for the channel and stops.
        Nothing in Postgres has changed up to this point.

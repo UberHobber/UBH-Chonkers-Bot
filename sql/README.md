@@ -1,17 +1,9 @@
 # Database bootstrap scripts
 
 Each `.sql` file here is a runnable DDL script for one cluster of tables (plus any
-materialized views/plain views/functions that belong to it). They're generated directly from the live
-`YTDB_Public` schema by [`.claude/skills/chat-database/update_schema.py`](../.claude/skills/chat-database/update_schema.py)
-— **do not hand-edit these files**; edit the `NARRATIVE` dict in that script instead (for
-rationale comments) or the schema itself (for structural changes), then re-run it:
-
-```
-python .claude/skills/chat-database/update_schema.py
-```
-
-That same run also regenerates [`SKILL.MD`](../.claude/skills/chat-database/SKILL.MD) from
-the same live introspection, so the two can never drift apart.
+views/functions that belong to it). They're exported directly from the
+live database schema by the maintainer's schema export script, which isn't part of this repo —
+**do not hand-edit these files**. Schema changes are made to the database and then re-exported.
 
 `modules.Database.EnsureSchema` (called once at startup, see `Main.py`) runs these files
 automatically against whatever database it connects to — it checks each file's "anchor"
@@ -28,7 +20,7 @@ Later files have foreign keys pointing at tables created by earlier ones:
 3. `videos.sql`
 4. `tags.sql`
 5. `emotes.sql`
-6. `messages.sql` — must come before `nicknames.sql`/`nicknames_members.sql`/`messages_members.sql`
+6. `messages.sql` — must come before `nicknames.sql`
 7. `nicknames.sql`
 8. `subtitles.sql`
 9. `video_subtitle_stats.sql` — its `record_subtitle_stats()` FKs `video_subtitle_stats` to
@@ -79,4 +71,4 @@ in `videos` (`members = true`) on every run; only members-only *chat* uses these
 collect a channel's members-only chat, set `channel_directory.members_chat = true` and run with
 `CFG.GET_MEMBERS_CHAT = True`: `modules.Database.EnsureMembersTables` creates that channel's
 four tables if they don't exist yet. The `_members.sql` files only list the tables that were
-there when `FILE_GROUPS` in `update_schema.py` was last edited.
+there when the export's file grouping was last edited.

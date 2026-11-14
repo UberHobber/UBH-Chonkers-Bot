@@ -15,11 +15,12 @@ Downloads the metadata, thumbnails and full chat history (messages, Super Chats,
    python -m venv .venv
    .venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
+   On Linux the second line is `.venv/bin/pip install -r requirements.txt` (see [`deploy/README.md`](deploy/README.md) for the system packages it needs).
 2. **Create an empty PostgreSQL database, and a role for the bot that owns it.** You don't need to create any tables: the bot builds the schema on its first run from the scripts in [`sql/`](sql/README.md). The role needs these rights on the database:
    - `CONNECT`;
    - `CREATE` on the `public` schema;
    - **`TEMPORARY`**, which `archive_chat.py` needs: `GRANT TEMPORARY ON DATABASE "<db>" TO <role>;`
-3. **Set up an S3-compatible bucket store** (the bot is used with Garage). The bot creates one bucket per channel, plus one for user data.
+3. **Set up an S3-compatible bucket store.** The bot creates one bucket per channel, plus one for user data.
 4. **Create a Google Cloud OAuth 2.0 client** for the YouTube Data API and download its secrets JSON.
 5. **Fill in a secrets folder.** Keep it outside the repo. It needs:
 
@@ -41,6 +42,8 @@ To run the bot unattended on a Linux server (a daily systemd timer, a log file a
 
 ### Routine run
 
+The commands below use the Windows launchers. On Linux, run each script from the repo folder with `.venv/bin/python <script> [args]` instead of `Launch.bat <script> [args]`.
+
 Each step is safe to re-run, and each picks up where it left off if it's interrupted.
 
 1. **Download new videos and chat:** `Launch_With_Monitor.bat` runs `Main.py` in one window and a live status view (`Monitor.py`) in another. `Launch.bat` runs `Main.py` alone. For each channel the bot:
@@ -49,7 +52,7 @@ Each step is safe to re-run, and each picks up where it left off if it's interru
    - downloads chat for every unprocessed video into Postgres, keeping the raw chat as `messages/<video>.json.gz` in the channel's bucket;
    - if the channel finished with no errors, hands it to a background thread that prepares and archives its finished chat (steps 3 and 4 below) while the bot moves on to the next channel. The thread shows as the **Archive** slot in the monitor. Turn this off with `AUTO_ARCHIVE = False`.
 
-   Shorts are marked done without downloading chat. Live and upcoming streams are left for a later run.
+   Shorts are marked done without downloading chat. Live and upcoming streams are left for a later run (`SKIP_LIVESTREAMS`, on by default).
 2. *(Optional)* **Download auto-captions:** `Launch.bat Subtitles.py`. This can run on its own or at the same time as `Main.py`. Captions are always English, so they can all be searched in English. For a video not spoken in English, they're YouTube's machine translation, and `videos.caption_source_language` records which language they were translated from (`en` means native English).
 
 Steps 3 and 4 run automatically for every channel that finishes cleanly. Run them by hand for channels that had errors, to catch up after a run with `AUTO_ARCHIVE` off, or for a channel the bot isn't processing. Both scripts accept `--channel "<name>"` to limit them to one channel, and `--dry-run` to report what they'd do without changing anything.
@@ -71,7 +74,7 @@ Opening, closing or resizing the monitor never affects the bot.
 |---|---|
 | **NOT RESPONDING** | The process is still alive but has stopped updating. |
 | **TERMINATED** | The process was killed, for example its window was closed. |
-| **FINISHED**, **CRASHED** or **STOPPED** | The run ended. CRASHED shows the error; STOPPED means Ctrl+C. |
+| **FINISHED**, **CRASHED** or **STOPPED** | The run ended. CRASHED shows the error; STOPPED means Ctrl+C or a stop signal (e.g. `systemctl stop`). |
 
 Ended runs stay on screen for 5 minutes (`--keep-ended <minutes>`), then disappear until that script starts again. If `STATUS_DIRECTORY` is set, pass the same folder with `--dir`.
 
@@ -107,16 +110,13 @@ Launch.bat build_audience_baseline.py --verify                  # full drift che
 Launch.bat build_audience_baseline.py --verify --channel Anya   # quick check of one small channel
 Launch.bat build_audience_baseline.py                           # full rebuild, with the bot stopped
 ```
-DuckDB and numpy on this PC do the heavy work; the database only streams the table out once (~8 min, mostly the weekly bitmaps). A full run takes about 15 minutes and needs about 1 GB of RAM. Unit tests for the delta logic: `.venv\Scripts\python.exe -m unittest discover -s Tests`.
+DuckDB and numpy on the machine running it do the heavy work; the database only streams the table out once (~8 min, mostly the weekly bitmaps). A full run takes about 15 minutes and needs about 1 GB of RAM. Unit tests for the delta logic: `.venv\Scripts\python.exe -m unittest discover -s Tests`.
 
 It's crash-safe: staged changes commit together with their messages, and every run starts by folding whatever a killed run left behind. Until that next start, `--verify` reports drift, and warns that staged rows are waiting. This was tested on 2026-11-08 by hard-killing the bot partway through a stream (21,500 of 71,016 messages stored) and restarting it. The restart folded the leftovers, skipped the stored messages, and a full `--verify` showed 0 drift.
 
 ### After a schema change
 
-Regenerate the `sql/` bootstrap scripts and the schema reference:
-```
-.venv\Scripts\python.exe .claude/skills/chat-database/update_schema.py
-```
+The `sql/` bootstrap scripts are exported from the live schema (see [`sql/README.md`](sql/README.md)). Re-export them after changing the database, rather than editing them by hand.
 
 ---
 
@@ -155,7 +155,7 @@ With the current channel list, the remaining JP channels have about 120k stream 
 
 Most of the S3 space is raw chat (about 360 GB at the end) and profile pictures (about 500 GB). Without them the S3 total would be closer to 200 GB.
 
-To check current bucket sizes on Garage, use `garage bucket info <bucket>`. It's much quicker than listing objects, since the user bucket holds about 9M of them.
+To check bucket sizes, use your S3 server's own bucket statistics if it has them. Listing objects is slow, since the user bucket holds about 9M of them.
 
 ---
 
@@ -173,12 +173,16 @@ The main flags at the top of [`modules/Settings.py`](modules/Settings.py):
 | `COOKIES_FROM_BROWSER` | Read cookies straight from a browser profile at startup, e.g. `("firefox", "ChonkersBot")`, instead of a hand-exported `cookies.txt` (see below) |
 | `AUTO_ARCHIVE` | Compress and archive each channel that finishes with no errors, in the background while the next channel runs |
 | `PROGRESS_BARS` | Also draw progress bars in the bot's own console (`Monitor.py` shows the same progress without the line spam) |
-| `STATUS_INTERVAL` / `STATUS_DIRECTORY` | How often the status files for `Monitor.py` are written, and where (blank = the launch folder) |
+| `STATUS_INTERVAL` / `STATUS_DIRECTORY` | How often the status files for `Monitor.py` are written, and where (blank = the launch folder; `CHONKERS_STATUS_DIR` overrides it) |
 | `LOG_VERBOSE` | Also log debug lines, including the per-file and per-50-video archive progress |
 | `QUICK_SETTINGS_LOG` / `LOG_DIRECTORY` / `LOG_RETENTION_DAYS` | Write the log to a file, where (blank = the launch folder), and how many days of old files to keep. Setting `CHONKERS_LOG_DIR` turns file logging on. |
 | `ALERT_LEVEL` / `ALERT_BATCH_SECONDS` / `ALERT_RUN_SUMMARY` | What gets posted to the `alert_webhook`, if one is set (see [`deploy/`](deploy/README.md)) |
 | `GET_MEMBERS_CHAT` | Run a members-only chat pass instead of the normal run (see below) |
 | `QUICK_SETTINGS` | `True` uses the folders and flags in the file. `False` prompts with dialogs at launch, including the members chat pass, chat timeout and livestream skipping. |
+| `SKIP_LIVESTREAMS` / `TIMEOUT` / `SKIP_CHAT_DOWNLOAD` | Leave live and upcoming streams for a later run; let the chat download time out when no new messages arrive; store video details only, no chat (set in the `QUICK_SETTINGS` block) |
+| `HEADLESS` | Never show dialogs or open a browser for the YouTube sign-in; stop with an error instead. On with `CHONKERS_HEADLESS=1`, and assumed on Linux/macOS when there's no display. |
+
+The data, secrets, log and status folders can also be set with the `CHONKERS_DATA_DIR`, `CHONKERS_SECRETS_DIR`, `CHONKERS_LOG_DIR` and `CHONKERS_STATUS_DIR` environment variables, which take priority over the file.
 
 Every normal run reads both the uploads and the members-only playlists. It stores members-only video details and thumbnails (`videos.members = true`) but not their chat. Those videos stay unprocessed, and are skipped on later normal runs once their details are final.
 

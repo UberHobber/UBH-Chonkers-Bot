@@ -9,10 +9,10 @@ bars' own update paths doing any extra work. With CFG.PROGRESS_BARS off the bars
 the snapshot is accurate) but draw to os.devnull instead of the console, leaving the bot's
 console as a plain log.
 
-Nothing is written until start() is called -- only entry-point scripts (Main.py, standalone
-Subtitles.py) should call it, so utility scripts that import Classes don't clobber a running
-bot's status file. Each script writes its own status_<name>.json so Main.py and a standalone
-subtitle pass can run side by side.
+Nothing is written until start() is called -- only entry-point scripts (Main.py, a standalone
+Subtitles.py, compress_raw_chat.py, archive_chat.py) should call it, so utility scripts that import
+Classes don't clobber a running bot's status file. Each script writes its own status_<name>.json,
+so they can run side by side.
 """
 # Import of main package files
 import atexit,itertools,json,logging,os,sys,threading,time

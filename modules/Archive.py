@@ -27,8 +27,8 @@ Views:
                          live row -- use Messages(con, where) for selective lookups)
     pg.public.<table> -- the whole Postgres database, attached read-only (rollups, videos, ...)
 
-The S3 store is a hard-drive NAS: threads defaults to 4 so parallel range requests don't make the
-drives thrash between seeks; pass local_root= to read a local copy of the files instead (laid out
+threads defaults to 4 so parallel range requests don't make hard-drive-backed S3 storage thrash
+between seeks; pass local_root= to read a local copy of the files instead (laid out
 as <local_root>/<db_suffix>/chat_archive/*.parquet). Files are sorted by (video_id, timestamp), so
 video filters skip most of each file; user/text filters scan the needed columns of every file.
 """
@@ -72,7 +72,7 @@ def connect(channels:list[str]|None=None,local_root:str|None=None,threads:int=4)
 
     :param channels: channel_directory names to include. None = every channel.
     :param local_root: read Parquet from this local directory instead of S3.
-    :param threads: DuckDB worker threads (parallel S3 requests). Keep low against the HDD NAS.
+    :param threads: DuckDB worker threads (parallel S3 requests). Keep low against hard-drive-backed S3 storage.
     """
     con = Base_Connection(threads)
 

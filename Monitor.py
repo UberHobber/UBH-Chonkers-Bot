@@ -1,9 +1,9 @@
 """
 Live view of a running bot, read from the status_<script>.json files modules/Status.py writes.
 
-Run it in its own window while Main.py (and/or a standalone Subtitles.py) is running:
+Run it in its own window while Main.py, Subtitles.py, compress_raw_chat.py or archive_chat.py is running:
     Launch.bat Monitor.py
-    Launch.bat Monitor.py --dir D:/some/folder   (if CFG.STATUS_DIRECTORY is set)
+    Launch.bat Monitor.py --dir path/to/folder   (if CFG.STATUS_DIRECTORY is set)
 
 Read-only and independent of the bot -- open, close, or resize it whenever; it never affects the
 run. A run that has ended (finished, crashed, or killed -- detected by its pid being gone) stays

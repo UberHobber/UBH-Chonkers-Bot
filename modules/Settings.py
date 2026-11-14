@@ -74,8 +74,8 @@ SUBTITLE_CIRCUIT_BREAKER_THRESHOLD = 3
 # worth of backoff, forever.
 SUBTITLE_GIVEUP_AFTER_RUNS = 3
 
-# Number of videos to process in parallel. 2 is the safe default — going above 3
-# risks hitting YouTube's rate limits and getting temporarily blocked.
+# Number of videos to process in parallel. Download starts are still spaced REQUEST_DELAY apart
+# across all workers; lower this if YouTube starts throttling or temporarily blocking requests.
 WORKER_COUNT = 6
 
 # Number of users to process in parallel WITHIN each batch of 50. This only parallelizes
@@ -108,10 +108,10 @@ ARCHIVE_MAX_ROWS = 10_000_000 # Messages per Parquet file (~250MB)
 
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
-# The CHONKERS_DATA_DIR / CHONKERS_SECRETS_DIR environment variables override these, so a server can
-# set its own paths (e.g. in a systemd unit, see deploy/) without editing this file.
-QUICK_SETTINGS_DATA = os.environ.get("CHONKERS_DATA_DIR") or "D:/CodingProjects/_Datafiles"
-QUICK_SETTINGS_SECRET = os.environ.get("CHONKERS_SECRETS_DIR") or "D:/CodingProjects/_NoShare"
+# Set these two folders here, or with the CHONKERS_DATA_DIR / CHONKERS_SECRETS_DIR environment variables,
+# which win when set -- handy for a server's systemd unit (see deploy/) or to keep a clone unedited.
+QUICK_SETTINGS_DATA = os.environ.get("CHONKERS_DATA_DIR") or "path/to/data"
+QUICK_SETTINGS_SECRET = os.environ.get("CHONKERS_SECRETS_DIR") or "path/to/secrets"
 QUICK_SETTINGS_LOG = False # Write the log to a file (always on when CHONKERS_LOG_DIR is set)
 
 # No screen or person at the keyboard (a server/systemd run): never prompt with dialogs or open a
@@ -192,6 +192,8 @@ else:
 # Will exit if either folder dialog boxes were closed
 if DATA_DIRECTORY == "" or SECRETS_DIRECTORY == "":
     exit()
+if not os.path.isdir(SECRETS_DIRECTORY):
+    exit(f"Secrets folder not found: {SECRETS_DIRECTORY}. Set QUICK_SETTINGS_SECRET in modules/Settings.py or the CHONKERS_SECRETS_DIR environment variable.")
 
 # Settings for the Oauth 2.0 Configuration used by the YT_API Class.
 CLIENT_SECRETS_FILE = f'{SECRETS_DIRECTORY}/client_secret.json'  # Download this from Google Cloud Console
