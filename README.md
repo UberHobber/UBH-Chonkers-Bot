@@ -54,6 +54,8 @@ Each step is safe to re-run, and each picks up where it left off if it's interru
 
    Shorts are marked done without downloading chat. Live and upcoming streams are left for a later run (`SKIP_LIVESTREAMS`, on by default).
 2. *(Optional)* **Download auto-captions:** `Launch.bat Subtitles.py`. This can run on its own or at the same time as `Main.py`. Captions are always English, so they can all be searched in English. For a video not spoken in English, they're YouTube's machine translation, and `videos.caption_source_language` records which language they were translated from (`en` means native English).
+   - **Needs [deno](https://deno.com) 2.3 or newer on PATH.** yt-dlp uses it, with the `yt-dlp-ejs` package from `requirements.txt`, to solve YouTube's JavaScript challenge. pip can't install it.
+   - **Machine-translated captions are heavily rate-limited by YouTube.** Since mid-2025 YouTube answers most requests for an auto-*translated* track with HTTP 429, even on an IP that hasn't downloaded anything recently. Original-language captions aren't affected. This is a known yt-dlp issue ([#13831](https://github.com/yt-dlp/yt-dlp/issues/13831)) with a fix in progress, so expect English captions for non-English videos to fail or crawl until it ships. The adaptive delay and circuit breaker (`SUBTITLE_*` settings) stop the pass from hammering YouTube meanwhile.
 
 Steps 3 and 4 run automatically for every channel that finishes cleanly. Run them by hand for channels that had errors, to catch up after a run with `AUTO_ARCHIVE` off, or for a channel the bot isn't processing. Both scripts accept `--channel "<name>"` to limit them to one channel, and `--dry-run` to report what they'd do without changing anything.
 

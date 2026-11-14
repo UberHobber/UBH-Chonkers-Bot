@@ -50,17 +50,18 @@ The paths below match the examples in the unit files. Change both together if yo
    "alert_webhook": "https://discord.com/api/webhooks/..."
    ```
    Leave it out or blank for no alerts.
-6. **Install the units:**
+6. **deno (only for subtitles).** yt-dlp needs a JavaScript runtime, deno 2.3 or newer, to solve YouTube's challenge. Install it from the [deno releases](https://github.com/denoland/deno/releases) (`deno-x86_64-unknown-linux-gnu.zip`, check its `.sha256sum`) to `/usr/local/bin/deno`, which is on the units' default PATH. It isn't an apt package, so update it by hand along with yt-dlp.
+7. **Install the units:**
    ```
    sudo cp deploy/chonkers-bot.service deploy/chonkers-bot.timer deploy/chonkers-bot-alert@.service /etc/systemd/system/
    sudo systemctl daemon-reload
    ```
-7. **Try one run by hand** before turning the timer on. The command returns when the run finishes, so start it with `--no-block` and watch the log:
+8. **Try one run by hand** before turning the timer on. The command returns when the run finishes, so start it with `--no-block` and watch the log:
    ```
    sudo systemctl start --no-block chonkers-bot
    tail -f /var/log/chonkers-bot/Chat_Process_Log.log
    ```
-8. **Turn on the daily timer:**
+9. **Turn on the daily timer:**
    ```
    sudo systemctl enable --now chonkers-bot.timer
    systemctl list-timers chonkers-bot.timer
