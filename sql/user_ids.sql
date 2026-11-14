@@ -5,6 +5,11 @@
 
 -- public.user_ids definition
 
+-- idx_user_ids_unprocessed (partial, WHERE NOT processed) backs Main.py's per-channel
+-- "unprocessed users" query, which was otherwise a full scan of the table once per channel.
+-- It only holds the backlog Get_User_Batch hasn't processed yet, so it stays tiny. The known-
+-- user-ID preload (also a full read) runs once per run, not per channel -- added 2026-11-13.
+
 -- Drop table
 
 -- DROP TABLE public.user_ids;
@@ -23,4 +28,5 @@ CREATE TABLE public.user_ids (
 );
 CREATE INDEX idx_user_ids_created ON public.user_ids USING btree (created);
 CREATE INDEX idx_user_ids_subscribers ON public.user_ids USING btree (subscribers);
+CREATE INDEX idx_user_ids_unprocessed ON public.user_ids USING btree (id) WHERE (NOT processed);
 CREATE INDEX idx_user_ids_viewcount ON public.user_ids USING btree (viewcount);

@@ -181,20 +181,16 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
     else:
         members_details_done = set()
 
-    # known_user_ids/known_emote_ids/sorted_nicknames are only ever consumed by Get_Messages()
-    # below, which never runs when CFG.SKIP_CHAT_DOWNLOAD is set -- skip loading them in that
-    # mode. This matters because members-only mode's emotes/nicknames tables are per-channel and
-    # only get created by hand once a channel's chat has actually been downloaded (see
-    # sql/README.md); a members-only channel being processed purely for video metadata (chat
+    # known_emote_ids/sorted_nicknames (and the run-wide known_user_ids) are only ever consumed by
+    # Get_Messages() below, which never runs when CFG.SKIP_CHAT_DOWNLOAD is set -- skip loading
+    # them in that mode. This matters because members-only mode's emotes/nicknames tables are
+    # per-channel and only get created by hand once a channel's chat has actually been downloaded
+    # (see sql/README.md); a members-only channel being processed purely for video metadata (chat
     # download skipped) may never have had that table created at all.
     if CFG.SKIP_CHAT_DOWNLOAD:
-        known_user_ids:set = set()
         known_emote_ids:set = set()
         sorted_nicknames:list[str] = []
     else:
-        known_user_ids:set = set(r["id"] for r in DB.GetEntries(db.cursor,CFG.DB_TABLES["user_ids"],"id"))
-        LOG.logger.info(f"  {len(known_user_ids):,} known user ID(s) loaded.")
-
         # Public mode's "emotes" table is shared across every channel (PK is channel_id+id), so it
         # must be filtered to this channel; members-only mode already uses a per-channel table.
         emote_filter = {"channel_id":CFG.YT_USER_ID} if CFG.GET_MEMBERS_CHAT is False else None
@@ -522,6 +518,22 @@ Invalid:        {all_chat_stats.invalid_users:,}
 # Compresses and archives each channel that finishes cleanly in a background thread while the
 # next channel processes -- see modules/ChannelArchiver.py. Its status slot sits after the workers'.
 archiver = CA.ChannelArchiver(CFG.WORKER_COUNT + 1) if CFG.AUTO_ARCHIVE and not CFG.GET_MEMBERS_CHAT else None
+
+# Every user ID already in user_ids, loaded once per run (not per channel: it's a full read of a
+# multi-million-row table). Safe to keep across channels because it only grows -- Get_Messages()
+# adds each user it inserts, under user_id_lock, after the row is committed. A user some other
+# process inserted meanwhile just makes that insert an ON CONFLICT no-op (and counts as "new" in
+# this run's stats). Read through a plain cursor rather than GetEntries so it doesn't build a dict
+# per row first. Not needed when chat download is skipped (see process_channel). Named directly:
+# CFG.DB_TABLES only exists once select_channel() runs, and user_ids is shared by every channel
+# in both public and members mode anyway.
+known_user_ids:set = set()
+if not CFG.SKIP_CHAT_DOWNLOAD:
+    ST.set_info(phase="Loading known user IDs")
+    db.cursor.execute("SELECT id FROM user_ids")
+    known_user_ids = {row[0] for row in db.cursor}
+    db.database.commit()  # don't leave this connection idle in transaction
+    LOG.logger.info(f"{len(known_user_ids):,} known user ID(s) loaded.")
 
 for channel_index,channel_name in enumerate(CFG.CHANNELS_TO_PROCESS):
     CFG.select_channel(channel_name)
