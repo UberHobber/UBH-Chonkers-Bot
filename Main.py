@@ -18,6 +18,7 @@ import modules.Database as DB
 import modules.Status as ST
 import modules.ChannelArchiver as CA
 import modules.AudienceDeltas as AD
+import modules.Alerts as AL
 
 """
 ---------------
@@ -64,6 +65,8 @@ https://github.com/xenova/chat-downloader
 
 # Live status for Monitor.py (see modules/Status.py)
 ST.start("Main",LOG.logger)
+# Optional Discord alerts for unattended runs (see modules/Alerts.py)
+AL.start("Main",LOG.logger)
 ST.set_info(phase="Starting up")
 
 # Initialize database connection and setup the API calls (shared across all channels)
@@ -535,6 +538,7 @@ if not CFG.SKIP_CHAT_DOWNLOAD:
     db.database.commit()  # don't leave this connection idle in transaction
     LOG.logger.info(f"{len(known_user_ids):,} known user ID(s) loaded.")
 
+channels_with_errors:dict[str,int] = {} # For the end-of-run summary
 for channel_index,channel_name in enumerate(CFG.CHANNELS_TO_PROCESS):
     CFG.select_channel(channel_name)
     if not CFG.GET_MEMBERS_CHAT:
@@ -544,6 +548,8 @@ for channel_index,channel_name in enumerate(CFG.CHANNELS_TO_PROCESS):
     AD.TOP_THRESHOLDS[CFG.YT_USER_ID] = DB.GetTopThreshold(db.cursor,CFG.YT_USER_ID)
     db.database.commit()
     channel_errors = process_channel(channel_name,channel_index + 1,len(CFG.CHANNELS_TO_PROCESS))
+    if channel_errors:
+        channels_with_errors[channel_name] = channel_errors
     # Pre-generated audience stats: this channel's workers are done, so fold what they staged.
     fold_audience(channel_name)
     if archiver is not None:
@@ -567,3 +573,15 @@ if archiver is not None:
 # The archiver's badge fixes stage moderator deltas too (compress_raw_chat._recompute_pending),
 # so fold once more after it has drained.
 fold_audience("end of run")
+
+# One-glance summary for the log and the alert webhook (if set) -- the per-channel details are above.
+summary_lines = [f"Run finished in {LOG.TimeDurration()}: {len(CFG.CHANNELS_TO_PROCESS):,} channel(s)."]
+if channels_with_errors:
+    summary_lines.append(f"Channels with errors: " + ", ".join(f"{name} ({count:,})" for name,count in channels_with_errors.items()))
+if archiver is not None:
+    summary_lines.append(f"Archived: {len(archiver.done):,} channel(s), {archiver.rows:,} message(s)." + (f" Failed: {', '.join(archiver.failed)}" if archiver.failed else ""))
+if AL.alert_count():
+    summary_lines.append(f"{AL.alert_count():,} error line(s) were posted as alerts during the run.")
+run_summary = "\n".join(summary_lines)
+LOG.logger.info(f"\n{run_summary}")
+AL.summary(run_summary,problems=bool(channels_with_errors or (archiver is not None and archiver.failed) or AL.alert_count()))

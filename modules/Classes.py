@@ -822,17 +822,23 @@ class YT_API:
                 with open(CFG.TOKEN_PICKLE_FILE, 'rb') as token:
                     credentials = pickle.load(token)
 
+            def sign_in(reason:str):
+                """Browser sign-in. A headless run can't do one, so it stops with an error instead of waiting forever."""
+                if CFG.HEADLESS:
+                    raise RuntimeError(f"YouTube sign-in needed ({reason}), but this is a headless run and can't open a browser. "
+                                       f"Run the bot once on a machine with a browser, then copy its token.pickle to {CFG.TOKEN_PICKLE_FILE}.")
+                flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
+                return flow.run_local_server(port=0)
+
             # If credentials don't exist or are invalid, run the flow
             if not credentials or not credentials.valid:
                 if credentials and credentials.expired and credentials.refresh_token:
                     try:
                         credentials.refresh(Request())
-                    except google.auth.exceptions.RefreshError:
-                        flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
-                        credentials = flow.run_local_server(port=0)
+                    except google.auth.exceptions.RefreshError as e:
+                        credentials = sign_in(f"the saved token's refresh was rejected: {e}")
                 else:
-                    flow = InstalledAppFlow.from_client_secrets_file(CFG.CLIENT_SECRETS_FILE, ['https://www.googleapis.com/auth/youtube.readonly'])
-                    credentials = flow.run_local_server(port=0)
+                    credentials = sign_in("no saved token" if not credentials else "the saved token can't be refreshed")
 
                 # Save credentials for future use
                 with open(CFG.TOKEN_PICKLE_FILE, 'wb') as token:

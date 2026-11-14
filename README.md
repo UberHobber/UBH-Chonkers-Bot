@@ -26,16 +26,18 @@ Downloads the metadata, thumbnails and full chat history (messages, Super Chats,
    | File | Contents |
    |---|---|
    | `client_secret.json` | The OAuth client from step 4. `token.pickle` is created next to it on the first run. |
-   | `Settings.json` | `user_data_name` (the name of the bucket and folder for user data, e.g. `"users"`) |
+   | `Settings.json` | `user_data_name` (the name of the bucket and folder for user data, e.g. `"users"`). *Optional:* `alert_webhook`, a Discord webhook URL for error alerts (see [`deploy/`](deploy/README.md)). |
    | `DB_Settings.json` | `DB_USR`, `DB_PASS`, `DB_HOST`, `DB_PORT`, `db_name` |
    | `S3_Settings.json` | `endpoint_url`, `aws_access_key_id`, `aws_secret_access_key`, `region_name` |
    | `cookies.txt` | *Optional.* Only needed for members-only or age-restricted chat, and only if you don't set `COOKIES_FROM_BROWSER` (see the note in `modules/Settings.py`). |
 
 6. **Edit the top of [`modules/Settings.py`](modules/Settings.py):**
-   - set `QUICK_SETTINGS_DATA` (a local scratch folder) and `QUICK_SETTINGS_SECRET` (the folder from step 5);
+   - set `QUICK_SETTINGS_DATA` (a local scratch folder) and `QUICK_SETTINGS_SECRET` (the folder from step 5), or set the `CHONKERS_DATA_DIR` / `CHONKERS_SECRETS_DIR` environment variables instead;
    - set `PROCESS_ALL` (every channel) or `CHANNEL_SELECTION` (just one);
    - check the other flags (see [Settings](#settings) below).
 7. **Register channels.** Insert rows into `branches`, then add each channel to `channel_directory` with its `messages_<db_suffix>` partition. `modules.Database.AddChannel()` does both in one step. Only channels with `process = true` are downloaded.
+
+To run the bot unattended on a Linux server (a daily systemd timer, a log file and Discord alerts), see [`deploy/README.md`](deploy/README.md).
 
 ### Routine run
 
@@ -173,6 +175,8 @@ The main flags at the top of [`modules/Settings.py`](modules/Settings.py):
 | `PROGRESS_BARS` | Also draw progress bars in the bot's own console (`Monitor.py` shows the same progress without the line spam) |
 | `STATUS_INTERVAL` / `STATUS_DIRECTORY` | How often the status files for `Monitor.py` are written, and where (blank = the launch folder) |
 | `LOG_VERBOSE` | Also log debug lines, including the per-file and per-50-video archive progress |
+| `QUICK_SETTINGS_LOG` / `LOG_DIRECTORY` / `LOG_RETENTION_DAYS` | Write the log to a file, where (blank = the launch folder), and how many days of old files to keep. Setting `CHONKERS_LOG_DIR` turns file logging on. |
+| `ALERT_LEVEL` / `ALERT_BATCH_SECONDS` / `ALERT_RUN_SUMMARY` | What gets posted to the `alert_webhook`, if one is set (see [`deploy/`](deploy/README.md)) |
 | `GET_MEMBERS_CHAT` | Run a members-only chat pass instead of the normal run (see below) |
 | `QUICK_SETTINGS` | `True` uses the folders and flags in the file. `False` prompts with dialogs at launch, including the members chat pass, chat timeout and livestream skipping. |
 

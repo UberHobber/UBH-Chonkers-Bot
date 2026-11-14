@@ -10,6 +10,7 @@ import modules.logconfig as LOG
 import modules.Classes as C
 import modules.Database as DB
 import modules.Status as ST
+import modules.Alerts as AL
 
 """
 Runs the subtitle-download pass for every channel, independent of chat/video processing.
@@ -144,6 +145,7 @@ def run(db:DB.PostgresClass, s3:C.H3Client, yt:C.YT_API, channel_names:list[str]
 if __name__ == "__main__":
     # Standalone invocation needs its own bootstrap, same as Main.py's top.
     ST.start("Subtitles",LOG.logger)
+    AL.start("Subtitles",LOG.logger)
     ST.set_info(phase="Starting up")
     db = DB.PostgresClass()
     DB.EnsureSchema(db.cursor)

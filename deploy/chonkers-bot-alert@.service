@@ -1,0 +1,14 @@
+# Posts a failed unit's last log lines to the bot's alert webhook. Started by OnFailure= in
+# chonkers-bot.service, with the failed unit's name as the instance (%i).
+
+[Unit]
+Description=Alert webhook for a failed %i
+
+[Service]
+Type=oneshot
+User=chonkers
+Group=chonkers
+# Lets the bot user read the failed unit's journal
+SupplementaryGroups=systemd-journal
+Environment=CHONKERS_SECRETS_DIR=/srv/chonkers/secrets
+ExecStart=/usr/bin/python3 /opt/chonkers-bot/deploy/notify_failure.py %i

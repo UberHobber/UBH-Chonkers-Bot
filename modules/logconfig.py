@@ -2,7 +2,8 @@
 Pre-made file for initializing logging functionality.
 """
 # Import of main package files
-import logging,time,atexit,datetime
+import logging,time,atexit,datetime,os,signal,sys,threading
+from logging.handlers import TimedRotatingFileHandler
 
 # Import specific items from a package
 from typing import List
@@ -22,7 +23,7 @@ class ConsoleFormatter(logging.Formatter):
     bold_red = "\x1b[31;1m"
     reset = "\x1b[0m"
     # format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
-    crit_fmt = 'CRTICAL: %(message)s (%(filename)s:%(lineno)d)'
+    crit_fmt = 'CRITICAL: %(message)s (%(filename)s:%(lineno)d)'
     err_fmt = 'ERROR: %(message)s (%(filename)s:%(lineno)d)'
     warn_fmt = 'WARN: %(message)s (%(filename)s:%(lineno)d)'
     dbg_fmt = 'DEBUG: %(message)s (%(filename)s:%(lineno)d)'
@@ -35,32 +36,38 @@ class ConsoleFormatter(logging.Formatter):
         logging.ERROR: red + err_fmt + reset,
         logging.CRITICAL: bold_red + crit_fmt + reset
     }
+    PLAIN_FORMATS = {
+        logging.DEBUG: dbg_fmt,
+        logging.INFO: info_fmt,
+        logging.WARNING: warn_fmt,
+        logging.ERROR: err_fmt,
+        logging.CRITICAL: crit_fmt
+    }
+    # No colour codes when the console is redirected (e.g. into systemd's journal), where they'd show as junk
+    COLOR = sys.stderr is not None and sys.stderr.isatty()
 
     def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
+        log_fmt = (self.FORMATS if self.COLOR else self.PLAIN_FORMATS).get(record.levelno)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
 class LogFormatter(logging.Formatter):
-    '''Formats the log file outputs based on what type of log object they are'''
-    crit_fmt = 'CRTICAL: %(message)s'
-    err_fmt = 'ERROR: %(message)s'
-    warn_fmt = 'WARN: %(message)s'
-    dbg_fmt = 'DEBUG: %(message)s'
-    info_fmt = '%(message)s'
+    '''
+    Log file lines: date, time, level and thread on every line, so an unattended run's log can be
+    read back later. Blank lines a message starts with (spacers for the console) go before the
+    prefix instead of after it.
+    '''
+    def __init__(self):
+        super().__init__('%(asctime)s %(levelname)-8s [%(threadName)s] %(message)s','%Y-%m-%d %H:%M:%S')
 
-    FORMATS = {
-        logging.CRITICAL: crit_fmt,
-        logging.ERROR: err_fmt,
-        logging.WARNING: warn_fmt,
-        logging.DEBUG: dbg_fmt,
-        logging.INFO: info_fmt
-    }
-
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt)
-        return formatter.format(record)
+    def formatMessage(self, record):
+        message = record.message
+        stripped = message.lstrip('\n')
+        record.message = stripped
+        try:
+            return message[:len(message) - len(stripped)] + super().formatMessage(record)
+        finally:
+            record.message = message
 
 class Summary:
     """
@@ -133,17 +140,21 @@ def StreamLog():
 
 def FileLog(single_filename='log',log_filename='log'):
     """
-    The Log Handler for the file output. Control log level with LOG_VERBOSE.
+    The Log Handler for the file output, in CFG.LOG_DIRECTORY. Control log level with LOG_VERBOSE.
+    CONTINUOUS_LOG writes one file that starts afresh each midnight, keeping CFG.LOG_RETENTION_DAYS
+    old ones (named <single_filename>.log.YYYY-MM-DD).
 
     :param single_filename: Name of the debug log file
     :type single_filename: String
     :param log_filename: Prefix of the main log file
     :type log_filename: String
     """
+    directory = CFG.LOG_DIRECTORY or os.getcwd()
+    os.makedirs(directory,exist_ok=True)
     if CFG.CONTINUOUS_LOG == False:
-        fh = logging.FileHandler(f'{log_filename} ({time.strftime('%Y.%m.%d-%H.%M.%S')}).log',encoding='utf-8')
+        fh = logging.FileHandler(os.path.join(directory,f'{log_filename} ({time.strftime('%Y.%m.%d-%H.%M.%S')}).log'),encoding='utf-8')
     else:
-        fh = logging.FileHandler(f'{single_filename}.log',encoding='utf-8')
+        fh = TimedRotatingFileHandler(os.path.join(directory,f'{single_filename}.log'),when='midnight',backupCount=CFG.LOG_RETENTION_DAYS,encoding='utf-8')
     fh.setLevel(logging.INFO) if CFG.LOG_VERBOSE == False else fh.setLevel(logging.DEBUG)
     fh.setFormatter(LogFormatter())
     logger.addHandler(fh)
@@ -185,6 +196,34 @@ for _cd_name in ('chat_downloader.metadata', 'urllib3'):
 
 if CFG.LOG == True:
     FileLog(CFG.DEBUG_LOG_FILE,CFG.LOG_NAME)
+
+def _log_uncaught(exc_type,exc,tb):
+    """Uncaught exceptions go to the log (and so the log file and any alert webhook), not just stderr."""
+    if issubclass(exc_type,KeyboardInterrupt):
+        logger.warning('Stopped before finishing (interrupted). Anything unfinished is picked up by the next run.')
+        return
+    logger.critical(f'Uncaught {exc_type.__name__}, stopping: {exc}',exc_info=(exc_type,exc,tb))
+
+def _log_uncaught_thread(args):
+    if issubclass(args.exc_type,SystemExit):
+        return
+    thread_name = args.thread.name if args.thread is not None else '?'
+    logger.critical(f'Uncaught {args.exc_type.__name__} in thread {thread_name}: {args.exc_value}',exc_info=(args.exc_type,args.exc_value,args.exc_traceback))
+
+sys.excepthook = _log_uncaught
+threading.excepthook = _log_uncaught_thread
+
+def _on_stop_signal(signum,frame):
+    """
+    systemctl stop (or kill) sends SIGTERM, which would otherwise end Python without logging anything
+    or running its exit handlers. Treat it like Ctrl+C instead: the run stops the same way, and the
+    log and status file say so.
+    """
+    logger.warning(f'Received {signal.Signals(signum).name}, stopping. Videos in progress are left unprocessed for the next run.')
+    raise KeyboardInterrupt
+
+if threading.current_thread() is threading.main_thread():
+    signal.signal(signal.SIGTERM,_on_stop_signal)
 
 time_start = time.time()
 time_epoch = int(round(time_start,0))

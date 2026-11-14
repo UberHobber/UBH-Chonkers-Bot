@@ -1,0 +1,13 @@
+# Starts chonkers-bot.service once a day. If a run is still going at the next start time, systemd
+# doesn't start a second copy. Persistent=true catches up on a start missed while the machine was off.
+
+[Unit]
+Description=Daily Chonkers Bot run
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+Unit=chonkers-bot.service
+
+[Install]
+WantedBy=timers.target

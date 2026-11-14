@@ -1,7 +1,6 @@
 # Native Stuff
 import json,os
 from sys import exit
-from tkinter import filedialog,messagebox
 from psycopg2.extensions import cursor
 
 ##############################
@@ -109,8 +108,16 @@ ARCHIVE_MAX_ROWS = 10_000_000 # Messages per Parquet file (~250MB)
 
 # Do not prompt for directories or options, just run the file.
 QUICK_SETTINGS = True
-QUICK_SETTINGS_DATA = "D:/CodingProjects/_Datafiles"
-QUICK_SETTINGS_SECRET = "D:/CodingProjects/_NoShare"
+# The CHONKERS_DATA_DIR / CHONKERS_SECRETS_DIR environment variables override these, so a server can
+# set its own paths (e.g. in a systemd unit, see deploy/) without editing this file.
+QUICK_SETTINGS_DATA = os.environ.get("CHONKERS_DATA_DIR") or "D:/CodingProjects/_Datafiles"
+QUICK_SETTINGS_SECRET = os.environ.get("CHONKERS_SECRETS_DIR") or "D:/CodingProjects/_NoShare"
+QUICK_SETTINGS_LOG = False # Write the log to a file (always on when CHONKERS_LOG_DIR is set)
+
+# No screen or person at the keyboard (a server/systemd run): never prompt with dialogs or open a
+# browser for the YouTube sign-in -- fail with a logged error instead of waiting forever. Set
+# CHONKERS_HEADLESS=1, or it's assumed on Linux/macOS when there's no display.
+HEADLESS = os.environ.get("CHONKERS_HEADLESS","").lower() in ("1","true","yes") or     (os.name != "nt" and not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")))
 
 # Database Configuration settngs
 DB_VERBOSE = False
@@ -120,12 +127,20 @@ DEBUG_LOG_FILE='Chat_Process_Log' # Used when CONTINUOUS_LOG is set to True
 LOG_VERBOSE = False # Any debug messages will appear
 LOG_NAME = "LOG" # Log file prefix
 CONTINUOUS_LOG = True # Create one continuous log file and not separate ones per-run
+LOG_DIRECTORY = os.environ.get("CHONKERS_LOG_DIR") or "" # Folder for log files. Blank = the folder the bot was launched from
+LOG_RETENTION_DAYS = 30 # CONTINUOUS_LOG starts a new file each midnight and keeps this many old ones
+
+# Alerts (see modules/Alerts.py): posted to the optional "alert_webhook" URL in the secrets folder's
+# Settings.json (a Discord webhook). No URL = no alerts.
+ALERT_LEVEL = "ERROR" # Lowest log level that gets posted
+ALERT_BATCH_SECONDS = 60 # Gather alert lines for this long and post them as one message (CRITICAL posts at once)
+ALERT_RUN_SUMMARY = True # Also post a one-message summary when a Main.py run finishes
 
 # Status Display (see modules/Status.py)
 # Run "Launch.bat Monitor.py" in a second window to watch the bot -- it reads the status file below.
 PROGRESS_BARS = False # Also draw tqdm progress bars in the bot's own console (prone to spamming lines on Windows)
 STATUS_INTERVAL = 2.0 # Seconds between status file writes
-STATUS_DIRECTORY = "" # Folder for status_<script>.json files. Blank = the folder the bot was launched from
+STATUS_DIRECTORY = os.environ.get("CHONKERS_STATUS_DIR") or "" # Folder for status_<script>.json files. Blank = the folder the bot was launched from
 
 # File Object Prefixes
 MEMBERS_ONLY_FLAG = "_members"
@@ -135,9 +150,12 @@ MESSAGES_TAG = "messages"
 SUBTITLE_TAG = "subtitles"
 PFP_TAG = "pfp"
 
+if QUICK_SETTINGS is False and HEADLESS:
+    exit("QUICK_SETTINGS is False, but there's no screen to show its dialogs on (headless run). Set QUICK_SETTINGS = True.")
+
 if QUICK_SETTINGS is True:
-    # Create a log file (In script location)
-    LOG = False
+    # Create a log file (In LOG_DIRECTORY)
+    LOG = QUICK_SETTINGS_LOG or bool(os.environ.get("CHONKERS_LOG_DIR"))
     # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
     DATA_DIRECTORY = QUICK_SETTINGS_DATA
     SECRETS_DIRECTORY = QUICK_SETTINGS_SECRET
@@ -152,7 +170,8 @@ if QUICK_SETTINGS is True:
     # Don't process currently live or stream reservation chats (Sometimes TIMEOUT being True isn't enough to skip a waiting room or a livestream)
     SKIP_LIVESTREAMS = True
 else:
-    # Create a log file (In script location)
+    from tkinter import filedialog,messagebox # Only needed here; servers often don't have tkinter installed
+    # Create a log file (In LOG_DIRECTORY)
     LOG = messagebox.askyesno("Logging","Do you want to write the console log to file?")
     # Sets the working directories at launch. I don't recommend keeping secret stuff in the same spot as the data.
     DATA_DIRECTORY = filedialog.askdirectory(title="Specify directory for data to be downloaded to")
@@ -182,6 +201,7 @@ with open(f"{SECRETS_DIRECTORY}/Settings.json",'r') as file:
     gen_settings = json.load(file)
 
 USER_DATA_NAME = gen_settings["user_data_name"]
+ALERT_WEBHOOK:str = gen_settings.get("alert_webhook") or ""
 
 # Needed to access chat messages from member's only videos. Either read from a browser profile
 # (COOKIES_FROM_BROWSER, above) or a cookies.txt exported by hand with a browser addin.
