@@ -172,7 +172,12 @@ def process_channel(channel_name:str,current_channel:int,channels_total:int) -> 
     all_chat_stats = C.ChatStats()
 
     LOG.logger.info("\nObtaining all videos from Youtube API...")
-    video_members = yt.Get_All_Videos(channel_bucket) # {video_id: members}
+    try:
+        video_members = yt.Get_All_Videos(channel_bucket) # {video_id: members}
+    except Exception as e:
+        # A persistent YouTube API failure for one channel shouldn't kill the rest of the run.
+        LOG.logger.error(f"Skipping channel {channel_name}: could not fetch video list ({type(e).__name__}: {e}).")
+        return 1
     video_ids = list(video_members)
     members_ids = {vid_id for vid_id,members in video_members.items() if members}
     LOG.logger.info(f"Total of {len(video_ids):,} video(s) aquired ({len(members_ids):,} members-only).")

@@ -899,6 +899,25 @@ class YT_API:
         else:
             return None
 
+    def _Get_Playlist_Page(self,playlist_id:str,page_token:str,max_attempts:int=5) -> dict[str,Any]:
+        """
+        Fetches one follow-up page of a playlist. YouTube intermittently answers a pageToken request
+        with 404 "playlistNotFound" even though the first page of the same playlist just loaded
+        (2026-11-15: killed the whole run at channel 86/90). The playlist plainly exists, so a 404
+        here is retried with backoff, rebuilding the request each time; it's raised only if it persists.
+        """
+        for attempt in range(max_attempts):
+            request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50,pageToken=page_token)
+            try:
+                return _execute_with_retry(request)
+            except HttpError as e:
+                if e.resp.status != 404 or attempt == max_attempts - 1:
+                    raise
+                wait = 2 ** (attempt + 1)
+                LOG.logger.warning(f"Playlist {playlist_id} page returned 404 mid-pagination, retrying in {wait}s (attempt {attempt+1}/{max_attempts})")
+                time.sleep(wait)
+        raise AssertionError("unreachable")
+
     def _Get_Playlist_Items(self,playlist_id:str,dl_vidbar) -> list[dict[str,Any]]:
         """Pages through one playlist's items. A 404 (playlist doesn't exist) returns an empty list."""
         request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50)
@@ -915,8 +934,7 @@ class YT_API:
         dl_vidbar.update(len(video_list))
 
         while next_page is not None:
-            next_request = self.api.playlistItems().list(part="contentDetails,id,snippet,status",playlistId=playlist_id,maxResults=50,pageToken=next_page)
-            next_response = _execute_with_retry(next_request)
+            next_response = self._Get_Playlist_Page(playlist_id,next_page)
             next_page = next_response.get("nextPageToken")
             response_items:list[dict] = next_response["items"]
             dl_vidbar.update(len(response_items))
